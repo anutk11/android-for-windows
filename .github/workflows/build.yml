@@ -100,6 +100,11 @@ jobs:
         run: |
           clang-cl /nologo /O2 /Fe:out\fs_probe.exe /Foout\ tools\fs_probe.c
           out\fs_probe.exe
+      - name: "Experiment: WRFSBASE on Windows"
+        shell: cmd
+        run: |
+          clang-cl /nologo /O2 /Fe:out\fsbase_probe.exe /Foout\ tools\fsbase_probe.c
+          out\fsbase_probe.exe
       - name: Package
         shell: cmd
         run: |
