@@ -50,3 +50,29 @@ long afw_sys_branch_into_site(int skip_mov) {
                      : "=a"(r) : "r"(skip_mov) : "rcx", "r11", "memory");
     return r;
 }
+
+/*
+ * Form B sites (no adjacent "mov eax, imm32"):
+ * 1) bionic's generic syscall(): the number arrives in rdi at run time.
+ *    Same instruction sequence as bionic/libc/arch-x86_64/bionic/syscall.S
+ *    (without its errno handling, which is not what is being tested).
+ */
+__attribute__((naked)) long afw_generic_syscall(long nr, long a, long b, long c, long d, long e) {
+    __asm__ volatile(
+        "mov %rdi, %rax\n\t"
+        "mov %rsi, %rdi\n\t"
+        "mov %rdx, %rsi\n\t"
+        "mov %rcx, %rdx\n\t"
+        "mov %r8, %r10\n\t"
+        "mov %r9, %r8\n\t"
+        "mov 8(%rsp), %r9\n\t"
+        "syscall\n\t"
+        "ret");
+}
+
+/* 2) __restore_rt style: "mov rax, imm32" (7 bytes, sign-extended) */
+long afw_sys_getpid_rax(void) {
+    long r;
+    __asm__ volatile("mov $39, %%rax\n\tsyscall" : "=a"(r) : : "rcx", "r11", "memory");
+    return r;
+}

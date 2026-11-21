@@ -12,7 +12,7 @@
 
 #define AFW_MAX_NEEDED 32
 
-typedef struct {
+typedef struct afw_lib_s {
     const char *path;
     unsigned char *base;        /* where the library lives in memory */
     size_t size;
@@ -34,6 +34,7 @@ typedef struct {
 
     /* load-time patching */
     unsigned char *stub_area;
+    const unsigned char *eh_frame_hdr;   /* for function boundaries */
     afw_patch_report patch;
 
     /* report */

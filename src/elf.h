@@ -38,6 +38,7 @@ typedef struct {
 #define PT_LOAD 1
 #define PT_DYNAMIC 2
 #define PT_TLS 7
+#define PT_GNU_EH_FRAME 0x6474e550
 #define PT_GNU_RELRO 0x6474e552
 
 /* Segment permission flags */

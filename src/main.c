@@ -106,7 +106,9 @@ static int run_syscall_tests(const afw_lib *lib) {
     printf("\n=== G1 tests: Linux syscalls rewritten at load time ===\n");
     check("test functions found", gp && wr && unk && xmm);
     if (g_failed) return 1;
-    check("every safe site was patched (4 sites)", lib->patch.sys_patched == 4);
+    check("every safe 'mov eax; syscall' site was patched (4)", lib->patch.sys_patched == 4);
+    check("both other sites patched by moving instructions (generic syscall, mov rax)",
+          lib->patch.sys_patched_moved == 2);
     check("the site with a branch into its middle was REFUSED", lib->patch.sys_refused_branch == 1);
 
     before = afw_syscall_counts[39];
@@ -123,9 +125,37 @@ static int run_syscall_tests(const afw_lib *lib) {
 
     check("xmm registers survive a syscall", xmm(3.25) == 3.25);
 
+    {
+        typedef long (SYSV *gen_fn)(long, long, long, long, long, long, long);
+        gen_fn gen = (gen_fn)afw_sym(lib, "afw_generic_syscall");
+        getpid_fn rax = (getpid_fn)afw_sym(lib, "afw_sys_getpid_rax");
+        check("form B functions found", gen && rax);
+        if (gen && rax) {
+            before = afw_syscall_counts[39];
+            r = gen(39, 0, 0, 0, 0, 0, 0);
+            printf("  generic syscall(39) -> %ld\n", r);
+            check("generic syscall(): number passed at run time reached the dispatcher",
+                  r == host_pid() && afw_syscall_counts[39] == before + 1);
+            r = gen(1, 1, (long)(uintptr_t)msg, (long)(sizeof msg - 1), 0, 0, 0);
+            check("generic syscall(): 3 arguments shifted correctly (write)", r == (long)(sizeof msg - 1));
+            r = rax();
+            check("'mov rax, 39; syscall' (the __restore_rt form) works", r == host_pid());
+        }
+    }
+
     printf("\n");
     afw_syscall_report();
     printf("\n%s\n", g_failed ? "G1 SYSCALL TESTS FAILED" : "G1 SYSCALL TESTS PASSED");
+    return g_failed ? 1 : 0;
+}
+
+static int run_redzone_tests(const afw_lib *lib) {
+    getpid_fn safe = (getpid_fn)afw_sym(lib, "afw_rz_safe");
+    printf("\n=== G1 negative test: red zone ===\n");
+    check("all 3 red zone sites were REFUSED", lib->patch.sys_refused_redzone == 3);
+    check("only the safe site was patched", lib->patch.sys_patched == 1);
+    check("the safe site works", safe && safe() == host_pid());
+    printf("\n%s\n", g_failed ? "RED ZONE TEST FAILED" : "RED ZONE TEST PASSED");
     return g_failed ? 1 : 0;
 }
 
@@ -158,13 +188,15 @@ int main(int argc, char **argv) {
     printf("  imports missing:     %d\n", lib.nimports_missing);
     printf("  weak imports empty:  %d\n", lib.nimports_weak_null);
 
-    printf("  syscall sites patched: %d (refused %d, unhandled %d)\n", lib.patch.sys_patched,
-           lib.patch.sys_refused_branch + lib.patch.sys_refused_redzone, lib.patch.sys_unhandled);
-    printf("  fs: accesses patched:  %d (register-based: %d)\n", lib.patch.fs_patched,
-           lib.patch.fs_register_form);
+    printf("  syscall sites patched: %d + %d moved (refused: %d branch, %d red zone, %d unknown)\n",
+           lib.patch.sys_patched, lib.patch.sys_patched_moved, lib.patch.sys_refused_branch,
+           lib.patch.sys_refused_redzone, lib.patch.sys_refused_unknown);
+    printf("  fs: accesses patched:  %d (fs:[reg]: %d real, %d data)\n", lib.patch.fs_patched,
+           lib.patch.fs_reg_in_func, lib.patch.fs_reg_outside);
 
     if (afw_sym(&lib, "afw_add")) rc = run_m0_tests(&lib);
     if (afw_sym(&lib, "afw_sys_getpid")) rc |= run_syscall_tests(&lib);
+    if (afw_sym(&lib, "afw_rz_safe")) rc |= run_redzone_tests(&lib);
 
     afw_unload(&lib);
     return rc;

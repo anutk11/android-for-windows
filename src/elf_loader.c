@@ -12,6 +12,7 @@
  */
 #include "elf_loader.h"
 #include "bionic_shim.h"
+#include "funcs.h"
 #include "platform.h"
 
 #include <stdio.h>
@@ -154,6 +155,10 @@ static void apply_relr(afw_lib *lib, const uint64_t *relr, size_t count) {
     }
 }
 
+static int patch_bounds(const void *ctx, uint64_t addr, uint64_t *s, uint64_t *e) {
+    return afw_func_bounds((const afw_lib *)ctx, addr, s, e);
+}
+
 int afw_load(const char *path, afw_lib *lib, int verbose) {
     size_t fsize = 0, i;
     unsigned char *file;
@@ -161,6 +166,7 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
     Elf64_Phdr *ph;
     uint64_t lo = UINT64_MAX, hi = 0;
     Elf64_Phdr dyn_copy, relro_copy;     /* copies: the file buffer is freed early */
+    uint64_t eh_hdr_vaddr = 0;
     Elf64_Phdr *dyn_ph = NULL, *relro_ph = NULL;
     const uint32_t *hash = NULL, *gnu_hash = NULL;
     const Elf64_Rela *rela = NULL, *jmprel = NULL;
@@ -212,6 +218,8 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
         } else if (ph[i].p_type == PT_DYNAMIC) {
             dyn_copy = ph[i];
             dyn_ph = &dyn_copy;
+        } else if (ph[i].p_type == PT_GNU_EH_FRAME) {
+            eh_hdr_vaddr = ph[i].p_vaddr;
         } else if (ph[i].p_type == PT_GNU_RELRO) {
             relro_copy = ph[i];
             relro_ph = &relro_copy;
@@ -259,6 +267,8 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
                    (ph[i].p_flags & PF_X) ? 'X' : '-');
     }
     free(file); /* everything we need is now in memory */
+
+    if (eh_hdr_vaddr) lib->eh_frame_hdr = (const unsigned char *)(lib->bias + eh_hdr_vaddr);
 
     /* 3. Dynamic section --------------------------------------------- */
     lib->dynamic = (Elf64_Dyn *)(lib->bias + dyn_ph->p_vaddr);
@@ -375,14 +385,19 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
             ncr++;
             i = j;
         }
-        afw_patch_code(cr, ncr, lib->stub_area, AFW_STUB_RESERVE, &lib->patch, verbose);
+        afw_patch_ctx pc;
+        pc.bounds = patch_bounds; pc.ctx = lib; pc.bias = lib->bias; pc.name = lib->soname ? lib->soname : path;
+        if (afw_patch_code(cr, ncr, lib->stub_area, AFW_STUB_RESERVE, &pc, &lib->patch, verbose) < 0) {
+            fprintf(stderr, "error: could not patch %s safely; refusing to run it\n", path);
+            free(pageprot); return -1;
+        }
         afw_mem_protect(lib->stub_area, AFW_STUB_RESERVE, AFW_PROT_R | AFW_PROT_X);
+        afw_flush_icache(lib->stub_area, AFW_STUB_RESERVE);
         if (verbose)
-            printf("Patched:    %d syscall sites (%d stubs), %d fs: accesses; "
-                   "refused %d, unhandled %d, fs:[reg] %d\n",
-                   lib->patch.sys_patched, lib->patch.stubs, lib->patch.fs_patched,
-                   lib->patch.sys_refused_branch + lib->patch.sys_refused_redzone,
-                   lib->patch.sys_unhandled, lib->patch.fs_register_form);
+            printf("Patched:    syscalls %d + %d moved (%d stubs), refused %d; fs: %d; fs:[reg] %d real, %d data\n",
+                   lib->patch.sys_patched, lib->patch.sys_patched_moved, lib->patch.stubs,
+                   lib->patch.sys_refused_branch + lib->patch.sys_refused_redzone + lib->patch.sys_refused_unknown,
+                   lib->patch.fs_patched, lib->patch.fs_reg_in_func, lib->patch.fs_reg_outside);
     }
 
     /* 6. Memory protection ------------------------------------------- */

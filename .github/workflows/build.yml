@@ -27,6 +27,8 @@ jobs:
             -o out/libhello.so test/hello.c -llog
           "$TC/clang" --target=x86_64-linux-android24 -shared -fPIC -O2 \
             -Wl,--pack-dyn-relocs=none -o out/libsyscall_test.so test/syscall_test.c
+          "$TC/clang" --target=x86_64-linux-android24 -shared -fPIC -O2 \
+            -Wl,--pack-dyn-relocs=none -o out/libredzone_test.so test/redzone_test.c
           "$TC/llvm-readelf" -h -d out/libhello.so
           echo "--- afw_stack_test machine code ---"
           "$TC/llvm-objdump" -d --disassemble-symbols=afw_stack_test out/libhello.so
@@ -82,6 +84,9 @@ jobs:
       - name: Run G1 syscall-patching tests on Windows
         shell: cmd
         run: out\afw-loader.exe out\libsyscall_test.so
+      - name: "Negative test: red zone sites must be refused"
+        shell: cmd
+        run: out\afw-loader.exe out\libredzone_test.so
       - name: "Explore: load the NDK's real libc++_shared.so"
         continue-on-error: true
         shell: cmd
