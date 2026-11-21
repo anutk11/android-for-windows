@@ -21,28 +21,44 @@ ls -la "$D"
 IMG="$D/system.img"
 file "$IMG"
 
-# Find an ext4 filesystem: the image itself, or a partition inside it.
+# Split the disk image (GPT -> partitions -> "super" logical partitions)
+python3 tools/extract_image.py "$IMG" "$W/parts"
+ls -la "$W/parts"
+
+# Read one file out of an ext4 or erofs image
+fstype() {
+  if [ "$(od -An -tx1 -j1080 -N2 "$1" | tr -d ' ')" = "53ef" ]; then echo ext4
+  elif [ "$(od -An -tx1 -j1024 -N4 "$1" | tr -d ' ')" = "e2e1f5e0" ]; then echo erofs
+  else echo unknown; fi
+}
+fs_get() {  # image path-inside out
+  case "$(fstype "$1")" in
+    ext4) debugfs -R "dump -p $2 $3" "$1" >/dev/null 2>&1 ;;
+    erofs)
+      local d="$1.x"
+      [ -d "$d" ] || { command -v fsck.erofs >/dev/null || sudo apt-get install -y -qq erofs-utils >/dev/null; fsck.erofs --extract="$d" "$1" >/dev/null 2>&1 || true; }
+      cp "$d$2" "$3" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+  [ -s "$3" ]
+}
+fs_ls() {
+  case "$(fstype "$1")" in
+    ext4) debugfs -R "ls -l $2" "$1" 2>/dev/null | head -40 ;;
+    erofs) ls -la "$1.x$2" 2>/dev/null | head -40 ;;
+  esac || true
+}
+
 FS=""
-if debugfs -R "stats" "$IMG" >/dev/null 2>&1; then
-  FS="$IMG"
-else
-  echo "== not a plain ext4 image, extracting partitions"
-  7z l "$IMG" || true
-  7z x -y -o"$W/parts" "$IMG" >/dev/null
-  ls -la "$W/parts"
-  for p in $(ls -S "$W/parts"/*); do
-    if debugfs -R "stats" "$p" >/dev/null 2>&1; then FS="$p"; break; fi
-  done
-fi
-[ -n "$FS" ] || { echo "no ext4 filesystem found"; exit 1; }
-echo "== filesystem: $FS"
+for c in system system_a; do [ -f "$W/parts/$c.img" ] && FS="$W/parts/$c.img" && break; done
+[ -n "$FS" ] || { echo "no system partition"; exit 1; }
+echo "== system partition: $FS ($(fstype "$FS"))"
+dbg_ls() { fs_ls "$@"; }
+dbg_dump() { fs_get "$@"; }
 
-dbg_ls() { debugfs -R "ls -l $2" "$1" 2>/dev/null | head -40 || true; }
-dbg_dump() { debugfs -R "dump -p $2 $3" "$1" >/dev/null 2>&1 && [ -s "$3" ]; }
-
-# Android 10+: system-as-root, so system files live under /system
 ROOTP="/system"
-debugfs -R "ls /system/apex" "$FS" >/dev/null 2>&1 || ROOTP=""
+fs_get "$FS" /system/build.prop "$W/build.prop" || ROOTP=""
+grep -E "ro.build.(version.release|id|fingerprint)=" "$W/build.prop" 2>/dev/null || true
 echo "== $ROOTP/apex"; dbg_ls "$FS" "$ROOTP/apex"
 
 GOT=""
