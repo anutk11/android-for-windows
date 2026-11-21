@@ -95,7 +95,7 @@ typedef void (*write_fn)(uint64_t);
 
 static DWORD WINAPI thread_main(void *arg) {
     read_fn rd = (read_fn)arg;
-    TlsSetValue(g_map[0].slot, (void *)(uintptr_t)0x2222222222222222ULL);
+    TlsSetValue(slot_for_offset(0x28), (void *)(uintptr_t)0x2222222222222222ULL);
     return (DWORD)(rd() == 0x2222222222222222ULL);
 }
 
@@ -144,9 +144,11 @@ int main(void) {
 
     /* Step 2: install the handler and map two fs offsets to TEB slots */
     AddVectoredExceptionHandler(1, fs_handler);
-    printf("2. fs:[0x28] -> TEB slot %d, fs:[0] -> TEB slot %d\n",
-           map_offset(0x28, (void *)(uintptr_t)0x1111111111111111ULL),
-           map_offset(0x00, NULL));
+    {
+        int s28 = map_offset(0x28, (void *)(uintptr_t)0x1111111111111111ULL);
+        int s0 = map_offset(0x00, NULL);
+        printf("2. fs:[0x28] -> TEB slot %d, fs:[0] -> TEB slot %d\n", s28, s0);
+    }
 
     v = rd();
     printf("3. read  fs:[0x28] = 0x%llx  %s\n", (unsigned long long)v,
