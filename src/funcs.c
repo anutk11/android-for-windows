@@ -4,6 +4,7 @@
 #include "funcs.h"
 #include "elf_loader.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 /* DWARF pointer encodings */
@@ -127,4 +128,29 @@ int afw_func_bounds(const afw_lib *lib, uint64_t addr, uint64_t *start, uint64_t
         }
     }
     return 0;
+}
+
+int afw_func_list(const afw_lib *lib, unsigned char ***starts, size_t **sizes) {
+    const unsigned char *h = lib->eh_frame_hdr, *p;
+    uint64_t eh_frame, count, hdr, i;
+    int n = 0;
+    *starts = NULL; *sizes = NULL;
+    if (!h) return 0;
+    p = h + 4; hdr = (uint64_t)(uintptr_t)h;
+    if (h[0] != 1 || !read_enc(&p, h[1], hdr, &eh_frame) || !read_enc(&p, h[2], hdr, &count) ||
+        h[3] != (PE_DATAREL | PE_SDATA4))
+        return 0;
+    *starts = (unsigned char **)malloc((size_t)count * sizeof **starts);
+    *sizes = (size_t *)malloc((size_t)count * sizeof **sizes);
+    for (i = 0; i < count; i++) {
+        const int32_t *tab = (const int32_t *)p;
+        uint64_t s0, e0;
+        const unsigned char *fde = (const unsigned char *)(uintptr_t)(hdr + (int64_t)tab[2 * i + 1]);
+        if (!fde_range(fde, &s0, &e0) || e0 <= s0) continue;
+        if (s0 < (uint64_t)(uintptr_t)lib->base || e0 > (uint64_t)(uintptr_t)lib->base + lib->size) continue;
+        (*starts)[n] = (unsigned char *)(uintptr_t)s0;
+        (*sizes)[n] = (size_t)(e0 - s0);
+        n++;
+    }
+    return n;
 }

@@ -178,6 +178,11 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
 #if defined(_WIN32)
                 {
                     int64_t d = ops[k].mem.disp.value;
+                    uint64_t fs0, fe0;
+                    if (!c || !c->bounds || !c->bounds(c->ctx, ip, &fs0, &fe0)) {
+                        rep->fs_skipped_outside++;   /* never change bytes outside a known function */
+                        continue;
+                    }
                     int teb = (d >= 0 && (d & 7) == 0) ? afw_tls_teb_offset((int)(d / 8)) : -1;
                     int j;
                     if (teb < 0 || ins.raw.disp.size != 32) continue; /* left to the fault handler */
@@ -190,6 +195,14 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
             }
             if (ins.mnemonic == ZYDIS_MNEMONIC_SYSCALL) {
                 site s;
+                uint64_t sf0, se0;
+                if (!c || !c->bounds || !c->bounds(c->ctx, ip, &sf0, &se0)) {
+                    /* not inside a known function: decoded data, or unknown code - leave it */
+                    rep->sys_refused_unknown++;
+                    describe(c, p, where, sizeof where);
+                    fprintf(stderr, "  [patch] syscall bytes at %s are outside every known function: not touched\n", where);
+                    goto next_ins;
+                }
                 memset(&s, 0, sizeof s);
                 if (prev_mov_eax && h[0].p + 5 == p) {
                     s.start = h[0].p; s.len = 7; s.form = 'A'; s.nr = prev_imm;
@@ -209,6 +222,7 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                     fprintf(stderr, "  [patch] REFUSED syscall at %s: nothing safe to move before it\n", where);
                 }
             }
+        next_ins:
             movable = !is_branch(&ins) && !(ins.attributes & ZYDIS_ATTRIB_IS_RELATIVE) && !uses_r11(&ins, ops) &&
                       ins.mnemonic != ZYDIS_MNEMONIC_SYSCALL;
             h[2] = h[1]; h[1] = h[0];

@@ -40,6 +40,7 @@ typedef struct {
     int fs_patched;            /* fs:[disp32] rewritten to gs: */
     int fs_reg_in_func;        /* fs:[reg] inside a known function: real code */
     int fs_reg_outside;        /* fs:[reg] outside any function: decoded data */
+    int fs_skipped_outside;    /* fs:[disp32] outside any function: not touched */
     int sys_patched;           /* form A */
     int sys_patched_moved;     /* form B */
     int sys_refused_branch;

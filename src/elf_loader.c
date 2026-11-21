@@ -374,23 +374,39 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
 
     /* 5b. Load-time patching of syscall / fs: instructions ------------ */
     {
-        afw_code_range cr[8];
-        int ncr = 0;
-        for (i = 0; i < npages && ncr < 8;) {
-            size_t j = i;
-            if (!(pageprot[i] & PF_X)) { i++; continue; }
-            while (j < npages && (pageprot[j] & PF_X)) j++;
-            cr[ncr].addr = lib->base + i * AFW_PAGE_SIZE;
-            cr[ncr].size = (j - i) * AFW_PAGE_SIZE;
-            ncr++;
-            i = j;
+        /* Decode only real functions (from .eh_frame), never the data that
+         * shares the executable segment: decoded data could look like an
+         * fs: access or a syscall and be "patched" into garbage. Fallback,
+         * when there is no .eh_frame_hdr: whole executable segments, where
+         * patch.c still requires known function bounds before changing bytes. */
+        afw_code_range *cr;
+        unsigned char **fstart;
+        size_t *fsize;
+        int ncr = afw_func_list(lib, &fstart, &fsize), k;
+        if (ncr > 0) {
+            cr = (afw_code_range *)malloc((size_t)ncr * sizeof *cr);
+            for (k = 0; k < ncr; k++) { cr[k].addr = fstart[k]; cr[k].size = fsize[k]; }
+        } else {
+            cr = (afw_code_range *)malloc(8 * sizeof *cr);
+            for (i = 0; i < npages && ncr < 8;) {
+                size_t j = i;
+                if (!(pageprot[i] & PF_X)) { i++; continue; }
+                while (j < npages && (pageprot[j] & PF_X)) j++;
+                cr[ncr].addr = lib->base + i * AFW_PAGE_SIZE;
+                cr[ncr].size = (j - i) * AFW_PAGE_SIZE;
+                ncr++;
+                i = j;
+            }
         }
+        free(fstart); free(fsize);
+        if (verbose) printf("Code:       %d %s decoded\n", ncr, lib->eh_frame_hdr ? "functions (.eh_frame)" : "segments (no .eh_frame_hdr)");
         afw_patch_ctx pc;
         pc.bounds = patch_bounds; pc.ctx = lib; pc.bias = lib->bias; pc.name = lib->soname ? lib->soname : path;
         if (afw_patch_code(cr, ncr, lib->stub_area, AFW_STUB_RESERVE, &pc, &lib->patch, verbose) < 0) {
             fprintf(stderr, "error: could not patch %s safely; refusing to run it\n", path);
-            free(pageprot); return -1;
+            free(cr); free(pageprot); return -1;
         }
+        free(cr);
         afw_mem_protect(lib->stub_area, AFW_STUB_RESERVE, AFW_PROT_R | AFW_PROT_X);
         afw_flush_icache(lib->stub_area, AFW_STUB_RESERVE);
         if (verbose)

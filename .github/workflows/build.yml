@@ -30,6 +30,10 @@ jobs:
           "$TC/clang" --target=x86_64-linux-android24 -shared -fPIC -O2 \
             -Wl,--pack-dyn-relocs=none -o out/libredzone_test.so test/redzone_test.c
           "$TC/llvm-readelf" -h -d out/libhello.so
+          echo "--- TLS relocations (GOTTPOFF/TPOFF would mean real initial-exec ELF TLS) ---"
+          for f in out/libhello.so out/libsyscall_test.so; do echo "$f:"; "$TC/llvm-readelf" -rW "$f" | grep -E "TPOFF|TLS|DTPMOD" || echo "  none"; done
+          echo "--- section containing offset 0x4f5 in libhello.so ---"
+          "$TC/llvm-readelf" -SW out/libhello.so | grep -E "^\s+\[" | head -30
           echo "--- afw_stack_test machine code ---"
           "$TC/llvm-objdump" -d --disassemble-symbols=afw_stack_test out/libhello.so
           cp "$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/x86_64-linux-android/libc++_shared.so" out/

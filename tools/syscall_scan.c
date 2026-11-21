@@ -33,7 +33,7 @@ typedef struct {
     uint64_t sh_addralign, sh_entsize;
 } Elf64_Shdr;
 
-typedef struct { uint64_t addr; const char *name; } func_sym;
+typedef struct { uint64_t addr; uint64_t size; const char *name; } func_sym;
 
 static func_sym *g_funcs;
 static size_t g_nfuncs, g_capfuncs;
@@ -51,7 +51,7 @@ static unsigned char *read_all(const char *path, size_t *n) {
     return b;
 }
 
-static void add_func(uint64_t addr, const char *name) {
+static void add_func(uint64_t addr, uint64_t size, const char *name) {
     if (!name[0] || addr == 0) return;
     if (g_nfuncs == g_capfuncs) {
         g_capfuncs = g_capfuncs ? g_capfuncs * 2 : 4096;
@@ -59,6 +59,7 @@ static void add_func(uint64_t addr, const char *name) {
     }
     g_funcs[g_nfuncs].addr = addr;
     g_funcs[g_nfuncs].name = name;
+    g_funcs[g_nfuncs].size = size;
     g_nfuncs++;
 }
 
@@ -79,7 +80,7 @@ static void load_symbols(const unsigned char *f, size_t n) {
         cnt = sh[i].sh_size / sizeof(Elf64_Sym);
         for (k = 1; k < cnt; k++)
             if (ELF64_ST_TYPE(syms[k].st_info) == STT_FUNC && syms[k].st_shndx != SHN_UNDEF)
-                add_func(syms[k].st_value, str + syms[k].st_name);
+                add_func(syms[k].st_value, syms[k].st_size, str + syms[k].st_name);
     }
 }
 
@@ -97,6 +98,17 @@ static const char *func_at(uint64_t addr) {
     }
     return g_funcs[lo].name;
 }
+
+/* Is addr inside a sized function symbol? */
+static int in_func(uint64_t addr) {
+    size_t lo = 0, hi = g_nfuncs, i;
+    if (!g_nfuncs || addr < g_funcs[0].addr) return 0;
+    while (hi - lo > 1) { size_t m = (lo + hi) / 2; if (g_funcs[m].addr <= addr) lo = m; else hi = m; }
+    for (i = lo + 1; i-- > 0 && lo - i < 4;)   /* aliases share an address */
+        if (g_funcs[i].addr <= addr && addr < g_funcs[i].addr + g_funcs[i].size) return 1;
+    return 0;
+}
+static int g_fs_abs_in, g_sites_in, g_fs_reg_in;
 
 static uint64_t func_end(uint64_t addr) {
     size_t i;
@@ -201,10 +213,12 @@ static void scan(const unsigned char *code, size_t size, uint64_t vaddr, int ver
             if (ops[i].mem.base == ZYDIS_REGISTER_NONE && ops[i].mem.index == ZYDIS_REGISTER_NONE) {
                 int64_t d = ops[i].mem.disp.value;
                 g_fs_abs++;
+                if (in_func(ip)) g_fs_abs_in++;
                 if (d >= 0 && d < 8 * 64 && (d & 7) == 0) g_fs_disp_count[d / 8]++;
                 else g_fs_disp_other++;
             } else {
                 g_fs_reg++;
+                if (in_func(ip)) g_fs_reg_in++;
                 if (verbose) printf("  fs: register form at 0x%llx in %s\n",
                                     (unsigned long long)ip, func_at(ip));
             }
@@ -219,6 +233,7 @@ static void scan(const unsigned char *code, size_t size, uint64_t vaddr, int ver
             const char *fn = func_at(ip);
             int rz = uses_red_zone(ip);
             g_sites++;
+            if (in_func(ip)) g_sites_in++;
             if (prev_mov_eax && prev_end == ip) {
                 g_pattern7++;
                 if (g_nsite_mov < 4096) g_site_mov[g_nsite_mov++] = ip - 5;
@@ -388,6 +403,8 @@ int main(int argc, char **argv) {
 
     printf("\nfs: accesses: %d absolute fs:[disp32] (patchable), %d register-based\n",
            g_fs_abs, g_fs_reg);
+    printf("inside sized function symbols: syscall %d of %d, fs:[disp32] %d of %d, fs:[reg] %d of %d\n",
+           g_sites_in, g_sites, g_fs_abs_in, g_fs_abs, g_fs_reg_in, g_fs_reg);
     for (i = 0; i < 64; i++)
         if (g_fs_disp_count[i])
             printf("  fs:[0x%02zx] (slot %zu): %d\n", i * 8, i, g_fs_disp_count[i]);
