@@ -227,7 +227,10 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
     lo = ALIGN_DOWN(lo, AFW_PAGE_SIZE);
     hi = ALIGN_UP(hi, AFW_PAGE_SIZE);
     lib->size = (size_t)(hi - lo);
-    lib->base = (unsigned char *)afw_mem_alloc(lib->size);
+    /* The stub area for patched syscalls sits right after the library, so a
+     * call rel32 from any code in it always reaches its stub. */
+    lib->base = (unsigned char *)afw_mem_alloc(lib->size + AFW_STUB_RESERVE);
+    lib->stub_area = lib->base ? lib->base + lib->size : NULL;
     if (!lib->base) { fprintf(stderr, "error: out of memory\n"); free(file); return -1; }
     lib->bias = (intptr_t)lib->base - (intptr_t)lo;
 
@@ -358,6 +361,29 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
         free(symaddr); free(pageprot); return -1;
     }
     free(symaddr);
+
+    /* 5b. Load-time patching of syscall / fs: instructions ------------ */
+    {
+        afw_code_range cr[8];
+        int ncr = 0;
+        for (i = 0; i < npages && ncr < 8;) {
+            size_t j = i;
+            if (!(pageprot[i] & PF_X)) { i++; continue; }
+            while (j < npages && (pageprot[j] & PF_X)) j++;
+            cr[ncr].addr = lib->base + i * AFW_PAGE_SIZE;
+            cr[ncr].size = (j - i) * AFW_PAGE_SIZE;
+            ncr++;
+            i = j;
+        }
+        afw_patch_code(cr, ncr, lib->stub_area, AFW_STUB_RESERVE, &lib->patch, verbose);
+        afw_mem_protect(lib->stub_area, AFW_STUB_RESERVE, AFW_PROT_R | AFW_PROT_X);
+        if (verbose)
+            printf("Patched:    %d syscall sites (%d stubs), %d fs: accesses; "
+                   "refused %d, unhandled %d, fs:[reg] %d\n",
+                   lib->patch.sys_patched, lib->patch.stubs, lib->patch.fs_patched,
+                   lib->patch.sys_refused_branch + lib->patch.sys_refused_redzone,
+                   lib->patch.sys_unhandled, lib->patch.fs_register_form);
+    }
 
     /* 6. Memory protection ------------------------------------------- */
     if (relro_ph) {

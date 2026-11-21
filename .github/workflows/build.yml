@@ -25,6 +25,8 @@ jobs:
             -fstack-protector-strong -U_FORTIFY_SOURCE \
             -Wl,--pack-dyn-relocs=none -Wl,-soname,libhello.so \
             -o out/libhello.so test/hello.c -llog
+          "$TC/clang" --target=x86_64-linux-android24 -shared -fPIC -O2 \
+            -Wl,--pack-dyn-relocs=none -o out/libsyscall_test.so test/syscall_test.c
           "$TC/llvm-readelf" -h -d out/libhello.so
           echo "--- afw_stack_test machine code ---"
           "$TC/llvm-objdump" -d --disassemble-symbols=afw_stack_test out/libhello.so
@@ -64,6 +66,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions/download-artifact@v4
         with:
           name: libhello
@@ -75,6 +79,9 @@ jobs:
       - name: Run M0 tests on Windows
         shell: cmd
         run: out\afw-loader.exe out\libhello.so
+      - name: Run G1 syscall-patching tests on Windows
+        shell: cmd
+        run: out\afw-loader.exe out\libsyscall_test.so
       - name: "Explore: load the NDK's real libc++_shared.so"
         continue-on-error: true
         shell: cmd

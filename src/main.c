@@ -14,6 +14,7 @@
 #include "platform.h"
 #include "tls_patch.h"
 #include "crash.h"
+#include "syscall.h"
 
 #define AFW_VERSION "0.2.0-M1-dev"
 
@@ -81,6 +82,53 @@ static int run_m0_tests(const afw_lib *lib) {
     return g_failed ? 1 : 0;
 }
 
+/* ---- G1: load-time syscall patching ---- */
+typedef long (SYSV *getpid_fn)(void);
+typedef long (SYSV *write_fn)(int, const void *, size_t);
+typedef double (SYSV *xmm_fn)(double);
+
+#if defined(_WIN32)
+#include <process.h>
+#define host_pid() ((long)_getpid())
+#else
+#include <unistd.h>
+#define host_pid() ((long)getpid())
+#endif
+
+static int run_syscall_tests(const afw_lib *lib) {
+    getpid_fn gp = (getpid_fn)afw_sym(lib, "afw_sys_getpid");
+    write_fn wr = (write_fn)afw_sym(lib, "afw_sys_write");
+    getpid_fn unk = (getpid_fn)afw_sym(lib, "afw_sys_unknown");
+    xmm_fn xmm = (xmm_fn)afw_sym(lib, "afw_sys_keeps_xmm");
+    static const char msg[] = "  (this line was written by a Linux write() syscall)\n";
+    long before, r;
+
+    printf("\n=== G1 tests: Linux syscalls rewritten at load time ===\n");
+    check("test functions found", gp && wr && unk && xmm);
+    if (g_failed) return 1;
+    check("every safe site was patched (4 sites)", lib->patch.sys_patched == 4);
+    check("the site with a branch into its middle was REFUSED", lib->patch.sys_refused_branch == 1);
+
+    before = afw_syscall_counts[39];
+    r = gp();
+    printf("  getpid() -> %ld (host pid %ld)\n", r, host_pid());
+    check("getpid went through our dispatcher", afw_syscall_counts[39] == before + 1 && r == host_pid());
+
+    r = wr(1, msg, sizeof msg - 1);
+    check("write(1, ...) returned the byte count", r == (long)(sizeof msg - 1));
+
+    r = unk();
+    printf("  reboot() -> %ld\n", r);
+    check("unimplemented syscall returns -ENOSYS", r == -38);
+
+    check("xmm registers survive a syscall", xmm(3.25) == 3.25);
+
+    printf("\n");
+    afw_syscall_report();
+    printf("\n%s\n", g_failed ? "G1 SYSCALL TESTS FAILED" : "G1 SYSCALL TESTS PASSED");
+    return g_failed ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     afw_lib lib;
     int verbose = 1, rc = 0;
@@ -110,7 +158,13 @@ int main(int argc, char **argv) {
     printf("  imports missing:     %d\n", lib.nimports_missing);
     printf("  weak imports empty:  %d\n", lib.nimports_weak_null);
 
+    printf("  syscall sites patched: %d (refused %d, unhandled %d)\n", lib.patch.sys_patched,
+           lib.patch.sys_refused_branch + lib.patch.sys_refused_redzone, lib.patch.sys_unhandled);
+    printf("  fs: accesses patched:  %d (register-based: %d)\n", lib.patch.fs_patched,
+           lib.patch.fs_register_form);
+
     if (afw_sym(&lib, "afw_add")) rc = run_m0_tests(&lib);
+    if (afw_sym(&lib, "afw_sys_getpid")) rc |= run_syscall_tests(&lib);
 
     afw_unload(&lib);
     return rc;

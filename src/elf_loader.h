@@ -8,6 +8,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "elf.h"
+#include "patch.h"
 
 #define AFW_MAX_NEEDED 32
 
@@ -30,6 +31,10 @@ typedef struct {
     uint64_t init, fini;
     uint64_t *init_array, *fini_array;
     size_t init_array_count, fini_array_count;
+
+    /* load-time patching */
+    unsigned char *stub_area;
+    afw_patch_report patch;
 
     /* report */
     int nrelocs;

@@ -109,9 +109,11 @@ static uint64_t func_end(uint64_t addr) {
 #define MAX_NR 1024
 static int g_nr_count[MAX_NR];
 static const char *g_nr_example[MAX_NR];
-static int g_sites, g_unresolved;
+static int g_sites, g_unresolved, g_fail;
 static int g_pattern7;        /* "mov eax, imm32 ; syscall" adjacent = 7 bytes */
 static int g_redzone_sites;   /* syscall site in a function that uses [rsp-N] */
+static uint64_t *g_targets; static size_t g_ntargets, g_captargets;
+static uint64_t g_site_mov[4096]; static size_t g_nsite_mov;
 static const unsigned char *g_code_base; static uint64_t g_code_vaddr; static size_t g_code_size;
 static int g_fs_abs, g_fs_reg, g_fsbase_ins;
 static int g_fs_disp_count[64];      /* fs:[8*i], i < 64 */
@@ -177,6 +179,21 @@ static void scan(const unsigned char *code, size_t size, uint64_t vaddr, int ver
             off++; eax = -1; prev_mov_eax = 0;
             continue;
         }
+        /* direct branch targets, to check no branch lands inside a site */
+        if (ins.meta.category == ZYDIS_CATEGORY_COND_BR || ins.meta.category == ZYDIS_CATEGORY_UNCOND_BR ||
+            ins.meta.category == ZYDIS_CATEGORY_CALL) {
+            for (i = 0; i < ins.operand_count_visible; i++) {
+                ZyanU64 t;
+                if (ops[i].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && ops[i].imm.is_relative &&
+                    ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&ins, &ops[i], ip, &t))) {
+                    if (g_ntargets == g_captargets) {
+                        g_captargets = g_captargets ? g_captargets * 2 : 65536;
+                        g_targets = (uint64_t *)realloc(g_targets, g_captargets * sizeof(uint64_t));
+                    }
+                    g_targets[g_ntargets++] = t;
+                }
+            }
+        }
         /* fs: memory operands */
         for (i = 0; i < ins.operand_count_visible; i++) {
             if (ops[i].type != ZYDIS_OPERAND_TYPE_MEMORY || ops[i].mem.segment != ZYDIS_REGISTER_FS)
@@ -202,7 +219,10 @@ static void scan(const unsigned char *code, size_t size, uint64_t vaddr, int ver
             const char *fn = func_at(ip);
             int rz = uses_red_zone(ip);
             g_sites++;
-            if (prev_mov_eax && prev_end == ip) g_pattern7++;
+            if (prev_mov_eax && prev_end == ip) {
+                g_pattern7++;
+                if (g_nsite_mov < 4096) g_site_mov[g_nsite_mov++] = ip - 5;
+            }
             else printf("  not the 7-byte pattern: syscall at 0x%llx in %s\n", (unsigned long long)ip, fn);
             if (rz == 1) { g_redzone_sites++; printf("  RED ZONE: syscall at 0x%llx in %s uses [rsp-N]\n", (unsigned long long)ip, fn); }
             if (eax >= 0 && eax < MAX_NR && eax_func == fn) {
@@ -346,7 +366,21 @@ int main(int argc, char **argv) {
            g_sites, g_sites - g_unresolved, g_unresolved);
     printf("distinct Linux syscalls: %d\n", distinct);
     printf("sites with the 7-byte \"mov eax, imm32; syscall\" pattern: %d of %d\n", g_pattern7, g_sites);
-    printf("sites inside functions that use the red zone: %d\n\n", g_redzone_sites);
+    printf("sites inside functions that use the red zone: %d\n", g_redzone_sites);
+    {
+        size_t a, b;
+        int bad = 0;
+        for (a = 0; a < g_nsite_mov; a++)
+            for (b = 0; b < g_ntargets; b++)
+                if (g_targets[b] > g_site_mov[a] && g_targets[b] < g_site_mov[a] + 7) {
+                    printf("  BRANCH INTO SITE: target 0x%llx inside site at 0x%llx (%s)\n",
+                           (unsigned long long)g_targets[b], (unsigned long long)g_site_mov[a],
+                           func_at(g_site_mov[a]));
+                    bad++;
+                }
+        printf("branches landing inside a 7-byte site: %d (checked %zu branch targets)\n\n", bad, g_ntargets);
+        if (bad || g_redzone_sites) g_fail = 1;
+    }
     printf("  nr  name                     sites  example function\n");
     for (nr = 0; nr < MAX_NR; nr++)
         if (g_nr_count[nr])
@@ -359,5 +393,6 @@ int main(int argc, char **argv) {
             printf("  fs:[0x%02zx] (slot %zu): %d\n", i * 8, i, g_fs_disp_count[i]);
     if (g_fs_disp_other) printf("  other displacements: %d\n", g_fs_disp_other);
     printf("rdfsbase/wrfsbase instructions: %d\n", g_fsbase_ins);
-    return 0;
+    if (g_fail) printf("\nSCAN FAILED: some syscall sites are unsafe to patch\n");
+    return g_fail;
 }

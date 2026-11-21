@@ -33,6 +33,11 @@ static int g_ready;
 
 long afw_tls_patch_count(void) { return g_patches; }
 
+int afw_tls_teb_offset(int slot) {
+    if (!g_ready || slot < 0 || slot >= BIONIC_TLS_SLOTS) return -1;
+    return TEB_TLS_SLOTS + 8 * (int)g_slot[slot];
+}
+
 /* Find the fs: prefix and disp32 of an "fs:[disp32]" instruction. */
 static unsigned char *find_fs_disp(unsigned char *ip, unsigned char **disp, int *reg_form) {
     unsigned char *p = ip, *fs = NULL;
@@ -111,6 +116,7 @@ void afw_tls_thread_init(void) {
 #else
 /* Linux: fs: already works natively; nothing to patch. */
 long afw_tls_patch_count(void) { return 0; }
+int afw_tls_teb_offset(int slot) { (void)slot; return -1; }
 int afw_tls_init(void) { afw_tls_thread_init(); return 0; }
 void afw_tls_thread_init(void) {
     if (!t_block) t_block = (uintptr_t *)calloc(BIONIC_TLS_SLOTS, sizeof(uintptr_t));
