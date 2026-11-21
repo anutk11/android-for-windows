@@ -103,6 +103,14 @@ static SYSV int s_cxa_atexit(atexit_fn fn, void *arg, void *dso) {
 }
 static SYSV void s_cxa_finalize(void *dso) { (void)dso; }
 
+/* pthread_atfork, registered by crtbegin_so.o. Windows has no fork(), so
+ * these handlers can never run. */
+typedef SYSV void (*fork_fn)(void);
+static SYSV int s_register_atfork(fork_fn prepare, fork_fn parent, fork_fn child, void *dso) {
+    (void)prepare; (void)parent; (void)child; (void)dso;
+    return 0;
+}
+
 void afw_shim_run_atexit(void) {
     while (g_atexit_count > 0) {
         g_atexit_count--;
@@ -147,6 +155,7 @@ static const shim_entry g_shims[] = {
     S("__stack_chk_fail", s_stack_chk_fail),
     S("__stack_chk_guard", &g_stack_chk_guard),
     S("__cxa_atexit", s_cxa_atexit), S("__cxa_finalize", s_cxa_finalize),
+    S("__register_atfork", s_register_atfork),
     S("__android_log_write", s_android_log_write),
 };
 #undef S
