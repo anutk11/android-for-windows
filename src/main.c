@@ -13,6 +13,7 @@
 #include "elf_loader.h"
 #include "platform.h"
 #include "tls_patch.h"
+#include "crash.h"
 
 #define AFW_VERSION "0.2.0-M1-dev"
 
@@ -84,6 +85,8 @@ int main(int argc, char **argv) {
     afw_lib lib;
     int verbose = 1, rc = 0;
 
+    setvbuf(stdout, NULL, _IONBF, 0); /* never lose output on a crash */
+    afw_crash_init();
     printf("Android-for-Windows loader %s\n", AFW_VERSION);
     printf("bionic-win provides %d functions\n\n", afw_shim_count());
 

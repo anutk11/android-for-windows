@@ -46,6 +46,10 @@ int afw_load(const char *path, afw_lib *lib, int verbose);
 /* Find an exported symbol (like dlsym). */
 void *afw_sym(const afw_lib *lib, const char *name);
 
+/* Describe an address: "libfoo.so+0x1234 (near some_function)".
+ * Returns 0 if the address is not inside any loaded library. */
+int afw_describe_address(uintptr_t addr, char *out, size_t outsz);
+
 /* Run destructors. */
 void afw_unload(afw_lib *lib);
 

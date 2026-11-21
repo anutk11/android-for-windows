@@ -23,6 +23,41 @@
 
 typedef SYSV void (*init_fn)(void);
 
+#define MAX_LIBS 64
+static afw_lib *g_libs[MAX_LIBS];
+static int g_nlibs;
+
+int afw_describe_address(uintptr_t addr, char *out, size_t outsz) {
+    int k;
+    for (k = 0; k < g_nlibs; k++) {
+        const afw_lib *lib = g_libs[k];
+        uintptr_t b = (uintptr_t)lib->base;
+        const char *best = NULL;
+        uint64_t best_v = 0, off;
+        size_t i;
+        if (addr < b || addr >= b + lib->size) continue;
+        off = (uint64_t)(addr - (uintptr_t)lib->bias);
+        for (i = 1; i < lib->nsyms; i++) {
+            const Elf64_Sym *s = &lib->symtab[i];
+            if (s->st_shndx == SHN_UNDEF || ELF64_ST_TYPE(s->st_info) != STT_FUNC) continue;
+            if (s->st_value <= off && s->st_value >= best_v) {
+                best_v = s->st_value;
+                best = lib->strtab + s->st_name;
+            }
+        }
+        if (best)
+            snprintf(out, outsz, "%s+0x%llx (%s+0x%llx)",
+                     lib->soname ? lib->soname : lib->path, (unsigned long long)off,
+                     best, (unsigned long long)(off - best_v));
+        else
+            snprintf(out, outsz, "%s+0x%llx", lib->soname ? lib->soname : lib->path,
+                     (unsigned long long)off);
+        return 1;
+    }
+    snprintf(out, outsz, "%p (outside Android libraries)", (void *)addr);
+    return 0;
+}
+
 static unsigned char *read_file(const char *path, size_t *out_size) {
     FILE *f = fopen(path, "rb");
     unsigned char *buf;
@@ -278,6 +313,8 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
         printf("\nSymbols:    %zu\n", lib->nsyms);
     }
 
+    if (g_nlibs < MAX_LIBS) g_libs[g_nlibs++] = lib;
+
     /* 4. Resolve symbols against bionic-win -------------------------- */
     symaddr = (uint64_t *)calloc(lib->nsyms ? lib->nsyms : 1, sizeof(uint64_t));
     for (i = 1; i < lib->nsyms; i++) {
@@ -336,6 +373,8 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
     afw_flush_icache(lib->base, lib->size);
 
     /* 7. Constructors ------------------------------------------------ */
+    if (verbose) printf("Running %zu constructor(s)...\n",
+                        lib->init_array_count + (lib->init ? 1 : 0));
     if (lib->init) ((init_fn)(uintptr_t)lib->init)();
     for (i = 0; i < lib->init_array_count; i++) {
         uint64_t f = lib->init_array[i];
