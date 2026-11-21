@@ -1,0 +1,6 @@
+out/
+pkg/
+*.obj
+*.exe
+*.so
+*.zip

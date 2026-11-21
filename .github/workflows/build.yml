@@ -1,0 +1,82 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # 1. Build a real Android library with Google's Android NDK
+  android-lib:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build libhello.so (Android x86_64, API 24)
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          echo "Using NDK: $NDK"
+          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          mkdir -p out
+          "$TC/clang" --target=x86_64-linux-android24 -shared -fPIC -O2 \
+            -fno-stack-protector -U_FORTIFY_SOURCE \
+            -Wl,--pack-dyn-relocs=none -Wl,-soname,libhello.so \
+            -o out/libhello.so test/hello.c -llog
+          "$TC/llvm-readelf" -h -d out/libhello.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libhello
+          path: out/libhello.so
+
+  # 2. Build the loader on Windows and run the Android library with it
+  windows:
+    needs: android-lib
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: libhello
+          path: out
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Build afw-loader.exe
+        shell: cmd
+        run: build.bat
+      - name: Run M0 tests on Windows
+        shell: cmd
+        run: out\afw-loader.exe out\libhello.so
+      - name: Package
+        shell: cmd
+        run: |
+          mkdir pkg
+          copy out\afw-loader.exe pkg\
+          copy out\libhello.so pkg\
+          copy tools\run-test.bat pkg\
+      - uses: actions/upload-artifact@v4
+        with:
+          name: afw-windows
+          path: pkg/*
+
+  # 3. Publish a download link: Releases -> nightly
+  release:
+    needs: windows
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: afw-windows
+          path: pkg
+      - name: Publish nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd pkg && zip -r ../android-for-windows-nightly.zip . && cd ..
+          gh release delete nightly --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
+          gh release create nightly android-for-windows-nightly.zip \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "Nightly build (${GITHUB_SHA::7})" \
+            --notes "Unzip and double-click run-test.bat"
