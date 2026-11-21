@@ -12,8 +12,9 @@
 #include "bionic_shim.h"
 #include "elf_loader.h"
 #include "platform.h"
+#include "tls_patch.h"
 
-#define AFW_VERSION "0.1.0-M0"
+#define AFW_VERSION "0.2.0-M1-dev"
 
 /* Signatures of the test library's functions (Android = System V ABI). */
 typedef const char *(SYSV *greeting_fn)(void);
@@ -22,6 +23,7 @@ typedef int (SYSV *init_value_fn)(void);
 typedef void (SYSV *say_fn)(const char *);
 typedef int (SYSV *callback_fn)(int);
 typedef int (SYSV *apply_fn)(callback_fn, int);
+typedef int (SYSV *stack_test_fn)(int);
 
 /* A Windows function that Android code will call back into. */
 static SYSV int times_ten(int x) { return x * 10; }
@@ -38,6 +40,7 @@ static int run_m0_tests(const afw_lib *lib) {
     init_value_fn init_value = (init_value_fn)afw_sym(lib, "afw_init_value");
     say_fn say = (say_fn)afw_sym(lib, "afw_say");
     apply_fn apply = (apply_fn)afw_sym(lib, "afw_apply");
+    stack_test_fn stack_test = (stack_test_fn)afw_sym(lib, "afw_stack_test");
 
     printf("\n=== M0 tests: calling Android code from Windows ===\n");
     check("exported functions found", greeting && add && init_value && say && apply);
@@ -63,6 +66,12 @@ static int run_m0_tests(const afw_lib *lib) {
         printf("  afw_apply(times_ten, 7) -> %d\n", r);
         check("Android code called back into Windows code", r == 70);
     }
+    if (stack_test) {
+        int r = stack_test(4);
+        printf("  afw_stack_test(4) -> %d  (fs: instructions rewritten: %ld)\n",
+               r, afw_tls_patch_count());
+        check("stack protector works (fs:[0x28] TLS emulation)", r == 96);
+    }
     printf("  afw_say(\"Windows\") prints:\n");
     say("Windows");
     check("Android code used malloc/strcpy/puts/logcat via bionic-win", 1);
@@ -83,6 +92,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     if (argc > 2 && strcmp(argv[2], "-v") == 0) verbose = 2;
+    if (afw_tls_init() != 0) return 1;
 
     if (afw_load(argv[1], &lib, verbose) != 0) {
         printf("\nLoad failed.\n");

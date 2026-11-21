@@ -22,14 +22,15 @@ jobs:
           TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
           mkdir -p out
           "$TC/clang" --target=x86_64-linux-android24 -shared -fPIC -O2 \
-            -fno-stack-protector -U_FORTIFY_SOURCE \
+            -U_FORTIFY_SOURCE \
             -Wl,--pack-dyn-relocs=none -Wl,-soname,libhello.so \
             -o out/libhello.so test/hello.c -llog
           "$TC/llvm-readelf" -h -d out/libhello.so
+          cp "$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/x86_64-linux-android/libc++_shared.so" out/
       - uses: actions/upload-artifact@v4
         with:
           name: libhello
-          path: out/libhello.so
+          path: out/*.so
 
   # 2. Build the loader on Windows and run the Android library with it
   windows:
@@ -48,6 +49,10 @@ jobs:
       - name: Run M0 tests on Windows
         shell: cmd
         run: out\afw-loader.exe out\libhello.so
+      - name: "Explore: load the NDK's real libc++_shared.so"
+        continue-on-error: true
+        shell: cmd
+        run: out\afw-loader.exe out\libc++_shared.so
       - name: "Experiment: fs: TLS on Windows"
         shell: cmd
         run: |

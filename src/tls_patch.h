@@ -1,0 +1,34 @@
+/*
+ * tls_patch.h - Make Linux/bionic "fs:" thread-local accesses work on Windows.
+ *
+ * Android code reads per-thread data with "fs:[offset]" (e.g. the stack
+ * guard at fs:[0x28]). Windows x64 gives programs no usable fs segment, so
+ * those instructions fault. We catch the fault and rewrite the instruction
+ * once, in place, to "gs:[TEB TlsSlot]" - same length, native speed after.
+ * See tools/fs_probe.c for the experiment that proved this.
+ */
+#ifndef AFW_TLS_PATCH_H
+#define AFW_TLS_PATCH_H
+
+#include <stdint.h>
+
+/* bionic x86_64 TLS slots (fs:[8*slot]) */
+#define BIONIC_TLS_SLOTS 16
+#define TLS_SLOT_SELF 0
+#define TLS_SLOT_THREAD_ID 1
+#define TLS_SLOT_STACK_GUARD 5
+
+/* Install the fault handler and set up the calling thread. */
+int afw_tls_init(void);
+
+/* Set up a new thread's bionic TLS block. Call at the start of every thread
+ * that will run Android code. */
+void afw_tls_thread_init(void);
+
+/* Number of instructions rewritten so far. */
+long afw_tls_patch_count(void);
+
+/* Current thread's bionic TLS slots (what fs:0 points to on Android). */
+uintptr_t *afw_tls_block(void);
+
+#endif

@@ -31,6 +31,16 @@ int afw_apply(int (*fn)(int), int x) {
     return fn(x);
 }
 
+/* Has a local array, so the NDK's -fstack-protector-strong inserts a stack
+ * guard check: reads fs:[0x28] on entry and exit. */
+int afw_stack_test(int n) {
+    volatile char buf[64];
+    int i, sum = 0;
+    for (i = 0; i < 64; i++) buf[i] = (char)(i % n);
+    for (i = 0; i < 64; i++) sum += buf[i];
+    return sum;
+}
+
 void afw_say(const char *name) {
     size_t n = strlen(name) + 32;
     char *buf = (char *)malloc(n);
