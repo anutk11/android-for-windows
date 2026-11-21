@@ -265,7 +265,7 @@ int main(int argc, char **argv) {
 
     for (i = 0; i < eh->e_phnum; i++)
         if (ph[i].p_type == PT_LOAD && (ph[i].p_flags & PF_X))
-            scan(f + ph[i].p_offset, ph[i].p_filesz, ph[i].p_vaddr, 0);
+            scan(f + ph[i].p_offset, ph[i].p_filesz, ph[i].p_vaddr, 1);
 
     for (nr = 0; nr < MAX_NR; nr++) if (g_nr_count[nr]) distinct++;
     printf("\nsyscall instructions: %d  (number resolved: %d, unknown: %d)\n",
