@@ -34,6 +34,30 @@ jobs:
           name: libhello
           path: out/*.so
 
+  # Gate G1 experiment: static scan of the real bionic libc.so.
+  # The extracted Android files are NOT uploaded (licensing): only the report.
+  bionic-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Extract real bionic libc.so from an Android 14 x86_64 image
+        run: bash tools/fetch_bionic.sh
+      - name: Build the scanner (Zydis)
+        run: bash tools/build_scan.sh
+      - name: Scan libc.so
+        run: |
+          DBG=""; [ -f out/bionic/libc.debug ] && DBG=out/bionic/libc.debug
+          out/scan/syscall_scan out/bionic/libc.so $DBG | tee out/libc-scan.txt
+          if [ -f out/bionic/linker64 ]; then
+            out/scan/syscall_scan out/bionic/linker64 | tee out/linker64-scan.txt
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bionic-scan-report
+          path: out/*-scan.txt
+
   # 2. Build the loader on Windows and run the Android library with it
   windows:
     needs: android-lib
