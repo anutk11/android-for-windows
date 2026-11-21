@@ -86,6 +86,7 @@ echo "== libc.so from: $GOT"
 file "$W/libc.so"; ls -la "$W"
 
 # Hidden function names: bionic keeps an xz-compressed .symtab in .gnu_debugdata
-if objcopy --dump-section .gnu_debugdata="$W/debugdata.xz" "$W/libc.so" 2>/dev/null; then
+objcopy --dump-section .gnu_debugdata="$W/debugdata.xz" "$W/libc.so" /dev/null 2>/dev/null || true
+if [ -s "$W/debugdata.xz" ]; then
   xz -dc "$W/debugdata.xz" > "$W/libc.debug" && echo "== .gnu_debugdata symbols extracted"
 fi
