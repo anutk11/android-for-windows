@@ -95,6 +95,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     if (argc > 2 && strcmp(argv[2], "-v") == 0) verbose = 2;
+    if (afw_check_security() != 0) return 1;
     if (afw_tls_init() != 0) return 1;
 
     if (afw_load(argv[1], &lib, verbose) != 0) {

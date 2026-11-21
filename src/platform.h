@@ -25,6 +25,11 @@
 #  define SYSV __attribute__((sysv_abi))
 #else
 #  define SYSV
+/* Check Windows exploit-protection policies that would block the engine
+ * (ACG forbids creating or patching executable memory). Can be forced on a
+ * program from outside, by an administrator. Returns 0 if we can run. */
+int afw_check_security(void);
+
 #endif
 
 /* Memory protection flags (same bits as ELF PF_*) */
@@ -40,5 +45,10 @@ void *afw_mem_alloc(size_t size);
 int afw_mem_protect(void *addr, size_t size, int prot);
 /* Make sure the CPU sees freshly written code. */
 void afw_flush_icache(void *addr, size_t size);
+
+/* Check Windows exploit-protection policies that would block the engine
+ * (ACG forbids creating or patching executable memory). Can be forced on a
+ * program from outside, by an administrator. Returns 0 if we can run. */
+int afw_check_security(void);
 
 #endif

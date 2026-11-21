@@ -98,11 +98,21 @@ static const char *func_at(uint64_t addr) {
     return g_funcs[lo].name;
 }
 
+static uint64_t func_end(uint64_t addr) {
+    size_t i;
+    for (i = 0; i < g_nfuncs; i++)
+        if (g_funcs[i].addr > addr) return g_funcs[i].addr;
+    return addr + 256;
+}
+
 /* ---- results ---- */
 #define MAX_NR 1024
 static int g_nr_count[MAX_NR];
 static const char *g_nr_example[MAX_NR];
 static int g_sites, g_unresolved;
+static int g_pattern7;        /* "mov eax, imm32 ; syscall" adjacent = 7 bytes */
+static int g_redzone_sites;   /* syscall site in a function that uses [rsp-N] */
+static const unsigned char *g_code_base; static uint64_t g_code_vaddr; static size_t g_code_size;
 static int g_fs_abs, g_fs_reg, g_fsbase_ins;
 static int g_fs_disp_count[64];      /* fs:[8*i], i < 64 */
 static int g_fs_disp_other;
@@ -127,12 +137,36 @@ static int writes_eax(const ZydisDecodedInstruction *ins, const ZydisDecodedOper
     return 0;
 }
 
+/* Does the function containing ip touch memory below rsp ([rsp - N])? */
+static int uses_red_zone(uint64_t ip) {
+    ZydisDecoder dec;
+    ZydisDecodedInstruction ins;
+    ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+    uint64_t a = 0, e = func_end(ip);
+    size_t lo = 0, hi = g_nfuncs;
+    while (hi - lo > 1) { size_t m = (lo + hi) / 2; if (g_funcs[m].addr <= ip) lo = m; else hi = m; }
+    if (g_nfuncs) a = g_funcs[lo].addr;
+    if (a < g_code_vaddr || e > g_code_vaddr + g_code_size || e - a > 65536) return -1;
+    ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+    while (a < e) {
+        int i;
+        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, g_code_base + (a - g_code_vaddr), e - a, &ins, ops))) { a++; continue; }
+        for (i = 0; i < ins.operand_count_visible; i++)
+            if (ops[i].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[i].mem.base == ZYDIS_REGISTER_RSP &&
+                ops[i].mem.disp.value < 0) return 1;
+        a += ins.length;
+    }
+    return 0;
+}
+
 static void scan(const unsigned char *code, size_t size, uint64_t vaddr, int verbose) {
     ZydisDecoder dec;
     ZydisDecodedInstruction ins;
     ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
     size_t off = 0;
     int64_t eax = -1; /* last known immediate in eax, -1 = unknown */
+    uint64_t prev_end = 0; int prev_mov_eax = 0;
+    g_code_base = code; g_code_vaddr = vaddr; g_code_size = size;
     const char *eax_func = NULL;
 
     ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
@@ -140,7 +174,7 @@ static void scan(const unsigned char *code, size_t size, uint64_t vaddr, int ver
         uint64_t ip = vaddr + off;
         int i;
         if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, code + off, size - off, &ins, ops))) {
-            off++; eax = -1;
+            off++; eax = -1; prev_mov_eax = 0;
             continue;
         }
         /* fs: memory operands */
@@ -166,7 +200,11 @@ static void scan(const unsigned char *code, size_t size, uint64_t vaddr, int ver
 
         if (ins.mnemonic == ZYDIS_MNEMONIC_SYSCALL) {
             const char *fn = func_at(ip);
+            int rz = uses_red_zone(ip);
             g_sites++;
+            if (prev_mov_eax && prev_end == ip) g_pattern7++;
+            else printf("  not the 7-byte pattern: syscall at 0x%llx in %s\n", (unsigned long long)ip, fn);
+            if (rz == 1) { g_redzone_sites++; printf("  RED ZONE: syscall at 0x%llx in %s uses [rsp-N]\n", (unsigned long long)ip, fn); }
             if (eax >= 0 && eax < MAX_NR && eax_func == fn) {
                 g_nr_count[eax]++;
                 if (!g_nr_example[eax]) g_nr_example[eax] = fn;
@@ -188,6 +226,10 @@ static void scan(const unsigned char *code, size_t size, uint64_t vaddr, int ver
                    writes_eax(&ins, ops)) {
             eax = -1;
         }
+        prev_mov_eax = (ins.mnemonic == ZYDIS_MNEMONIC_MOV && ins.length == 5 &&
+                        ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER && ops[0].reg.value == ZYDIS_REGISTER_EAX &&
+                        ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE);
+        prev_end = ip + ins.length;
         off += ins.length;
     }
 }
@@ -263,6 +305,38 @@ int main(int argc, char **argv) {
         printf("\n\n");
     }
 
+    /* Build ID (PT_NOTE, NT_GNU_BUILD_ID) */
+    for (i = 0; i < eh->e_phnum; i++) {
+        size_t o, end;
+        if (ph[i].p_type != 4 /* PT_NOTE */) continue;
+        o = ph[i].p_offset; end = o + ph[i].p_filesz;
+        while (o + 12 <= end) {
+            uint32_t nsz, dsz, type, k;
+            memcpy(&nsz, f + o, 4); memcpy(&dsz, f + o + 4, 4); memcpy(&type, f + o + 8, 4);
+            if (type == 3 && nsz == 4 && memcmp(f + o + 12, "GNU", 4) == 0) {
+                printf("build id: ");
+                for (k = 0; k < dsz; k++) printf("%02x", f[o + 12 + 4 + k]);
+                printf("\n");
+            }
+            o += 12 + ((nsz + 3) & ~3u) + ((dsz + 3) & ~3u);
+        }
+    }
+    /* GWP-ASan controls: environment variables / properties named in the binary */
+    {
+        size_t k;
+        printf("GWP-ASan control strings:");
+        for (k = 0; k + 8 < n; k++) {
+            if ((memcmp(f + k, "GWP_ASAN", 8) == 0 || memcmp(f + k, "gwp_asan.", 9) == 0) &&
+                (k == 0 || f[k - 1] == 0 || f[k - 1] == '.')) {
+                size_t st = k;
+                while (st > 0 && f[st - 1] >= 0x20 && f[st - 1] < 0x7f) st--;
+                printf(" \"%s\"", (const char *)f + st);
+                k += strlen((const char *)f + k);
+            }
+        }
+        printf("\n");
+    }
+
     for (i = 0; i < eh->e_phnum; i++)
         if (ph[i].p_type == PT_LOAD && (ph[i].p_flags & PF_X))
             scan(f + ph[i].p_offset, ph[i].p_filesz, ph[i].p_vaddr, 1);
@@ -270,7 +344,9 @@ int main(int argc, char **argv) {
     for (nr = 0; nr < MAX_NR; nr++) if (g_nr_count[nr]) distinct++;
     printf("\nsyscall instructions: %d  (number resolved: %d, unknown: %d)\n",
            g_sites, g_sites - g_unresolved, g_unresolved);
-    printf("distinct Linux syscalls: %d\n\n", distinct);
+    printf("distinct Linux syscalls: %d\n", distinct);
+    printf("sites with the 7-byte \"mov eax, imm32; syscall\" pattern: %d of %d\n", g_pattern7, g_sites);
+    printf("sites inside functions that use the red zone: %d\n\n", g_redzone_sites);
     printf("  nr  name                     sites  example function\n");
     for (nr = 0; nr < MAX_NR; nr++)
         if (g_nr_count[nr])

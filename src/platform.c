@@ -3,9 +3,33 @@
  */
 #include "platform.h"
 
+#include <stdio.h>
+
 #if defined(_WIN32)
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+
+int afw_check_security(void) {
+    PROCESS_MITIGATION_DYNAMIC_CODE_POLICY dyn = {0};
+    PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY cfg = {0};
+    int ok = 1;
+    if (GetProcessMitigationPolicy(GetCurrentProcess(), ProcessDynamicCodePolicy, &dyn, sizeof dyn) &&
+        dyn.ProhibitDynamicCode) {
+        fprintf(stderr,
+                "error: Arbitrary Code Guard (ACG) is enabled for this program.\n"
+                "       Android code must be loaded into memory and patched, which ACG forbids.\n"
+                "       Check Windows Security > App & browser control > Exploit protection,\n"
+                "       or your organization's policy for afw-loader.exe.\n");
+        ok = 0;
+    }
+    if (GetProcessMitigationPolicy(GetCurrentProcess(), ProcessControlFlowGuardPolicy, &cfg, sizeof cfg) &&
+        cfg.EnableControlFlowGuard)
+        fprintf(stderr, "warning: Control Flow Guard is on; calls into Android code may be blocked\n");
+    return ok ? 0 : -1;
+}
 
 void *afw_mem_alloc(size_t size) {
     return VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -28,6 +52,8 @@ void afw_flush_icache(void *addr, size_t size) {
 
 #else
 #include <sys/mman.h>
+
+int afw_check_security(void) { return 0; }
 
 void *afw_mem_alloc(size_t size) {
     void *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
