@@ -22,7 +22,7 @@ jobs:
           TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
           mkdir -p out
           "$TC/clang" --target=x86_64-linux-android24 -shared -fPIC -O2 \
-            -U_FORTIFY_SOURCE \
+            -fstack-protector-strong -U_FORTIFY_SOURCE \
             -Wl,--pack-dyn-relocs=none -Wl,-soname,libhello.so \
             -o out/libhello.so test/hello.c -llog
           "$TC/llvm-readelf" -h -d out/libhello.so

@@ -160,6 +160,7 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
     Elf64_Ehdr *eh;
     Elf64_Phdr *ph;
     uint64_t lo = UINT64_MAX, hi = 0;
+    Elf64_Phdr dyn_copy, relro_copy;     /* copies: the file buffer is freed early */
     Elf64_Phdr *dyn_ph = NULL, *relro_ph = NULL;
     const uint32_t *hash = NULL, *gnu_hash = NULL;
     const Elf64_Rela *rela = NULL, *jmprel = NULL;
@@ -209,9 +210,11 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
             if (ph[i].p_vaddr < lo) lo = ph[i].p_vaddr;
             if (ph[i].p_vaddr + ph[i].p_memsz > hi) hi = ph[i].p_vaddr + ph[i].p_memsz;
         } else if (ph[i].p_type == PT_DYNAMIC) {
-            dyn_ph = &ph[i];
+            dyn_copy = ph[i];
+            dyn_ph = &dyn_copy;
         } else if (ph[i].p_type == PT_GNU_RELRO) {
-            relro_ph = &ph[i];
+            relro_copy = ph[i];
+            relro_ph = &relro_copy;
         } else if (ph[i].p_type == PT_TLS) {
             fprintf(stderr, "error: thread-local storage (PT_TLS) not supported yet\n");
             free(file); return -1;
