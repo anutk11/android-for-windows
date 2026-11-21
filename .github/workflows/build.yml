@@ -48,6 +48,11 @@ jobs:
       - name: Run M0 tests on Windows
         shell: cmd
         run: out\afw-loader.exe out\libhello.so
+      - name: "Experiment: fs: TLS on Windows"
+        shell: cmd
+        run: |
+          clang-cl /nologo /O2 /Fe:out\fs_probe.exe /Foout\ tools\fs_probe.c
+          out\fs_probe.exe
       - name: Package
         shell: cmd
         run: |
