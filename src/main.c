@@ -17,6 +17,7 @@
 #include "crash.h"
 #include "syscall.h"
 #include "tls_static.h"
+#include "vma.h"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -178,6 +179,19 @@ static int run_syscall_tests(const afw_lib *lib) {
             mr = gen(10, a, 4096, 1, 0, 0, 0);
             printf("  mprotect(.bss page at image+0x%llx, PROT_READ) -> %ld\n",
                    (unsigned long long)((uintptr_t)pg - (uintptr_t)lib->base), mr);
+            if (mr != 0) {   /* diagnosis: the same call directly, the VMA state, the OS call */
+                printf("    direct afw_mprotect -> %lld; VMA allocations %d, extents %zu\n",
+                       (long long)afw_mprotect((uint64_t)a, 4096, 1), afw_vma_alloc_count(), afw_vma_extent_count());
+#if defined(_WIN32)
+                {
+                    DWORD old = 0;
+                    BOOL ok = VirtualProtect((void *)(uintptr_t)a, 4096, PAGE_READONLY, &old);
+                    printf("    VirtualProtect(PAGE_READONLY) -> %d (error %lu, old 0x%lx)\n", (int)ok,
+                           ok ? 0ul : (unsigned long)GetLastError(), (unsigned long)old);
+                    if (ok) VirtualProtect((void *)(uintptr_t)a, 4096, old, &old);
+                }
+#endif
+            }
             check("mprotect(PROT_READ) on the library's own .bss succeeds", mr == 0);
             check("... the contents are kept", pg[0] == 5);
             check("mprotect(PROT_READ|PROT_WRITE) back succeeds, and the page is writable",
