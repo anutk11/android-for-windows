@@ -42,14 +42,26 @@ static LONG WINAPI on_crash(EXCEPTION_POINTERS *ep) {
                 er->ExceptionInformation[0] == 0 ? "reading" :
                 er->ExceptionInformation[0] == 1 ? "writing" : "executing",
                 (unsigned long long)er->ExceptionInformation[1]);
-    fprintf(stderr, "  code: ");
-    for (i = 0; i < 12; i++) fprintf(stderr, "%02x ", ip[i]);
+    {   /* never read through RIP or RSP directly: a call through NULL crashes
+         * at 0 and the report itself would fault (measured on the real libc) */
+        unsigned char code[12];
+        SIZE_T got = 0;
+        fprintf(stderr, "  code: ");
+        if (ReadProcessMemory(GetCurrentProcess(), ip, code, sizeof code, &got) && got)
+            for (i = 0; i < (int)got; i++) fprintf(stderr, "%02x ", code[i]);
+        else
+            fprintf(stderr, "(not readable)");
+    }
     fprintf(stderr, "\n  rax=%llx rbx=%llx rcx=%llx rdx=%llx\n  rsi=%llx rdi=%llx rbp=%llx rsp=%llx\n",
             c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->Rbp, c->Rsp);
     fprintf(stderr, "  possible callers (from stack):\n");
-    for (i = 0; i < 64; i++) {
-        if (afw_describe_address((uintptr_t)sp[i], where, sizeof where))
-            fprintf(stderr, "    %s\n", where);
+    {
+        uint64_t st[64];
+        SIZE_T got = 0;
+        if (ReadProcessMemory(GetCurrentProcess(), sp, st, sizeof st, &got))
+            for (i = 0; i < (int)(got / 8); i++)
+                if (afw_describe_address((uintptr_t)st[i], where, sizeof where))
+                    fprintf(stderr, "    %s\n", where);
     }
     fflush(stderr);
     return EXCEPTION_EXECUTE_HANDLER;
