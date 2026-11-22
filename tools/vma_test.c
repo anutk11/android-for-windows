@@ -4,6 +4,11 @@
  * of every page is also checked with VirtualQuery.
  * Cases from reviewers 2 and 3 (round 7).
  */
+#if !defined(_WIN32)
+#define _POSIX_C_SOURCE 200809L
+#include <time.h>
+#endif
+
 #include "../src/syscall.h"
 #include "../src/vma.h"
 
@@ -24,8 +29,19 @@ static const char *state(uint64_t a) {
     if (mi.Protect == PAGE_READONLY) return "commit-r";
     return "commit-other";
 }
+static double now_ms(void) {
+    LARGE_INTEGER f, t;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t);
+    return (double)t.QuadPart * 1000.0 / (double)f.QuadPart;
+}
 #define WIN_CHECK(what, a, want) check(what, strcmp(state(a), want) == 0)
 #else
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
 #define WIN_CHECK(what, a, want) ((void)0)
 #endif
 
@@ -177,6 +193,160 @@ int main(void) {
     MUNMAP(b, 100);
     check("file mappings not supported yet -> ENODEV", sc(9, 0, 4096, RW, LNX_MAP_PRIVATE, 3, 0) == -19);
     check("prctl(PR_SET_VMA) accepted", sc(157, 0x53564d41, 0, 0, 0, 0, 0) == 0);
+
+    printf("11. 64GB PROT_NONE reservation (Scudo arena scale: <1s, <1MB metadata)\n");
+    {
+        uint64_t g64 = 64ull * 1024 * 1024 * 1024;
+        uint64_t g16 = 16ull * 1024 * 1024 * 1024;
+        uint64_t g32 = 32ull * 1024 * 1024 * 1024;
+        double t0 = now_ms(), dt;
+        size_t meta;
+        b = MMAP(0, g64, 0, ANON | LNX_MAP_NORESERVE);
+        dt = now_ms() - t0;
+        meta = afw_vma_meta_bytes();
+        printf("    64GB PROT_NONE: %.2f ms, metadata %zu bytes, extents %zu\n",
+               dt, meta, afw_vma_extent_count());
+        check("mmap 64GB PROT_NONE succeeded", b > 0);
+        check("completed in < 1000 ms", dt < 1000.0);
+        check("metadata < 1MB", meta < 1024 * 1024);
+        check("represented as a single extent", afw_vma_extent_count() == 1);
+        if (b > 0) {
+            WIN_CHECK("start is reserved", (uint64_t)b, "reserved");
+            WIN_CHECK("middle is reserved", (uint64_t)b + g32, "reserved");
+            check("mprotect 64KB slice at +32GB RW", MPROTECT((uint64_t)b + g32, 64 * K, RW) == 0);
+            p = (unsigned char *)(uintptr_t)((uint64_t)b + g32);
+            p[0] = 0x5c; p[64 * K - 1] = 0x3d;
+            check("slice at +32GB is writable", p[0] == 0x5c && p[64 * K - 1] == 0x3d);
+            WIN_CHECK("slice at +32GB is committed RW", (uint64_t)b + g32, "commit-rw");
+            WIN_CHECK("neighbour page stays reserved", (uint64_t)b + g32 - 4 * K, "reserved");
+            check("trim first 16GB and last 16GB",
+                  MUNMAP(b, g16) == 0 && MUNMAP((uint64_t)b + g64 - g16, g16) == 0);
+            t0 = now_ms();
+            check("munmap over 16GB already-unmapped hole succeeds quickly",
+                  MUNMAP(b, g16) == 0 && (now_ms() - t0) < 1000.0);
+            check("metadata still < 1MB after slicing", afw_vma_meta_bytes() < 1024 * 1024);
+            check("munmap remaining middle 32GB", MUNMAP((uint64_t)b + g16, g32) == 0);
+            check("64GB allocation fully released", afw_vma_alloc_count() == 0 && afw_vma_extent_count() == 0);
+            WIN_CHECK("64GB range is free again", (uint64_t)b, "free");
+        }
+    }
+
+    printf("12. Coalescing of OS calls and extents\n");
+    {
+        uint64_t c0, c1;
+        c0 = afw_vma_os_call_count();
+        b = MMAP(0, 2048 * K, 0, ANON);
+        c1 = afw_vma_os_call_count();
+        check("2MB PROT_NONE: 1 OS call (reserve) and 1 extent",
+              b > 0 && (c1 - c0) == 1 && afw_vma_extent_count() == 1);
+        c0 = afw_vma_os_call_count();
+        check("mprotect 480 pages (1920KB) RW succeeds", MPROTECT(b + 64 * K, 1920 * K, RW) == 0);
+        c1 = afw_vma_os_call_count();
+        printf("    480-page mprotect used %llu OS call(s)\n", (unsigned long long)(c1 - c0));
+        check("480-page mprotect coalesced into 1 OS call", (c1 - c0) == 1);
+        check("split into 3 extents [res, RW, res]", afw_vma_extent_count() == 3);
+        c0 = afw_vma_os_call_count();
+        check("redundant mprotect with same prot makes 0 OS calls",
+              MPROTECT(b + 64 * K, 1920 * K, RW) == 0 && afw_vma_os_call_count() == c0);
+        check("sub-range mprotect RO creates 5 extents",
+              MPROTECT(b + 128 * K, 64 * K, LNX_PROT_READ) == 0 && afw_vma_extent_count() == 5);
+        check("restoring RW coalesces back to 3 extents",
+              MPROTECT(b + 128 * K, 64 * K, RW) == 0 && afw_vma_extent_count() == 3);
+        c0 = afw_vma_os_call_count();
+        check("munmap whole 2MB releases allocation in <= 2 OS calls",
+              MUNMAP(b, 2048 * K) == 0 && (afw_vma_os_call_count() - c0) <= 2 &&
+              afw_vma_alloc_count() == 0 && afw_vma_extent_count() == 0);
+    }
+
+    printf("13. OS failure injection: metadata stays truthful on failure\n");
+    {
+        /* 13a: commit fails on a fresh mmap(RW) -> reservation rolled back */
+        afw_vma_test_fail_os(2);   /* 1 = os_reserve succeeds, 2 = os_commit fails */
+        check("mmap(RW) rolls back reservation when commit fails",
+              MMAP(0, 64 * K, RW, ANON) == -12 && afw_vma_alloc_count() == 0);
+        afw_vma_test_fail_os(0);
+
+        /* 13b: multi-extent mprotect fails on 2nd OS call */
+        b = MMAP(0, 16 * K, 0, ANON);
+        check("prepare [RO, reserved, reserved, reserved]", MPROTECT(b, 4 * K, LNX_PROT_READ) == 0);
+        afw_vma_test_fail_os(2);   /* 1 = os_protect(RO->RW) ok, 2 = os_commit(res->RW) fails */
+        check("mprotect across [RO, reserved] returns ENOMEM on 2nd OS call",
+              MPROTECT(b, 8 * K, RW) == -12);
+        afw_vma_test_fail_os(0);
+        p = (unsigned char *)(uintptr_t)b;
+        p[0] = 0x42;
+        check("first extent truthfully became RW", p[0] == 0x42);
+        WIN_CHECK("first extent is commit-rw", (uint64_t)b, "commit-rw");
+        WIN_CHECK("second extent stayed reserved", (uint64_t)b + 4 * K, "reserved");
+        check("retry mprotect(8K, RW) commits second extent cleanly", MPROTECT(b, 8 * K, RW) == 0);
+        check("first extent kept 0x42, second extent is zeroed", p[0] == 0x42 && all_zero(p + 4 * K, 4 * K));
+        MUNMAP(b, 16 * K);
+
+        /* 13c: MADV_DONTNEED decommit succeeds, recommit fails -> metadata drops P_COMMIT */
+        b = MMAP(0, 8 * K, RW, ANON);
+        p = (unsigned char *)(uintptr_t)b;
+        memset(p, 0x99, 8 * K);
+        afw_vma_test_fail_os(2);   /* 1 = os_decommit ok, 2 = os_commit fails */
+        check("madvise(DONTNEED) returns ENOMEM when recommit fails",
+              MADVISE(b, 8 * K, LNX_MADV_DONTNEED) == -12);
+        afw_vma_test_fail_os(0);
+        WIN_CHECK("dropped back to reserved after recommit failure", (uint64_t)b, "reserved");
+        /* If metadata had falsely kept P_COMMIT, Windows would call VirtualProtect
+         * on MEM_RESERVE here and fail; committing proves metadata is truthful. */
+        check("mprotect(RW) afterwards commits cleanly with zeros",
+              MPROTECT(b, 8 * K, RW) == 0 && all_zero(p, 8 * K));
+        MUNMAP(b, 8 * K);
+
+        /* 13d: MAP_FIXED_NOREPLACE rejects mapped ranges and accepts holes */
+        b = MMAP(0, 16 * K, RW, ANON);
+        check("MAP_FIXED_NOREPLACE over mapped page -> EEXIST",
+              MMAP(b + 4 * K, 4 * K, RW, ANON | LNX_MAP_FIXED_NOREPLACE) == -17);
+        check("munmap hole, then MAP_FIXED_NOREPLACE succeeds",
+              MUNMAP(b + 4 * K, 4 * K) == 0 &&
+              MMAP(b + 4 * K, 4 * K, RW, ANON | LNX_MAP_FIXED_NOREPLACE) == b + 4 * (int64_t)K);
+        MUNMAP(b, 16 * K);
+
+        /* 13e: MAP_FIXED over committed page where decommit succeeds and commit fails */
+        b = MMAP(0, 8 * K, RW, ANON);
+        p = (unsigned char *)(uintptr_t)b;
+        memset(p, 0xdd, 8 * K);
+        afw_vma_test_fail_os(2);   /* 1 = os_decommit ok, 2 = os_commit fails */
+        check("MAP_FIXED over live page returns ENOMEM when recommit fails",
+              MMAP(b, 4 * K, RW, ANON | LNX_MAP_FIXED) == -12);
+        afw_vma_test_fail_os(0);
+        WIN_CHECK("first page truthfully dropped to reserved", (uint64_t)b, "reserved");
+        WIN_CHECK("second page stayed committed RW", (uint64_t)b + 4 * K, "commit-rw");
+        check("second page kept its data", p[4 * K] == 0xdd);
+        check("retry MAP_FIXED succeeds and zeroes first page",
+              MMAP(b, 4 * K, RW, ANON | LNX_MAP_FIXED) == b && all_zero(p, 4 * K) && p[4 * K] == 0xdd);
+        MUNMAP(b, 8 * K);
+        check("all test-13 allocations released", afw_vma_alloc_count() == 0);
+    }
+
+    printf("14. Multiple allocations: sorted lookup and hole validation\n");
+    {
+        uint64_t s[3], tmp;
+        int i, j;
+        int64_t a1 = MMAP(0, 16 * K, RW, ANON);
+        int64_t a2 = MMAP(0, 16 * K, RW, ANON);
+        int64_t a3 = MMAP(0, 16 * K, RW, ANON);
+        check("three allocations live", a1 > 0 && a2 > 0 && a3 > 0 && afw_vma_alloc_count() == 3);
+        s[0] = (uint64_t)a1; s[1] = (uint64_t)a2; s[2] = (uint64_t)a3;
+        for (i = 0; i < 3; i++)
+            for (j = i + 1; j < 3; j++)
+                if (s[j] < s[i]) { tmp = s[i]; s[i] = s[j]; s[j] = tmp; }
+        /* Unmap the middle allocation to guarantee a gap between s[0] and s[2]. */
+        check("unmap middle allocation to create a guaranteed gap", MUNMAP(s[1], 16 * K) == 0);
+        check("mprotect spanning gap between s[0] and s[2] fails with ENOMEM",
+              MPROTECT(s[0], (s[2] - s[0]) + 4 * K, LNX_PROT_READ) == -12);
+        ((unsigned char *)(uintptr_t)s[0])[0] = 0x7e;
+        check("s[0] stayed writable (not partially mutated)",
+              ((unsigned char *)(uintptr_t)s[0])[0] == 0x7e);
+        check("munmap remaining two allocations",
+              MUNMAP(s[2], 16 * K) == 0 && MUNMAP(s[0], 16 * K) == 0);
+        check("zero allocations and extents remain",
+              afw_vma_alloc_count() == 0 && afw_vma_extent_count() == 0);
+    }
 
     printf("\n%s\n", failed ? "VMA TESTS FAILED" : "VMA TESTS PASSED");
     return failed ? 1 : 0;
