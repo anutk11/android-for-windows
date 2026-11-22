@@ -44,6 +44,11 @@ typedef struct afw_lib_s {
     struct { uint64_t *where; uint64_t resolver; } *irel;
     size_t nirel, capirel;             /* 1-based static TLS module id, 0 = no PT_TLS */
 
+    /* phase A done, phase B (TLS close, IFUNC, RELRO, constructors) not yet */
+    int pending;
+    unsigned char *pageprot;
+    size_t npages, relro_first, relro_last;
+
     /* report */
     int nrelocs;
     int nimports_shimmed;

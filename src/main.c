@@ -554,8 +554,10 @@ int main(int argc, char **argv) {
     if (afw_sym(&lib, "afw_deps_check")) {
         typedef int (SYSV *dfn)(void);
         printf("\nDependency test (--with-deps):\n");
-        check("the import resolves to the loaded dependency", ((dfn)afw_sym(&lib, "afw_deps_check"))() == 42);
-        check("it was linked to a library, not to bionic-win", lib.nimports_linked >= 1);
+        check("imports, an imported IFUNC and TLS: 30 + 5 + 7, constructor of the dependency first",
+              ((dfn)afw_sym(&lib, "afw_deps_check"))() == 42);
+        check("it was linked to a library, not to bionic-win", lib.nimports_linked >= 3);
+        check("it has TLS although the dependency loaded first has none", lib.tls_module >= 1);
         printf("%s\n", g_failed ? "DEPS TEST FAILED" : "DEPS TEST PASSED");
         rc |= g_failed;
     }

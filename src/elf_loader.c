@@ -92,13 +92,36 @@ static unsigned char *read_file(const char *path, size_t *out_size) {
 /* A defined, exported symbol of an already loaded library other than self
  * (load order = dependency order, as the global scope of a dynamic linker). */
 void *afw_sym(const afw_lib *lib, const char *name);
-static void *global_lookup(const char *name, const afw_lib *self) {
+static const Elf64_Sym *find_def(const afw_lib *lib, const char *name) {
+    size_t i;
+    for (i = 1; i < lib->nsyms; i++) {
+        const Elf64_Sym *s = &lib->symtab[i];
+        if (s->st_shndx != SHN_UNDEF && ELF64_ST_BIND(s->st_info) != STB_LOCAL &&
+            strcmp(lib->strtab + s->st_name, name) == 0)
+            return s;
+    }
+    return NULL;
+}
+
+#ifndef STT_GNU_IFUNC
+#define STT_GNU_IFUNC 10
+#endif
+
+/* An import defined by another loaded library. Never runs library code: for
+ * an IFUNC it returns the RESOLVER and sets *is_ifunc; the importer runs the
+ * resolver in its own step 6c, after the exporting library is finished
+ * (libc's memcpy, strlen... are IFUNCs on x86_64). */
+static void *global_lookup(const char *name, const afw_lib *self, int *is_ifunc) {
     int k;
+    *is_ifunc = 0;
     for (k = 0; k < g_nlibs; k++) {
-        void *p;
+        const Elf64_Sym *s;
         if (g_libs[k] == self) continue;
-        p = afw_sym(g_libs[k], name);
-        if (p) return p;
+        s = find_def(g_libs[k], name);
+        if (s) {
+            *is_ifunc = ELF64_ST_TYPE(s->st_info) == STT_GNU_IFUNC;
+            return (void *)(g_libs[k]->bias + s->st_value);
+        }
     }
     return NULL;
 }
@@ -153,13 +176,9 @@ static int defer_ifunc(afw_lib *lib, uint64_t *where, uint64_t resolver) {
     return 0;
 }
 
-#ifndef STT_GNU_IFUNC
-#define STT_GNU_IFUNC 10
-#endif
-
 /* Apply one array of RELA relocations. */
 static int apply_rela(afw_lib *lib, const Elf64_Rela *rel, size_t count,
-                      const uint64_t *symaddr) {
+                      const uint64_t *symaddr, const unsigned char *imp_ifunc) {
     size_t i;
     for (i = 0; i < count; i++) {
         uint32_t type = ELF64_R_TYPE(rel[i].r_info);
@@ -168,10 +187,11 @@ static int apply_rela(afw_lib *lib, const Elf64_Rela *rel, size_t count,
         uint64_t S = sym ? symaddr[sym] : 0;
         int64_t A = rel[i].r_addend;
 
-        /* a symbol of this library that is an IFUNC: its value is the RESOLVER;
-         * the address comes from running it, later (step 6c) */
-        if (sym && lib->symtab[sym].st_shndx != SHN_UNDEF &&
-            ELF64_ST_TYPE(lib->symtab[sym].st_info) == STT_GNU_IFUNC &&
+        /* an IFUNC of this library, or one imported from another loaded
+         * library: S is the RESOLVER; the address comes from running it,
+         * later (step 6c) */
+        if (sym && ((lib->symtab[sym].st_shndx != SHN_UNDEF &&
+                     ELF64_ST_TYPE(lib->symtab[sym].st_info) == STT_GNU_IFUNC) || imp_ifunc[sym]) &&
             (type == R_X86_64_64 || type == R_X86_64_GLOB_DAT || type == R_X86_64_JUMP_SLOT)) {
             if (afw_load_patch_only) continue;
             if (A != 0) { fprintf(stderr, "error: IFUNC relocation with an addend\n"); return -1; }
@@ -268,6 +288,10 @@ static int patch_readable(const void *ctx, uint64_t addr, uint64_t len) {
     return afw_lib_readable((const afw_lib *)ctx, addr, len);
 }
 
+static int g_defer_finish;
+static int lib_finish(afw_lib *lib, int verbose);
+static void discard(afw_lib *lib);
+
 static int load_inner(const char *path, afw_lib *lib, int verbose) {
     size_t fsize = 0, i;
     unsigned char *file;
@@ -285,6 +309,7 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
     int64_t pltrel = DT_RELA;
     uint64_t soname_off = 0, needed_off[AFW_MAX_NEEDED];
     uint64_t *symaddr;
+    unsigned char *imp_ifunc;
     unsigned char *pageprot;
     size_t npages;
 
@@ -471,6 +496,11 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
 
     /* 4. Resolve symbols against bionic-win -------------------------- */
     symaddr = (uint64_t *)calloc(lib->nsyms ? lib->nsyms : 1, sizeof(uint64_t));
+    imp_ifunc = (unsigned char *)calloc(lib->nsyms ? lib->nsyms : 1, 1);
+    if (!symaddr || !imp_ifunc) {
+        fprintf(stderr, "error: out of memory\n");
+        free(symaddr); free(imp_ifunc); free(pageprot); return -1;
+    }
     for (i = 1; i < lib->nsyms; i++) {
         const Elf64_Sym *s = &lib->symtab[i];
         const char *name = lib->strtab + s->st_name;
@@ -484,9 +514,11 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
         if (!name[0]) continue;
         {
             void *shim = afw_shim_lookup(name);
-            void *glob = loader_override(name) ? NULL : global_lookup(name, lib);
+            int gi = 0;
+            void *glob = loader_override(name) ? NULL : global_lookup(name, lib, &gi);
             if (glob) {                                 /* another loaded library defines it */
                 symaddr[i] = (uint64_t)(uintptr_t)glob;
+                imp_ifunc[i] = (unsigned char)gi;
                 lib->nimports_linked++;
                 if (verbose > 1) printf("  library  %s\n", name);
             } else if (shim) {
@@ -511,13 +543,13 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
         relr = NULL; rela = NULL; jmprel = NULL;
     }
     if (relr) apply_relr(lib, relr, relrsz / 8);
-    if (rela && apply_rela(lib, rela, relasz / sizeof(Elf64_Rela), symaddr) != 0) {
-        free(symaddr); free(pageprot); return -1;
+    if (rela && apply_rela(lib, rela, relasz / sizeof(Elf64_Rela), symaddr, imp_ifunc) != 0) {
+        free(symaddr); free(imp_ifunc); free(pageprot); return -1;
     }
-    if (jmprel && apply_rela(lib, jmprel, pltrelsz / sizeof(Elf64_Rela), symaddr) != 0) {
-        free(symaddr); free(pageprot); return -1;
+    if (jmprel && apply_rela(lib, jmprel, pltrelsz / sizeof(Elf64_Rela), symaddr, imp_ifunc) != 0) {
+        free(symaddr); free(imp_ifunc); free(pageprot); return -1;
     }
-    free(symaddr);
+    free(symaddr); free(imp_ifunc);
 
     /* 5b. Load-time patching of syscall / fs: instructions ------------ */
     {
@@ -615,32 +647,54 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
     }
     afw_flush_icache(lib->base, lib->size);
 
+    lib->pageprot = pageprot;
+    lib->npages = npages;
+    if (relro_ph) {
+        lib->relro_first = (size_t)((ALIGN_DOWN(relro_ph->p_vaddr, AFW_PAGE_SIZE) - lo) / AFW_PAGE_SIZE);
+        lib->relro_last = (size_t)((ALIGN_DOWN(relro_ph->p_vaddr + relro_ph->p_memsz, AFW_PAGE_SIZE) - lo) / AFW_PAGE_SIZE);
+    }
+    lib->pending = 1;
+    if (g_defer_finish) return 0;      /* afw_load_with_deps finishes the whole set together */
+    return lib_finish(lib, verbose);
+}
+
+/* Phase B: everything that runs library code or closes the TLS layout.
+ * With dependencies, every library of the set is mapped, relocated and
+ * patched (phase A) before the first one gets here - like Android's linker,
+ * which relocates the whole set before any constructor. Otherwise a
+ * dependency without TLS (libdl) would close the static TLS layout before
+ * the library that has TLS (libc) is even mapped (measured, PR #11). */
+static int lib_finish(afw_lib *lib, int verbose) {
+    size_t i;
+    unsigned char *pageprot = lib->pageprot;
+    size_t npages = lib->npages;
+    lib->pageprot = NULL;
+    lib->pending = 0;
+
     if (!afw_load_patch_only) {
         /* 6b. Static TLS layout is final now: every thread block, including this
          *     thread's, gets the relocated .tdata images. Before any library code. */
         if (afw_tls_static_finish() != 0) { free(pageprot); return -1; }
 
-        /* 6c. IRELATIVE resolvers: the first library code to run, on patched,
-         *     executable code, writing into pages that are still writable */
+        /* 6c. IFUNC resolvers (this library's and imported ones): the first
+         *     library code to run, on patched, executable code, writing into
+         *     pages that are still writable */
         for (i = 0; i < lib->nirel; i++) {
             typedef SYSV uint64_t (*resolver_fn)(void);
             resolver_fn r = (resolver_fn)(uintptr_t)lib->irel[i].resolver;
             *lib->irel[i].where = r();
         }
-        if (verbose && lib->nirel) printf("IFUNC:      %zu resolver(s) run after patching\n", lib->nirel);
+        if (verbose && lib->nirel) printf("IFUNC:      %zu resolver(s) run after patching (%s)\n", lib->nirel,
+                                          lib->soname ? lib->soname : lib->path);
     }
     free(lib->irel); lib->irel = NULL; lib->nirel = lib->capirel = 0;
 
     /* 6d. RELRO: read-only from now on --------------------------------- */
-    if (relro_ph) {
-        size_t p, first = (size_t)((ALIGN_DOWN(relro_ph->p_vaddr, AFW_PAGE_SIZE) - lo) / AFW_PAGE_SIZE);
-        size_t last = (size_t)((ALIGN_DOWN(relro_ph->p_vaddr + relro_ph->p_memsz, AFW_PAGE_SIZE) - lo) / AFW_PAGE_SIZE);
-        for (p = first; p < last && p < npages; p++) {
-            pageprot[p] &= (unsigned char)~PF_W;
-            if (afw_mem_protect(lib->base + p * AFW_PAGE_SIZE, AFW_PAGE_SIZE, pageprot[p]) != 0) {
-                fprintf(stderr, "error: cannot apply RELRO\n");
-                free(pageprot); return -1;
-            }
+    for (i = lib->relro_first; i < lib->relro_last && i < npages; i++) {
+        pageprot[i] &= (unsigned char)~PF_W;
+        if (afw_mem_protect(lib->base + i * AFW_PAGE_SIZE, AFW_PAGE_SIZE, pageprot[i]) != 0) {
+            fprintf(stderr, "error: cannot apply RELRO\n");
+            free(pageprot); return -1;
         }
     }
     free(pageprot);
@@ -648,8 +702,8 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
     if (afw_load_patch_only) return 0;
 
     /* 7. Constructors ------------------------------------------------ */
-    if (verbose) printf("Running %zu constructor(s)...\n",
-                        lib->init_array_count + (lib->init ? 1 : 0));
+    if (verbose) printf("Running %zu constructor(s) of %s...\n",
+                        lib->init_array_count + (lib->init ? 1 : 0), lib->soname ? lib->soname : lib->path);
     if (lib->init) ((init_fn)(uintptr_t)lib->init)();
     for (i = 0; i < lib->init_array_count; i++) {
         uint64_t f = lib->init_array[i];
@@ -730,7 +784,7 @@ static int find_lib(const char *name, const char *dir, char *out, size_t outsz) 
     return 0;
 }
 
-int afw_load_with_deps(const char *path, afw_lib *lib, afw_lib *deps, int maxdeps, int *ndeps, int verbose) {
+static int prepare_with_deps(const char *path, afw_lib *lib, afw_lib *deps, int maxdeps, int *ndeps, int verbose) {
     const char *names[AFW_MAX_NEEDED];
     unsigned char *buf = NULL;
     char dir[1024], found[1200];
@@ -748,7 +802,7 @@ int afw_load_with_deps(const char *path, afw_lib *lib, afw_lib *deps, int maxdep
         }
         if (*ndeps >= maxdeps) { fprintf(stderr, "error: too many libraries\n"); free(buf); return -1; }
         if (verbose) printf("\n== dependency %s (of %s)\n", found, path);
-        if (afw_load_with_deps(found, &deps[(*ndeps)++], deps, maxdeps, ndeps, verbose) != 0) {
+        if (prepare_with_deps(found, &deps[(*ndeps)++], deps, maxdeps, ndeps, verbose) != 0) {
             fprintf(stderr, "error: dependency %s failed to load\n", found);
             free(buf); return -1;
         }
@@ -758,9 +812,27 @@ int afw_load_with_deps(const char *path, afw_lib *lib, afw_lib *deps, int maxdep
     return afw_load(path, lib, verbose);
 }
 
-int afw_load(const char *path, afw_lib *lib, int verbose) {
-    int k, rc = load_inner(path, lib, verbose);
-    if (rc == 0) return 0;
+int afw_load_with_deps(const char *path, afw_lib *lib, afw_lib *deps, int maxdeps, int *ndeps, int verbose) {
+    int k, first = g_nlibs, rc;
+    g_defer_finish = 1;
+    rc = prepare_with_deps(path, lib, deps, maxdeps, ndeps, verbose);
+    g_defer_finish = 0;
+    if (rc != 0) {                       /* nothing of the set ran: undo it, newest first */
+        for (k = g_nlibs - 1; k >= first; k--) discard(g_libs[k]);
+        return -1;
+    }
+    if (verbose) printf("\n== all %d libraries mapped and relocated; TLS layout closes now\n", g_nlibs - first);
+    for (k = first; k < g_nlibs; k++)    /* dependency order: a library after the ones it needs */
+        if (g_libs[k]->pending && lib_finish(g_libs[k], verbose) != 0) {
+            fprintf(stderr, "error: %s failed after library code ran; the set stays loaded\n",
+                    g_libs[k]->soname ? g_libs[k]->soname : g_libs[k]->path);
+            return -1;
+        }
+    return 0;
+}
+
+static void discard(afw_lib *lib) {
+    int k;
     for (k = 0; k < g_nlibs; k++)
         if (g_libs[k] == lib) { memmove(&g_libs[k], &g_libs[k + 1], (size_t)(g_nlibs - k - 1) * sizeof *g_libs); g_nlibs--; break; }
     if (lib->tls_module && afw_tls_static_unregister(lib->tls_module) != 0)
@@ -769,24 +841,24 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
     free(lib->irel); lib->irel = NULL; lib->nirel = lib->capirel = 0;
     if (lib->base) afw_mem_free(lib->base, lib->size + AFW_STUB_RESERVE);
     lib->base = NULL; lib->stub_area = NULL;
+    free(lib->pageprot); lib->pageprot = NULL; lib->pending = 0;
+}
+
+int afw_load(const char *path, afw_lib *lib, int verbose) {
+    int rc = load_inner(path, lib, verbose);
+    if (rc != 0) discard(lib);
     return rc;
 }
 
 void *afw_sym(const afw_lib *lib, const char *name) {
-    size_t i;
-    for (i = 1; i < lib->nsyms; i++) {
-        const Elf64_Sym *s = &lib->symtab[i];
-        if (s->st_shndx != SHN_UNDEF && ELF64_ST_BIND(s->st_info) != STB_LOCAL &&
-            strcmp(lib->strtab + s->st_name, name) == 0) {
-            if (ELF64_ST_TYPE(s->st_info) == STT_GNU_IFUNC) {   /* the value is the resolver */
-                typedef SYSV void *(*resolver_fn)(void);
-                if (afw_load_patch_only) return NULL;            /* measuring: never run library code */
-                return ((resolver_fn)(uintptr_t)(lib->bias + s->st_value))();
-            }
-            return (void *)(lib->bias + s->st_value);
-        }
+    const Elf64_Sym *s = find_def(lib, name);
+    if (!s) return NULL;
+    if (ELF64_ST_TYPE(s->st_info) == STT_GNU_IFUNC) {   /* the value is the resolver */
+        typedef SYSV void *(*resolver_fn)(void);
+        if (afw_load_patch_only || lib->pending) return NULL;  /* never run unfinished library code */
+        return ((resolver_fn)(uintptr_t)(lib->bias + s->st_value))();
     }
-    return NULL;
+    return (void *)(lib->bias + s->st_value);
 }
 
 void afw_unload(afw_lib *lib) {
