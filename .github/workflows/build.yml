@@ -250,14 +250,16 @@ jobs:
       - name: "G1: extract the real bionic on this Windows runner (never uploaded)"
         shell: bash
         run: python -I tools/fetch_bionic.py out/bionic
-      - name: "G1: Android code calling the REAL libc.so on Windows - informational"
-        continue-on-error: true
+      - name: "G1: Android code calling the REAL libc.so on Windows (required)"
         timeout-minutes: 3
         shell: cmd
         run: |
           set AFW_LIB_PATH=out\bionic
-          out\afw-loader.exe out\libreal_libc_test.so --with-deps --watchdog=60 2>&1
-          echo exit code %errorlevel%
+          out\afw-loader.exe out\libreal_libc_test.so --with-deps --watchdog=60 > out\real-libc.txt 2>&1
+          set rc=%errorlevel%
+          type out\real-libc.txt
+          if not "%rc%"=="0" (echo the loader exited with %rc% & exit /b 1)
+          findstr /c:"REAL LIBC TEST PASSED" out\real-libc.txt >nul || (echo real libc test did not pass & exit /b 1)
       - name: "G1 probe: load the real libc.so for real (constructors run) - informational"
         continue-on-error: true
         timeout-minutes: 3       # a hang is a result too: the output so far is printed live

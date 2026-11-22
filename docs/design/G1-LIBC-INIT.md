@@ -63,7 +63,31 @@ linker's `constexpr` constructor leaves. On top of that:
 NT_GNU_BUILD_ID is the pinned one, and refuses any other. A different build would read
 and write the wrong fields.
 
-## Where it stands now
+## Result (measured on Windows CI)
+
+**The real libc.so's six constructors finish, and Android code calls it.**
+`test/real_libc_test.c`, built with the NDK against libc.so, passes all 11 checks with
+the real bionic: snprintf, scudo malloc/free (small, and 8MB through mmap), qsort,
+errno (strtol ERANGE), pthread_self, getpid, clock_gettime, strdup, printf to the
+console, strerror. This is now a required CI step.
+
+What it took, in the order the measurements showed:
+
+| Stop | Cause | Fix |
+|---|---|---|
+| libc refused | the first library closed the TLS layout | two-phase loading |
+| constructor at an unrelocated address | `DT_ANDROID_RELR` ignored | read it; refuse `DT_TEXTREL` |
+| `__loader_shared_globals` missing | | measured layout, pinned to the Build ID |
+| errno written to 0x260c | `tp[1]` held a thread id | pthread_internal_t / bionic_tls area |
+| `WriteProtected mprotect` ENOMEM | the VMA layer did not know the image | `afw_vma_adopt` (reviewer 4, PR #14) |
+| hang | futex ENOSYS | futex over WaitOnAddress, clock_gettime, getrandom, uid |
+| hang (with no syscall) | the VEH deadlocked on its own lock on a non-fs fault | filter before the lock; per-thread guard |
+| call through NULL | libdl's `__loader_*` imports are weak, ld-android not loaded | the linker API in `loader_api.c` |
+
+Diagnosis tools that came out of this: `--watchdog=N` (native stack by name, last
+syscall and caller), and safe crash reports.
+
+## Where it stood before
 
 With the TCB fixed (below) and `writev` in place, the constructors no longer crash. libc
 aborts on purpose and says why:
