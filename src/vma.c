@@ -703,8 +703,17 @@ int afw_vma_adopt(uint64_t base, uint64_t size, const unsigned char *page_prot) 
     LOCK();
     idx = lower_bound_alloc(base);
     if (idx < g_n && g_a[idx].base == base && g_a[idx].size == size) {
+        size_t i;
         if (g_a[idx].owned) { UNLOCK(); free(ext); return -LNX_EEXIST; }
-        /* Idempotent re-adopt (e.g. after RELRO): replace extents atomically. */
+        /* Re-adopt contract (reviewer 2, PR #14): allowed only while the whole
+         * range is still mapped and committed (before munmap / decommit). */
+        if (g_a[idx].mapped_bytes != size) { UNLOCK(); free(ext); return -LNX_EINVAL; }
+        for (i = 0; i < g_a[idx].next; i++) {
+            if ((g_a[idx].ext[i].state & (P_MAPPED | P_COMMIT)) != (P_MAPPED | P_COMMIT)) {
+                UNLOCK(); free(ext); return -LNX_EINVAL;
+            }
+        }
+        /* Replace extents atomically (e.g. after RELRO). */
         free(g_a[idx].ext);
         g_a[idx].ext = ext;
         g_a[idx].next = nruns;

@@ -414,10 +414,21 @@ int main(void) {
             WIN_CHECK(".bss stayed commit-rw", bss, "commit-rw");
             WIN_CHECK("stub area stayed commit-rx", stub, "commit-rx");
 
+            /* Decommit via PROT_NONE + MADV_DONTNEED: still mapped, not committed -> re-adopt refused */
+            check("decommit .bss via PROT_NONE + MADV_DONTNEED",
+                  MPROTECT(bss, 4 * K, 0) == 0 && MADVISE(bss, 4 * K, LNX_MADV_DONTNEED) == 0);
+            WIN_CHECK(".bss dropped to reserved", bss, "reserved");
+            check("re-adopt after decommit is refused with -EINVAL (reviewer 2 contract)",
+                  afw_vma_adopt(ibase, img_sz, lnx_prot) == -22);
+
             /* Even full munmap of image (+ overshoot into stub) must NOT release VirtualAlloc or touch stub */
             check("munmap across image + stub decommits image only", MUNMAP(ibase, img_sz + stub_sz) == 0);
             WIN_CHECK("image page is decommitted (reserved)", ibase, "reserved");
             WIN_CHECK("stub area is STILL commit-rx after full image munmap", stub, "commit-rx");
+            check("re-adopt after munmap is refused with -EINVAL (reviewer 2 contract)",
+                  afw_vma_adopt(ibase, img_sz, lnx_prot) == -22);
+            check("mprotect on unmapped image still fails with -ENOMEM after refused re-adopt",
+                  MPROTECT(ibase, 4 * K, RW) == -12);
 
             /* Interior forget and partial-overlap adopt must be refused */
             check("partial-overlap adopt refused with -EEXIST",
