@@ -14,6 +14,7 @@
 #include "bionic_shim.h"
 #include "funcs.h"
 #include "platform.h"
+#include "tls_static.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,7 +30,11 @@ int afw_load_allow_unproven;
 
 int afw_gate_ok(const afw_lib *lib) {
     const afw_patch_report *r = &lib->patch;
-    return !r->unproven && !r->lsda_failures && !r->sys_untouched && !r->sys_outside_functions;
+    return !r->unproven && !r->lsda_failures && !r->sys_untouched && !r->sys_outside_functions &&
+           !r->fs_unsupported &&
+           /* every fs:[reg] must really be rewritten (Windows); measurement mode
+            * reports what Windows would do */
+           (afw_load_patch_only || r->fs_reg_trampolined == r->fs_reg_feasible);
 }
 
 #define MAX_LIBS 64
@@ -128,6 +133,36 @@ static int apply_rela(afw_lib *lib, const Elf64_Rela *rel, size_t count,
         case R_X86_64_GLOB_DAT:
         case R_X86_64_JUMP_SLOT: *where = S; break;
         case R_X86_64_RELATIVE: *where = (uint64_t)lib->bias + A; break;
+        /* TLS: a symbol's value is its offset inside its module's TLS block.
+         * sym 0 (static __thread) means this library, S = 0 (reviewer 3). */
+        case R_X86_64_TPOFF64:
+        case R_X86_64_DTPMOD64:
+        case R_X86_64_DTPOFF64: {
+            const Elf64_Sym *sy = sym ? &lib->symtab[sym] : NULL;
+            uint64_t sv = sy ? sy->st_value : 0;
+            if (afw_load_patch_only) break;
+            if (sy && sy->st_shndx == SHN_UNDEF) {
+                fprintf(stderr, "error: TLS symbol %s is defined in another library; not supported in G1\n",
+                        lib->strtab + sy->st_name);
+                return -1;
+            }
+            if (sy && ELF64_ST_TYPE(sy->st_info) != STT_TLS) {
+                fprintf(stderr, "error: TLS relocation against non-TLS symbol %s\n", lib->strtab + sy->st_name);
+                return -1;
+            }
+            if (!lib->tls_module) {
+                fprintf(stderr, "error: TLS relocation in a library without PT_TLS\n");
+                return -1;
+            }
+            if (type == R_X86_64_DTPMOD64) *where = (uint64_t)lib->tls_module;
+            else if (type == R_X86_64_DTPOFF64) *where = sv + (uint64_t)A;
+            else *where = sv + (uint64_t)A - afw_tls_static_off(lib->tls_module);  /* negative */
+            break;
+        }
+        case R_X86_64_TLSDESC:
+            if (afw_load_patch_only) break;
+            fprintf(stderr, "error: TLSDESC relocation (TLS descriptors) not supported yet\n");
+            return -1;
         case R_X86_64_IRELATIVE: {
             typedef SYSV uint64_t (*resolver_fn)(void);
             if (afw_load_patch_only) break;  /* never run library code when measuring */
@@ -186,10 +221,10 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
     Elf64_Ehdr *eh;
     Elf64_Phdr *ph;
     uint64_t lo = UINT64_MAX, hi = 0;
-    Elf64_Phdr dyn_copy, relro_copy;     /* copies: the file buffer is freed early */
+    Elf64_Phdr dyn_copy, relro_copy, tls_copy;  /* copies: the file buffer is freed early */
     uint64_t eh_hdr_vaddr = 0;
     int skip_relocs = 0;
-    Elf64_Phdr *dyn_ph = NULL, *relro_ph = NULL;
+    Elf64_Phdr *dyn_ph = NULL, *relro_ph = NULL, *tls_ph = NULL;
     const uint32_t *hash = NULL, *gnu_hash = NULL;
     const Elf64_Rela *rela = NULL, *jmprel = NULL;
     size_t relasz = 0, pltrelsz = 0, relrsz = 0;
@@ -258,11 +293,8 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
             relro_copy = ph[i];
             relro_ph = &relro_copy;
         } else if (ph[i].p_type == PT_TLS) {
-            if (!afw_load_patch_only) {
-                fprintf(stderr, "error: thread-local storage (PT_TLS) not supported yet\n");
-                free(file); return -1;
-            }
-            fprintf(stderr, "note: PT_TLS present (ignored in measurement mode)\n");
+            if (afw_load_patch_only) fprintf(stderr, "note: PT_TLS present (ignored in measurement mode)\n");
+            else { tls_copy = ph[i]; tls_ph = &tls_copy; }
         }
     }
     if (lo == UINT64_MAX || !dyn_ph) {
@@ -368,6 +400,21 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
     }
 
     if (g_nlibs < MAX_LIBS) g_libs[g_nlibs++] = lib;
+
+    /* 3b. Static TLS: register this library's PT_TLS (its .tdata image stays
+     *     in the mapped library; each thread copies it after relocation). */
+    if (tls_ph) {
+        afw_tls_segment seg;
+        seg.p_vaddr = tls_ph->p_vaddr; seg.p_align = tls_ph->p_align;
+        seg.p_memsz = tls_ph->p_memsz; seg.p_filesz = tls_ph->p_filesz;
+        lib->tls_module = afw_tls_static_register((const void *)(lib->bias + tls_ph->p_vaddr), &seg,
+                                                  lib->soname ? lib->soname : path);
+        if (!lib->tls_module) return -1;
+        if (verbose) printf("TLS:        module %d, %llu bytes (%llu initialised), align %llu, at tp-%llu\n",
+                            lib->tls_module, (unsigned long long)seg.p_memsz, (unsigned long long)seg.p_filesz,
+                            (unsigned long long)seg.p_align,
+                            (unsigned long long)afw_tls_static_off(lib->tls_module));
+    }
 
     /* 4. Resolve symbols against bionic-win -------------------------- */
     symaddr = (uint64_t *)calloc(lib->nsyms ? lib->nsyms : 1, sizeof(uint64_t));
@@ -477,10 +524,13 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
             fprintf(stderr,
                     "error: refusing to run %s: patching left %d unproven syscall/fs: look-alikes,\n"
                     "       %d undecodable exception tables, %d untouched syscall sites and %d syscall\n"
-                    "       bytes outside known functions. Code we cannot prove safe is not run.\n"
+                    "       bytes outside known functions, %d unsupported fs: accesses,\n"
+                    "       %d fs:[reg] accesses not rewritten (rewriting exists on Windows only).\n"
+                    "       Code we cannot prove safe is not run.\n"
                     "       (--allow-unproven overrides this, for diagnosis only)\n",
                     path, lib->patch.unproven, lib->patch.lsda_failures, lib->patch.sys_untouched,
-                    lib->patch.sys_outside_functions);
+                    lib->patch.sys_outside_functions, lib->patch.fs_unsupported,
+                    lib->patch.fs_reg_feasible - lib->patch.fs_reg_trampolined);
             free(pageprot); return -1;
         }
         afw_mem_protect(lib->stub_area, AFW_STUB_RESERVE, AFW_PROT_R | AFW_PROT_X);
@@ -510,7 +560,11 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
 
     if (afw_load_patch_only) return 0;
 
-    /* 7. Constructors ------------------------------------------------ */
+    /* 7. Static TLS layout is final now: every thread block, including this
+     *    thread's, gets the relocated .tdata images. Before any library code. */
+    if (afw_tls_static_finish() != 0) return -1;
+
+    /* 8. Constructors ------------------------------------------------ */
     if (verbose) printf("Running %zu constructor(s)...\n",
                         lib->init_array_count + (lib->init ? 1 : 0));
     if (lib->init) ((init_fn)(uintptr_t)lib->init)();

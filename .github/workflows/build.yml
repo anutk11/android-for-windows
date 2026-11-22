@@ -29,6 +29,19 @@ jobs:
             -Wl,--pack-dyn-relocs=none -o out/libsyscall_test.so test/syscall_test.c
           "$TC/clang" --target=x86_64-linux-android24 -shared -fPIC -O2 \
             -Wl,--pack-dyn-relocs=none -o out/libredzone_test.so test/redzone_test.c
+          "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 \
+            -Wl,--pack-dyn-relocs=none -o out/libtls_test.so test/tls_test.c
+          "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 \
+            -Wl,--pack-dyn-relocs=none -o out/libfs_gate_test.so test/fs_gate_test.c
+          "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 \
+            -Wl,--pack-dyn-relocs=none -o out/libtls_ie_test.so test/tls_ie_test.c
+          echo "--- fs:[reg] forms in libtls_ie_test.so"
+          "$TC/llvm-objdump" -d out/libtls_ie_test.so | grep -E "%fs" 
+          echo "--- G1-TLS: how the NDK compiles thread-local storage (measured, not assumed)"
+          "$TC/llvm-readelf" -lW out/libtls_test.so | grep -E "TLS|Type"
+          "$TC/llvm-readelf" -rW out/libtls_test.so | grep -E "TPOFF|DTP|TLS" || echo "  no TLS relocations"
+          "$TC/llvm-objdump" -d out/libtls_test.so | grep -E "fs:|tls_get_addr" || true
+          if "$TC/llvm-readelf" -rW out/libtls_test.so | grep -q TLSDESC; then echo "TLSDESC emitted: not supported yet"; exit 1; fi
           "$TC/clang++" --target=x86_64-linux-android24 -shared -fPIC -O2 -fstack-protector-strong \
             -Wl,--pack-dyn-relocs=none -o out/libcxx_exception_test.so test/cxx_exception_test.cpp
           echo "--- landing pads in libcxx_exception_test.so (from .gcc_except_table)"
@@ -84,9 +97,26 @@ jobs:
             out/afw-loader "$f" --patch-report 2>&1 | grep -vE "^  MISSING" | tee -a out/patch-scan.txt
           done
           echo "--- expected load-gate results (an unexpected change fails the build)"
+          # libc: RUN - every one of its 17 fs:[reg] sites (gwp_asan ELF TLS) gets a trampoline
+          test "$(grep -c "fs:\[reg\] at libc.so+0x[0-9a-f]*: ELF TLS access, trampoline" out/patch-scan.txt)" -eq 17
+          grep -E "fs:\[reg\] at libc" out/patch-scan.txt || true
           grep -q "GATE libc.so: would RUN" out/patch-scan.txt
           grep -q "GATE ld-android.so: would REFUSE" out/patch-scan.txt   # 3 unproven look-alikes, known
           echo "gate results as expected"
+          echo "--- libc ELF TLS: who uses the TPOFF64 GOT entry (issue #3, proposal 1; issue #4)" | tee out/libc-tls-scan.txt
+          {
+            readelf -lW out/bionic/libc.so | grep -E "Type|TLS"
+            readelf -rW out/bionic/libc.so | grep -E "TPOFF|DTPMOD|DTPOFF" || echo "no TLS relocations"
+            objdump -d --no-show-raw-insn out/bionic/libc.so > out/libc.dis
+            for got in $(readelf -rW out/bionic/libc.so | awk '/TPOFF64/{print $1}' | sed 's/^0*//'); do
+              echo "== instructions that load GOT entry 0x$got (the TPOFF64 value):"
+              grep -n "# $got <\|# $got\b" out/libc.dis | sed 's/^[0-9]*://' || true
+            done
+            echo "== every fs: access other than fs:0x28, with 10 instructions before and 3 after:"
+            grep -nE "%fs:" out/libc.dis | grep -v "%fs:0x28" | cut -d: -f1 | while read n; do
+              echo "----"; sed -n "$((n>10?n-10:1)),$((n+3))p" out/libc.dis
+            done
+          } | tee -a out/libc-tls-scan.txt
           echo "--- full record of every UNPROVEN site (for docs/unproven/)"
           grep "^UNPROVEN-DETAIL" out/patch-scan.txt | sed 's/^UNPROVEN-DETAIL //' > out/unproven-scan.txt
           cat out/unproven-scan.txt
@@ -115,13 +145,22 @@ jobs:
           OUTBIN=out/afw-asan EXTRA_CFLAGS="-g -fsanitize=address,undefined -fno-sanitize-recover=undefined" bash tools/build_linux.sh
           cc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall \
              -o out/vma_test tools/vma_test.c src/vma.c src/syscall.c src/platform.c
+          cc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall -Wextra \
+             -o out/tls_layout_test tools/tls_layout_test.c src/tls_layout.c
       - name: Run all tests under ASan
         run: |
           set -e
           out/vma_test
+          out/tls_layout_test
           out/afw-asan out/libhello.so
           out/afw-asan out/libsyscall_test.so
           out/afw-asan out/libredzone_test.so
+          out/afw-asan out/libtls_test.so
+          if out/afw-asan out/libfs_gate_test.so > out/fsgate.txt 2>&1; then cat out/fsgate.txt; echo "fs: gate did not refuse"; exit 1; fi
+          grep -q "5 unsupported fs: accesses" out/fsgate.txt
+          # fs:[reg] is rewritten on Windows only: on Linux the gate must refuse it
+          if out/afw-asan out/libtls_ie_test.so > out/ie.txt 2>&1; then cat out/ie.txt; echo "fs:[reg] ran unrewritten"; exit 1; fi
+          grep -q "8 fs:\[reg\] accesses not rewritten" out/ie.txt
           out/afw-asan out/libcxx_exception_test.so --patch-report --strict --min-landing-pads=1
           out/afw-asan out/libc++_shared.so --patch-report
 
@@ -163,6 +202,18 @@ jobs:
           if %errorlevel% equ 99 (type out\trap.txt & echo did not trap & exit /b 1)
           type out\trap.txt | findstr /c:"exception 0xc000001d" /c:"REFUSED to patch"
           findstr /c:"the loader REFUSED to patch" out\trap.txt
+      - name: "G1-TLS: ELF thread-local storage, two threads, both access models"
+        shell: cmd
+        run: out\afw-loader.exe out\libtls_test.so
+      - name: "G1-TLS: fs:[reg] accesses through trampolines (gwp_asan form)"
+        shell: cmd
+        run: out\afw-loader.exe out\libtls_ie_test.so
+      - name: "Negative test: unsupported fs: accesses must be refused"
+        shell: cmd
+        run: |
+          out\afw-loader.exe out\libfs_gate_test.so > out\fsgate.txt 2>&1
+          if %errorlevel% equ 0 (type out\fsgate.txt & echo fs: gate did not refuse & exit /b 1)
+          findstr /c:"5 unsupported fs: accesses" out\fsgate.txt
       - name: "Negative test: red zone sites must be refused"
         shell: cmd
         run: out\afw-loader.exe out\libredzone_test.so

@@ -6,6 +6,7 @@
  */
 #include "bionic_shim.h"
 #include "platform.h"
+#include "tls_static.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -157,6 +158,8 @@ static const shim_entry g_shims[] = {
     S("__cxa_atexit", s_cxa_atexit), S("__cxa_finalize", s_cxa_finalize),
     S("__register_atfork", s_register_atfork),
     S("__android_log_write", s_android_log_write),
+    /* TEMPORARY for G1: ahead of libc's own, until bionic's DTV is built (G2) */
+    S("__tls_get_addr", afw_tls_get_addr),
 };
 #undef S
 

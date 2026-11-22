@@ -16,6 +16,14 @@
 #include "tls_patch.h"
 #include "crash.h"
 #include "syscall.h"
+#include "tls_static.h"
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
 
 #define AFW_VERSION "0.2.0-M1-dev"
 
@@ -182,6 +190,241 @@ static int run_syscall_tests(const afw_lib *lib) {
     return g_failed ? 1 : 0;
 }
 
+
+/* ---- G1-TLS (docs/design/G1-TLS.md, section 5) ---------------------- */
+typedef int (SYSV *tls_int_fn)(void);
+typedef long (SYSV *tls_long_fn)(void);
+typedef uintptr_t (SYSV *tls_uptr_fn)(void);
+typedef int *(SYSV *tls_ptr_fn)(void);
+typedef SYSV void (*tls_wait_fn)(void);
+typedef int (SYSV *tls_worker_fn)(int, tls_wait_fn, int);
+
+/* Barrier state: every read and write is atomic (reviewer 2, PR #6 A3). */
+static long g_arrived, g_barrier_open;
+#if defined(_WIN32)
+static long ld(long *p) { return InterlockedCompareExchange(p, 0, 0); }
+static void st(long *p, long v) { InterlockedExchange(p, v); }
+static void inc(long *p) { InterlockedIncrement(p); }
+#else
+static long ld(long *p) { return __atomic_load_n(p, __ATOMIC_SEQ_CST); }
+static void st(long *p, long v) { __atomic_store_n(p, v, __ATOMIC_SEQ_CST); }
+static void inc(long *p) { __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
+#endif
+static SYSV void tls_barrier(void) {          /* two threads meet here, unless the barrier was opened */
+    inc(&g_arrived);
+    while (ld(&g_arrived) < 2 && !ld(&g_barrier_open)) {}
+}
+
+typedef struct { tls_worker_fn fn; int id, use_ie, rc; } tls_job;
+#if defined(_WIN32)
+static DWORD WINAPI tls_thread(LPVOID p) {
+#else
+static void *tls_thread(void *p) {
+#endif
+    tls_job *j = (tls_job *)p;
+    if (afw_tls_thread_init() != 0) { j->rc = -2; tls_barrier(); return 0; }   /* no partial state */
+    j->rc = j->fn(j->id, tls_barrier, j->use_ie);
+    return 0;
+}
+
+/* Every creation and wait is checked (reviewer 2, PR #6 A3). If a thread
+ * cannot be created, the barrier is opened so the other one cannot hang,
+ * and the run reports failure. fail_second simulates that (negative test). */
+static int run_tls_threads(tls_worker_fn fn, int use_ie, int fail_second) {
+    tls_job j[2] = {{fn, 1, use_ie, -1}, {fn, 2, use_ie, -1}};
+    int k, created[2] = {0, 0}, ok = 1;
+    st(&g_arrived, 0); st(&g_barrier_open, 0);
+#if defined(_WIN32)
+    HANDLE h[2] = {NULL, NULL};
+    for (k = 0; k < 2; k++) {
+        h[k] = (k == 1 && fail_second) ? NULL : CreateThread(NULL, 0, tls_thread, &j[k], 0, NULL);
+        created[k] = h[k] != NULL;
+        if (!created[k]) { ok = 0; st(&g_barrier_open, 1); printf("    thread %d could not be created\n", k + 1); }
+    }
+    for (k = 0; k < 2; k++)
+        if (created[k]) {
+            DWORD w = WaitForSingleObject(h[k], 30000);
+            if (w == WAIT_TIMEOUT) {          /* open the barrier, then wait for real: j is on our stack */
+                ok = 0; st(&g_barrier_open, 1);
+                printf("    thread %d did not finish in 30 s\n", k + 1);
+                w = WaitForSingleObject(h[k], INFINITE);
+            }
+            if (w != WAIT_OBJECT_0) {
+                printf("    waiting for thread %d failed (error %lu): stopping, its data is on this stack\n",
+                       k + 1, GetLastError());
+                abort();
+            }
+            CloseHandle(h[k]);
+        }
+#else
+    pthread_t t[2];
+    for (k = 0; k < 2; k++) {
+        created[k] = !(k == 1 && fail_second) && pthread_create(&t[k], NULL, tls_thread, &j[k]) == 0;
+        if (!created[k]) { ok = 0; st(&g_barrier_open, 1); printf("    thread %d could not be created\n", k + 1); }
+    }
+    for (k = 0; k < 2; k++)
+        if (created[k] && pthread_join(t[k], NULL) != 0) {
+            printf("    thread %d could not be joined: stopping, its data is on this stack\n", k + 1);
+            abort();
+        }
+#endif
+    if (j[0].rc || j[1].rc) printf("    worker results: thread 1 -> %d, thread 2 -> %d\n", j[0].rc, j[1].rc);
+    return ok && j[0].rc == 0 && j[1].rc == 0;
+}
+
+/* A new thread whose very first publish fails half way: afterwards it must
+ * have no block and nothing published (all its slots still zero). */
+static int g_init_fail_ok;
+/* p != NULL: go through afw_tls_init(), the entry point a new thread uses
+ * first, and retry through it as well */
+#if defined(_WIN32)
+static DWORD WINAPI init_fail_thread(LPVOID p) {
+#else
+static void *init_fail_thread(void *p) {
+#endif
+    int i, clean = 1, via_init = p != NULL;
+    afw_tls_test_fail_publish(3);
+    if ((via_init ? afw_tls_init() : afw_tls_thread_init()) != -1) clean = 0;
+    if (afw_tls_block() != NULL) clean = 0;
+#if defined(_WIN32)
+    for (i = 0; i < 16; i++) if (afw_tls_published_slot(i) != 0) clean = 0;
+#else
+    (void)i;
+#endif
+    if ((via_init ? afw_tls_init() : afw_tls_thread_init()) != 0 || afw_tls_block() == NULL ||
+        afw_tls_published_slot(0) != (uintptr_t)afw_tls_block())
+        clean = 0;   /* the retry really sets the thread up, not just reports success */
+    g_init_fail_ok = clean;
+    return 0;
+}
+static int run_fail_init_thread(int via_init) {
+    g_init_fail_ok = 0;
+#if defined(_WIN32)
+    HANDLE h = CreateThread(NULL, 0, init_fail_thread, via_init ? (LPVOID)1 : NULL, 0, NULL);
+    if (!h || WaitForSingleObject(h, INFINITE) != WAIT_OBJECT_0) return 0;
+    CloseHandle(h);
+#else
+    pthread_t t;
+    if (pthread_create(&t, NULL, init_fail_thread, via_init ? (void *)1 : NULL) != 0 || pthread_join(t, NULL) != 0)
+        return 0;
+#endif
+    return g_init_fail_ok;
+}
+
+static int run_tls_tests(const afw_lib *lib) {
+    tls_int_fn tdata = (tls_int_fn)afw_sym(lib, "afw_tls_tdata");
+    tls_int_fn tbss = (tls_int_fn)afw_sym(lib, "afw_tls_tbss");
+    tls_long_fn local = (tls_long_fn)afw_sym(lib, "afw_tls_local");
+    tls_uptr_fn aligned = (tls_uptr_fn)afw_sym(lib, "afw_tls_aligned_addr");
+    tls_int_fn first = (tls_int_fn)afw_sym(lib, "afw_tls_aligned_first");
+    tls_ptr_fn gd = (tls_ptr_fn)afw_sym(lib, "afw_tls_addr_gd");
+    tls_ptr_fn ie = (tls_ptr_fn)afw_sym(lib, "afw_tls_addr_ie");
+    tls_worker_fn worker = (tls_worker_fn)afw_sym(lib, "afw_tls_worker");
+    printf("\nG1-TLS tests (ELF thread-local storage):\n");
+    check(".tdata variable has its initial value", tdata() == 0x5eed1234);
+    check(".tbss variable starts at zero", tbss() == 0);
+    check("static __thread (relocation with symbol 0)", local() == 77);
+    check("aligned(64) variable is 64-byte aligned", (aligned() & 63) == 0);
+    check("aligned variable has its initial value", first() == 7);
+    check("general-dynamic address lies below tp", (uintptr_t)gd() < (uintptr_t)afw_tls_block());
+#if defined(_WIN32)
+    check("initial-exec (fs:[0] + TPOFF64) == general-dynamic", ie() == gd());
+    check("two threads, initial-exec: private copies", run_tls_threads(worker, 1, 0));
+#else
+    (void)ie;   /* on Linux fs: belongs to the host C library: initial-exec runs only on Windows */
+#endif
+    check("two threads, general-dynamic: private copies", run_tls_threads(worker, 0, 0));
+    printf("  negative tests (failures must be reported, never hidden or hung):\n");
+    check("second thread cannot be created: reported, no hang", run_tls_threads(worker, 0, 1) == 0);
+    {
+        int *v = gd();
+        int before = *v;
+        uintptr_t *tp_before = afw_tls_block();
+        afw_tls_test_fail_publish(3);           /* fails after 3 slots were already set */
+        check("rebuild whose publish fails after 3 slots returns -1", afw_tls_thread_rebuild() == -1);
+        check("... every slot the CPU sees names the old block again",
+              afw_tls_published_slot(0) == (uintptr_t)tp_before && afw_tls_published_slot(2) == tp_before[2] &&
+              afw_tls_published_slot(5) == tp_before[5]);
+        check("... and the thread keeps its old block and values", afw_tls_block() == tp_before && *gd() == before);
+        afw_tls_test_fail_publish(16);          /* fails at the very last step (FLS) */
+        check("rebuild whose publish fails at the last step returns -1, old block published",
+              afw_tls_thread_rebuild() == -1 && afw_tls_published_slot(0) == (uintptr_t)tp_before);
+        check("new thread whose publish fails after 3 slots: nothing left published", run_fail_init_thread(0));
+        check("... the same through afw_tls_init(): fails, then a retry really sets the thread up",
+              run_fail_init_thread(1));
+        check("a rebuild that succeeds still works afterwards", afw_tls_thread_rebuild() == 0 && *gd() == before);
+    }
+    {
+        afw_tls_index bad;
+        uint64_t memsz = 0;
+        int m = lib->tls_module;
+        (void)bad;
+        memsz = afw_tls_static_memsz(m);
+        check("__tls_get_addr: last byte of the module resolves", afw_tls_static_resolve((uint64_t)m, memsz - 1) != NULL);
+        check("__tls_get_addr: offset == p_memsz refused", afw_tls_static_resolve((uint64_t)m, memsz) == NULL);
+        check("__tls_get_addr: offset > p_memsz refused", afw_tls_static_resolve((uint64_t)m, memsz + 64) == NULL);
+        check("__tls_get_addr: offset near 2^64 refused", afw_tls_static_resolve((uint64_t)m, ~(uint64_t)0) == NULL);
+        check("__tls_get_addr: module 0 / unknown module refused",
+              afw_tls_static_resolve(0, 0) == NULL && afw_tls_static_resolve((uint64_t)m + 1, 0) == NULL);
+    }
+    printf("%s\n", g_failed ? "G1-TLS TESTS FAILED" : "G1-TLS TESTS PASSED");
+    return g_failed ? 1 : 0;
+}
+
+/* fs:[reg] ELF TLS through trampolines (G1-TLS design, section 6) */
+typedef int (SYSV *ie_int_fn)(void);
+typedef void (SYSV *ie_set_fn)(int);
+typedef int (SYSV *ie_and_fn)(int);
+typedef int *(SYSV *ie_ptr_fn)(void);
+static ie_int_fn g_ie_read_b;
+#if defined(_WIN32)
+static DWORD WINAPI ie_thread(LPVOID p) {
+    int *out = (int *)p;
+    if (afw_tls_thread_init() != 0) { *out = -2; return 0; }
+    *out = g_ie_read_b();                    /* this thread's own copy: initial value */
+    return 0;
+}
+#endif
+static int run_ie_tests(const afw_lib *lib) {
+    ie_int_fn read_b = (ie_int_fn)afw_sym(lib, "afw_ie_read_b");
+    ie_set_fn write_a = (ie_set_fn)afw_sym(lib, "afw_ie_write_a");
+    ie_and_fn and_b = (ie_and_fn)afw_sym(lib, "afw_ie_and_b");
+    ie_ptr_fn addr = (ie_ptr_fn)afw_sym(lib, "afw_ie_addr");
+    ie_set_fn store_ret = (ie_set_fn)afw_sym(lib, "afw_ie_store_ret");
+    ie_int_fn test_flags = (ie_int_fn)afw_sym(lib, "afw_ie_test_flags");
+    ie_and_fn branch_after = (ie_and_fn)afw_sym(lib, "afw_ie_branch_after");
+    ie_set_fn incr_a_dummy = NULL;
+    typedef void (SYSV *ie_void_fn)(void);
+    ie_void_fn incr_a = (ie_void_fn)afw_sym(lib, "afw_ie_incr_a");
+    g_ie_read_b = read_b;
+    printf("\nG1-TLS fs:[reg] tests (%d accesses rewritten through trampolines):\n", lib->patch.fs_reg_trampolined);
+    (void)incr_a_dummy;
+    check("all 8 fs:[reg] accesses rewritten", lib->patch.fs_reg_trampolined == 8);
+    check("read fs:[reg+4] (initial value)", read_b() == 22);
+    write_a(5);
+    check("write fs:[reg] lands where tp + TPOFF points", addr()[0] == 5);
+    check("and eax, fs:[reg+4]", and_b(0xF0) == (22 & 0xF0));
+    store_ret(77);
+    check("store right before ret (moved rip-relative mov re-based)", addr()[0] == 77);
+    check("flags from test after the stub (b=22: bit 0 clear)", test_flags() == 1);
+    addr()[1] = 23;
+    check("flags change with the value (b=23)", test_flags() == 0 && read_b() == 23);
+    check("branch target right after the access: predecessor moved instead", branch_after(0) == 24);
+    check("... and the branch to that target still works", branch_after(7) == 1);
+    addr()[0] = 41; incr_a();
+    check("two sites sharing an instruction: read, add, write back", addr()[0] == 42);
+#if defined(_WIN32)
+    {
+        int other = -1;
+        HANDLE t = CreateThread(NULL, 0, ie_thread, &other, 0, NULL);
+        WaitForSingleObject(t, INFINITE); CloseHandle(t);
+        check("another thread reads its own copy (22, not 23)", other == 22);
+    }
+#endif
+    printf("%s\n", g_failed ? "G1-TLS fs:[reg] TESTS FAILED" : "G1-TLS fs:[reg] TESTS PASSED");
+    return g_failed ? 1 : 0;
+}
+
 static int run_redzone_tests(const afw_lib *lib) {
     getpid_fn safe = (getpid_fn)afw_sym(lib, "afw_rz_safe");
     printf("\n=== G1 negative test: red zone ===\n");
@@ -281,6 +524,8 @@ int main(int argc, char **argv) {
     if (afw_sym(&lib, "afw_add")) rc = run_m0_tests(&lib);
     if (afw_sym(&lib, "afw_sys_getpid")) rc |= run_syscall_tests(&lib);
     if (afw_sym(&lib, "afw_rz_safe")) rc |= run_redzone_tests(&lib);
+    if (afw_sym(&lib, "afw_tls_worker")) rc |= run_tls_tests(&lib);
+    if (afw_sym(&lib, "afw_ie_read_b")) rc |= run_ie_tests(&lib);
     if (call_trap) {
         typedef long (SYSV *f1)(int);
         f1 f = (f1)afw_sym(&lib, "afw_sys_branch_into_site");

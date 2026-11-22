@@ -1,0 +1,44 @@
+/*
+ * tls_static.h - ELF static TLS for the libraries loaded at startup
+ * (docs/design/G1-TLS.md). One layout for the whole process, fixed before
+ * any library code runs; every thread gets its own copy of every module's
+ * TLS block, below tp.
+ */
+#ifndef AFW_TLS_STATIC_H
+#define AFW_TLS_STATIC_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include "platform.h"
+#include "tls_layout.h"
+
+/* Register a PT_TLS segment whose initial image (.tdata) is at `image`.
+ * Returns the 1-based module id, or 0 on error (message printed): layout
+ * already fixed, bad alignment, too many modules. */
+int afw_tls_static_register(const void *image, const afw_tls_segment *seg, const char *name);
+
+/* Fix the layout. After this, register() refuses (dynamic TLS is G2).
+ * Rebuilds the calling thread's block. Idempotent. Returns 0 or -1. */
+int afw_tls_static_finish(void);
+
+/* Offset of module `mod` (1-based) below tp, or 0 if unknown. */
+uint64_t afw_tls_static_off(int mod);
+
+/* Allocate and initialise one thread's block. Returns tp (the bionic slot
+ * array), or NULL; *block gets the allocation, which is what
+ * afw_tls_static_free() takes (tp's offset in it depends on the layout at
+ * the time of allocation, so tp alone is not enough). */
+uintptr_t *afw_tls_static_alloc(void **block);
+void afw_tls_static_free(void *block);
+
+/* Address of byte `offset` of module `module` (1-based) for the calling
+ * thread, or NULL if the module does not exist or offset >= its p_memsz. */
+void *afw_tls_static_resolve(uint64_t module, uint64_t offset);
+uint64_t afw_tls_static_memsz(int mod);   /* p_memsz of module mod, 0 if unknown */
+
+/* What general-dynamic code calls (resolved for every library in G1, ahead
+ * of libc's own export: TEMPORARY until bionic's DTV is built in G2). */
+typedef struct { uint64_t module, offset; } afw_tls_index;
+SYSV void *afw_tls_get_addr(const afw_tls_index *ti);
+
+#endif

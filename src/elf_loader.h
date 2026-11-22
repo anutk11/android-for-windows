@@ -39,6 +39,8 @@ typedef struct afw_lib_s {
     int nxsec;
     afw_patch_report patch;
 
+    int tls_module;             /* 1-based static TLS module id, 0 = no PT_TLS */
+
     /* report */
     int nrelocs;
     int nimports_shimmed;
