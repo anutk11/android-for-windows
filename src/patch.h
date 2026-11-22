@@ -78,6 +78,10 @@ typedef struct {
     int nfs_kind;
 } afw_patch_report;
 
+/* If pc is inside an fs:[reg] trampoline, the original instruction it
+ * replaces (for crash reports); otherwise NULL. */
+const void *afw_stub_origin(const void *pc);
+
 /* Name of a Zydis mnemonic id (for the fs: histogram). */
 const char *afw_mnemonic_name(int mnemonic);
 

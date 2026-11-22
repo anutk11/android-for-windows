@@ -47,6 +47,30 @@ static int is_branch(const ZydisDecodedInstruction *ins) {
            ins->meta.category == ZYDIS_CATEGORY_SYSCALL;
 }
 
+/* Any operand, visible or hidden (push/pop/call stack use), touching rsp. */
+static int uses_rsp(const ZydisDecodedInstruction *ins, const ZydisDecodedOperand *ops) {
+    int i;
+    for (i = 0; i < ins->operand_count; i++) {
+        ZydisRegister r = ZYDIS_REGISTER_NONE;
+        if (ops[i].type == ZYDIS_OPERAND_TYPE_REGISTER) r = ops[i].reg.value;
+        if (ops[i].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+            (ops[i].mem.base == ZYDIS_REGISTER_RSP || ops[i].mem.index == ZYDIS_REGISTER_RSP))
+            return 1;
+        if (r == ZYDIS_REGISTER_RSP || r == ZYDIS_REGISTER_ESP || r == ZYDIS_REGISTER_SP || r == ZYDIS_REGISTER_SPL)
+            return 1;
+    }
+    return 0;
+}
+
+/* Control transfer or trap of any kind: never copied into a trampoline. */
+static int transfers_control(const ZydisDecodedInstruction *n) {
+    return is_branch(n) || n->meta.category == ZYDIS_CATEGORY_INTERRUPT || n->meta.category == ZYDIS_CATEGORY_SYSTEM ||
+           n->mnemonic == ZYDIS_MNEMONIC_XBEGIN || n->mnemonic == ZYDIS_MNEMONIC_XABORT ||
+           n->mnemonic == ZYDIS_MNEMONIC_XEND || n->mnemonic == ZYDIS_MNEMONIC_UD0 ||
+           n->mnemonic == ZYDIS_MNEMONIC_UD1 || n->mnemonic == ZYDIS_MNEMONIC_UD2 ||
+           n->mnemonic == ZYDIS_MNEMONIC_INT3 || n->mnemonic == ZYDIS_MNEMONIC_HLT;
+}
+
 static int uses_r11(const ZydisDecodedInstruction *ins, const ZydisDecodedOperand *ops) {
     int i;
     for (i = 0; i < ins->operand_count; i++) {
@@ -441,6 +465,23 @@ static int has_fs_operand(const ZydisDecodedInstruction *ins, const ZydisDecoded
     return 0;
 }
 
+/* Which original instruction a trampoline stands for (crash reports). */
+#define AFW_MAX_STUB_NOTES 4096
+static struct { const unsigned char *lo, *hi, *site; } g_notes[AFW_MAX_STUB_NOTES];
+static int g_nnotes;
+static void afw_stub_note(const unsigned char *stub, size_t len, const unsigned char *site) {
+    if (g_nnotes < AFW_MAX_STUB_NOTES) {
+        g_notes[g_nnotes].lo = stub; g_notes[g_nnotes].hi = stub + len; g_notes[g_nnotes].site = site; g_nnotes++;
+    }
+}
+const void *afw_stub_origin(const void *pc) {
+    int i;
+    for (i = 0; i < g_nnotes; i++)
+        if ((const unsigned char *)pc >= g_notes[i].lo && (const unsigned char *)pc < g_notes[i].hi)
+            return g_notes[i].site;
+    return NULL;
+}
+
 /* An instruction that may be copied into a trampoline: no branch, no r11,
  * no fs:, no syscall. rip-relative memory operands are allowed (disp32 is
  * re-based by copy_insn). */
@@ -450,7 +491,7 @@ static int tramp_movable(ZydisDecoder *dec, const unsigned char *q, const unsign
     int k;
     if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, q, (ZyanUSize)(end - q), &n, nops))) return 0;
     *len = n.length;
-    if (is_branch(&n) || uses_r11(&n, nops) || has_fs_operand(&n, nops) || n.mnemonic == ZYDIS_MNEMONIC_SYSCALL)
+    if (transfers_control(&n) || uses_r11(&n, nops) || has_fs_operand(&n, nops) || n.mnemonic == ZYDIS_MNEMONIC_SYSCALL)
         return 0;
     if (n.attributes & ZYDIS_ATTRIB_IS_RELATIVE) {
         for (k = 0; k < n.operand_count; k++)
@@ -471,7 +512,7 @@ static int copy_insn(ZydisDecoder *dec, unsigned char *dst, const unsigned char 
         int32_t d;
         int64_t nd;
         memcpy(&d, src + n.raw.disp.offset, 4);
-        nd = (int64_t)d + (int64_t)(src - dst);         /* same target from the new place */
+        nd = (int64_t)d + (int64_t)((intptr_t)src - (intptr_t)dst);   /* same target from the new place */
         if (nd > INT32_MAX || nd < INT32_MIN) return -1;
         d = (int32_t)nd;
         memcpy(dst + n.raw.disp.offset, &d, 4);
@@ -500,6 +541,11 @@ static int fs_reg_site(ZydisDecoder *dec, unsigned char *p, unsigned char *fstar
     }
     if (uses_r11(ins, ops)) { *why = "instruction uses r11"; return 0; }
     if (ins->attributes & ZYDIS_ATTRIB_IS_RELATIVE) { *why = "instruction is rip-relative"; return 0; }
+    /* rsp is 136 bytes lower inside the stub (reviewer 3) */
+    if (uses_rsp(ins, ops)) { *why = "instruction uses rsp (visible or implicit)"; return 0; }
+    if (ins->mnemonic == ZYDIS_MNEMONIC_LEA) { *why = "lea ignores fs:, the rewrite would add tp"; return 0; }
+    if (ins->address_width != 64) { *why = "32-bit address size (0x67 prefix)"; return 0; }
+    if (transfers_control(ins)) { *why = "control transfer"; return 0; }
     f->ends_ret = 0;
     {
         int pass;
@@ -536,7 +582,7 @@ static int fs_reg_stub(ZydisDecoder *dec, const fsite *f, int32_t teb, unsigned 
     const unsigned char *core = f->start + f->pre_len, *q;
     int k, o = 0;
     int64_t rel;
-    if (room < 128) return -1;
+    if (room < 128) return -1;   /* longest stub: 3 moved instrs (45) + 21 fixed + 15 access + 5 */
     if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, core, (ZyanUSize)f->ins_len, &ins, ops))) return -1;
     if (!ZYAN_SUCCESS(ZydisEncoderDecodedInstructionToEncoderRequest(&ins, ops, ins.operand_count_visible, &req)))
         return -1;
@@ -548,6 +594,23 @@ static int fs_reg_stub(ZydisDecoder *dec, const fsite *f, int32_t teb, unsigned 
         }
     req.prefixes &= ~(ZydisInstructionAttributes)ZYDIS_ATTRIB_HAS_SEGMENT_FS;
     if (!ZYAN_SUCCESS(ZydisEncoderEncodeInstruction(&req, enc, &elen))) return -1;
+    {   /* the re-encoded access must decode back to: same mnemonic, no fs:, [r11 + reg*1 + disp] */
+        ZydisDecodedInstruction e;
+        ZydisDecodedOperand eops[ZYDIS_MAX_OPERAND_COUNT];
+        int m1, m2;
+        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, enc, elen, &e, eops)) || e.mnemonic != ins.mnemonic ||
+            (e.attributes & ZYDIS_ATTRIB_HAS_SEGMENT_FS) || e.operand_count_visible != ins.operand_count_visible)
+            return -1;
+        for (m1 = 0; m1 < ins.operand_count_visible; m1++)
+            if (ops[m1].type == ZYDIS_OPERAND_TYPE_MEMORY) break;
+        for (m2 = 0; m2 < e.operand_count_visible; m2++)
+            if (eops[m2].type == ZYDIS_OPERAND_TYPE_MEMORY) break;
+        if (m1 == ins.operand_count_visible || m2 != m1 || eops[m2].mem.base != ZYDIS_REGISTER_R11 ||
+            eops[m2].mem.index != ops[m1].mem.base || eops[m2].mem.scale != 1 ||
+            eops[m2].mem.disp.value != ops[m1].mem.disp.value || eops[m2].size != ops[m1].size ||
+            eops[m2].mem.segment == ZYDIS_REGISTER_FS)
+            return -1;
+    }
     for (q = f->start; q < core;) {                                      /* moved predecessors */
         int len;
         ZydisDecodedInstruction n;
@@ -711,7 +774,9 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                 rep->fs_disp_seen++;
                 {
                     int64_t d0 = ops[k].mem.disp.value;
-                    int w = (ops[k].actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) != 0, q;
+                    /* only an exact plain READ counts as a read: CONDWRITE (cmpxchg), READWRITE
+                     * and 0 (lea, nop [mem]) are all refused (reviewer 3) */
+                    int w = ops[k].actions != ZYDIS_OPERAND_ACTION_READ, q;
                     for (q = 0; q < rep->nfs_kind; q++)
                         if (rep->fs_kind[q].disp == d0 && rep->fs_kind[q].mnemonic == (int)ins.mnemonic &&
                             rep->fs_kind[q].write == w) break;
@@ -866,37 +931,79 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
         if (verbose > 1) printf("  [patch] syscall at %s: form %c\n", where, s->form);
     }
 
-    /* Pass 2b: fs:[reg] trampolines (design section 6) */
-    for (i = 0; i < nfsites && !fatal; i++) {
-        fsite *f = NULL;
+    /* Pass 2b: fs:[reg] trampolines (design section 6).
+     * Plan first, write after: a layout must have no branch target inside,
+     * must not overlap any syscall site (its bytes were rewritten in pass 2)
+     * nor another fs:[reg] site's chosen layout (reviewer 3). If a site has
+     * no free layout, the previous site may switch to its other layout. */
+    {
+        int *pick = (int *)malloc((nfsites ? nfsites : 1) * sizeof *pick);
         int32_t teb = afw_tls_teb_offset(0);
-        int len, k, o;
-        int64_t rel;
-        for (o = 0; o < fsites[i].nopt && !f; o++)     /* the first layout no branch lands inside */
-            if (!target_inside(targets, ntargets, (uint64_t)(uintptr_t)fsites[i].opt[o].start,
-                               (uint64_t)(uintptr_t)(fsites[i].opt[o].start + fsites[i].opt[o].total)))
-                f = &fsites[i].opt[o];
-        describe(c, fsites[i].opt[0].start + fsites[i].opt[0].pre_len, where, sizeof where);
-        if (!f) {
-            rep->fs_reg_feasible--; rep->fs_unsupported++;
-            fprintf(stderr, "  [patch] fs:[reg] at %s: REFUSED (a branch lands inside the moved bytes); "
-                            "library will not be run\n", where);
-            continue;
+        size_t j;
+        if (!pick) fatal = 1;
+        for (i = 0; i < nfsites && !fatal; i++) {
+            int o, ok = -1;
+            pick[i] = -1;
+            for (o = 0; o < fsites[i].nopt && ok < 0; o++) {
+                const fsite *f = &fsites[i].opt[o];
+                uint64_t lo = (uint64_t)(uintptr_t)f->start, hi = lo + (uint64_t)f->total;
+                int clash = target_inside(targets, ntargets, lo, hi);
+                for (j = 0; j < nsites && !clash; j++)
+                    clash = lo < (uint64_t)(uintptr_t)(sites[j].start + sites[j].len) &&
+                            (uint64_t)(uintptr_t)sites[j].start < hi;
+                if (!clash && i > 0 && pick[i - 1] >= 0) {
+                    const fsite *g = &fsites[i - 1].opt[pick[i - 1]];
+                    clash = lo < (uint64_t)(uintptr_t)(g->start + g->total) && (uint64_t)(uintptr_t)g->start < hi;
+                    if (clash && fsites[i - 1].nopt == 2) {      /* one step back: can the previous move? */
+                        const fsite *g2 = &fsites[i - 1].opt[1 - pick[i - 1]];
+                        uint64_t l2 = (uint64_t)(uintptr_t)g2->start, h2 = l2 + (uint64_t)g2->total;
+                        int c2 = target_inside(targets, ntargets, l2, h2) || (lo < h2 && l2 < hi);
+                        for (j = 0; j < nsites && !c2; j++)
+                            c2 = l2 < (uint64_t)(uintptr_t)(sites[j].start + sites[j].len) &&
+                                 (uint64_t)(uintptr_t)sites[j].start < h2;
+                        if (!c2 && i > 1 && pick[i - 2] >= 0) {
+                            const fsite *g3 = &fsites[i - 2].opt[pick[i - 2]];
+                            c2 = l2 < (uint64_t)(uintptr_t)(g3->start + g3->total) &&
+                                 (uint64_t)(uintptr_t)g3->start < h2;
+                        }
+                        if (!c2) { pick[i - 1] = 1 - pick[i - 1]; clash = 0; }
+                    }
+                }
+                if (!clash) ok = o;
+            }
+            pick[i] = ok;
+            if (ok < 0) {
+                describe(c, fsites[i].opt[0].start + fsites[i].opt[0].pre_len, where, sizeof where);
+                rep->fs_reg_feasible--; rep->fs_unsupported++;
+                fprintf(stderr, "  [patch] fs:[reg] at %s: REFUSED (every layout has a branch target inside or "
+                                "overlaps another rewritten site); library will not be run\n", where);
+            }
         }
-        if (teb < 0) continue;            /* not Windows: counted as feasible, never rewritten */
-        len = fs_reg_stub(&dec, f, teb, stub_area + stub_used, stub_size - stub_used);
-        if (len < 0) {
-            rep->fs_reg_feasible--; rep->fs_unsupported++;
-            fprintf(stderr, "  [patch] fs:[reg] at %s: REFUSED (could not build the trampoline)\n", where);
-            continue;
+        for (i = 0; i < nfsites && !fatal && teb >= 0; i++) {   /* not Windows: planned, never written */
+            fsite *f;
+            int len, k;
+            int64_t rel;
+            if (pick[i] < 0) continue;
+            f = &fsites[i].opt[pick[i]];
+            describe(c, f->start + f->pre_len, where, sizeof where);
+            if (stub_used >= stub_size) { fprintf(stderr, "  [patch] FATAL: stub area full\n"); fatal = 1; break; }
+            len = fs_reg_stub(&dec, f, teb, stub_area + stub_used, stub_size - stub_used);
+            if (len < 0) {
+                rep->fs_reg_feasible--; rep->fs_unsupported++;
+                fprintf(stderr, "  [patch] fs:[reg] at %s: REFUSED (could not build or verify the trampoline)\n",
+                        where);
+                continue;
+            }
+            rel = (int64_t)((intptr_t)(stub_area + stub_used) - (intptr_t)(f->start + 5));
+            if (rel > INT32_MAX || rel < INT32_MIN) { fatal = 1; break; }
+            f->start[0] = 0xE9; { int32_t r32 = (int32_t)rel; memcpy(f->start + 1, &r32, 4); }  /* jmp stub */
+            for (k = 5; k < f->total; k++) f->start[k] = 0xCC;                                 /* never run */
+            afw_stub_note(stub_area + stub_used, (size_t)len, f->start + f->pre_len);
+            stub_used += ((size_t)len + 15) & ~(size_t)15;
+            rep->stubs++;
+            rep->fs_reg_trampolined++;
         }
-        rel = (int64_t)((stub_area + stub_used) - (f->start + 5));
-        if (rel > INT32_MAX || rel < INT32_MIN) { fatal = 1; break; }
-        f->start[0] = 0xE9; { int32_t r32 = (int32_t)rel; memcpy(f->start + 1, &r32, 4); }  /* jmp stub */
-        for (k = 5; k < f->total; k++) f->start[k] = 0xCC;                                 /* never run */
-        stub_used += ((size_t)len + 15) & ~(size_t)15;
-        rep->stubs++;
-        rep->fs_reg_trampolined++;
+        free(pick);
     }
     free(fsites);
 

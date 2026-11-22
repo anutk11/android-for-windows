@@ -44,3 +44,14 @@ __attribute__((naked)) int afw_ie_branch_after(int x) {
             "add $1, %eax\n\t"
             "ret");
 }
+
+/* two fs:[reg] sites sharing the instruction between them (reviewer 3):
+ * the first must take its predecessor so the second can take the middle.
+ * afw_ie.a += 1 */
+__attribute__((naked)) void afw_ie_incr_a(void) {
+    __asm__("mov afw_ie@gottpoff(%rip), %rax\n\t"
+            "mov %fs:(%rax), %ecx\n\t"
+            "add $1, %ecx\n\t"
+            "mov %ecx, %fs:(%rax)\n\t"
+            "ret");
+}

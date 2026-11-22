@@ -287,9 +287,13 @@ static int run_ie_tests(const afw_lib *lib) {
     ie_set_fn store_ret = (ie_set_fn)afw_sym(lib, "afw_ie_store_ret");
     ie_int_fn test_flags = (ie_int_fn)afw_sym(lib, "afw_ie_test_flags");
     ie_and_fn branch_after = (ie_and_fn)afw_sym(lib, "afw_ie_branch_after");
+    ie_set_fn incr_a_dummy = NULL;
+    typedef void (SYSV *ie_void_fn)(void);
+    ie_void_fn incr_a = (ie_void_fn)afw_sym(lib, "afw_ie_incr_a");
     g_ie_read_b = read_b;
     printf("\nG1-TLS fs:[reg] tests (%d accesses rewritten through trampolines):\n", lib->patch.fs_reg_trampolined);
-    check("all 6 fs:[reg] accesses rewritten", lib->patch.fs_reg_trampolined == 6);
+    (void)incr_a_dummy;
+    check("all 8 fs:[reg] accesses rewritten", lib->patch.fs_reg_trampolined == 8);
     check("read fs:[reg+4] (initial value)", read_b() == 22);
     write_a(5);
     check("write fs:[reg] lands where tp + TPOFF points", addr()[0] == 5);
@@ -301,6 +305,8 @@ static int run_ie_tests(const afw_lib *lib) {
     check("flags change with the value (b=23)", test_flags() == 0 && read_b() == 23);
     check("branch target right after the access: predecessor moved instead", branch_after(0) == 24);
     check("... and the branch to that target still works", branch_after(7) == 1);
+    addr()[0] = 41; incr_a();
+    check("two sites sharing an instruction: read, add, write back", addr()[0] == 42);
 #if defined(_WIN32)
     {
         int other = -1;
