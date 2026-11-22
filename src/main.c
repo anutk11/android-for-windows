@@ -154,17 +154,18 @@ static int run_syscall_tests(const afw_lib *lib) {
     }
 
     {
-        typedef long (SYSV *gen_fn)(long, long, long, long, long, long, long);
+        /* int64_t, not long: long is 32 bits on Windows and would cut pointers */
+        typedef int64_t (SYSV *gen_fn)(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
         gen_fn gen = (gen_fn)afw_sym(lib, "afw_generic_syscall");
         getpid_fn rax = (getpid_fn)afw_sym(lib, "afw_sys_getpid_rax");
         check("form B functions found", gen && rax);
         if (gen && rax) {
             before = afw_syscall_counts[39];
-            r = gen(39, 0, 0, 0, 0, 0, 0);
+            r = (long)gen(39, 0, 0, 0, 0, 0, 0);
             printf("  generic syscall(39) -> %ld\n", r);
             check("generic syscall(): number passed at run time reached the dispatcher",
                   r == host_pid() && afw_syscall_counts[39] == before + 1);
-            r = gen(1, 1, (long)(uintptr_t)msg, (long)(sizeof msg - 1), 0, 0, 0);
+            r = (long)gen(1, 1, (int64_t)(uintptr_t)msg, (int64_t)(sizeof msg - 1), 0, 0, 0);
             check("generic syscall(): 3 arguments shifted correctly (write)", r == (long)(sizeof msg - 1));
             r = rax();
             check("'mov rax, 39; syscall' (the __restore_rt form) works", r == host_pid());
@@ -173,42 +174,17 @@ static int run_syscall_tests(const afw_lib *lib) {
             /* libc's WriteProtected<libc_globals> (issue #12): mprotect on the
              * library's own .bss, through a patched site, as libc does it */
             volatile char *pg = (volatile char *)afw_sym(lib, "afw_sys_bss_page");
-            long a = (long)(uintptr_t)pg;
-            long mr;
+            int64_t a = (int64_t)(uintptr_t)pg, mr;
             pg[0] = 5;
             mr = gen(10, a, 4096, 1, 0, 0, 0);
-            printf("  mprotect(.bss page at image+0x%llx, PROT_READ) -> %ld\n",
-                   (unsigned long long)((uintptr_t)pg - (uintptr_t)lib->base), mr);
-            if (mr != 0) {   /* diagnosis: the same call directly, the VMA state, the OS call */
-                printf("    direct afw_mprotect -> %lld; VMA allocations %d, extents %zu\n",
-                       (long long)afw_mprotect((uint64_t)a, 4096, 1), afw_vma_alloc_count(), afw_vma_extent_count());
-#if defined(_WIN32)
-                {
-                    DWORD old = 0;
-                    BOOL ok = VirtualProtect((void *)(uintptr_t)a, 4096, PAGE_READONLY, &old);
-                    printf("    VirtualProtect(PAGE_READONLY) -> %d (error %lu, old 0x%lx)\n", (int)ok,
-                           ok ? 0ul : (unsigned long)GetLastError(), (unsigned long)old);
-                    if (ok) VirtualProtect((void *)(uintptr_t)a, 4096, old, &old);
-                }
-                {
-                    MEMORY_BASIC_INFORMATION mi;
-                    uintptr_t q;
-                    for (q = (uintptr_t)lib->base; q < (uintptr_t)lib->base + lib->size + 0x10000; q += mi.RegionSize) {
-                        if (!VirtualQuery((void *)q, &mi, sizeof mi)) break;
-                        printf("    region +0x%llx size 0x%llx state 0x%lx protect 0x%lx type 0x%lx allocbase %s\n",
-                               (unsigned long long)(q - (uintptr_t)lib->base), (unsigned long long)mi.RegionSize,
-                               (unsigned long)mi.State, (unsigned long)mi.Protect, (unsigned long)mi.Type,
-                               mi.AllocationBase == (void *)lib->base ? "=base" : "OTHER");
-                    }
-                }
-#endif
-            }
+            printf("  mprotect(.bss page at image+0x%llx, PROT_READ) -> %lld\n",
+                   (unsigned long long)((uintptr_t)pg - (uintptr_t)lib->base), (long long)mr);
             check("mprotect(PROT_READ) on the library's own .bss succeeds", mr == 0);
             check("... the contents are kept", pg[0] == 5);
             check("mprotect(PROT_READ|PROT_WRITE) back succeeds, and the page is writable",
                   gen(10, a, 4096, 3, 0, 0, 0) == 0 && (pg[0] = 6, pg[0] == 6));
             check("mprotect on the stub area after the image -> -ENOMEM (not Linux memory)",
-                  gen(10, (long)(uintptr_t)lib->stub_area, 4096, 7, 0, 0, 0) == -12);
+                  gen(10, (int64_t)(uintptr_t)lib->stub_area, 4096, 7, 0, 0, 0) == -12);
         }
     }
 
