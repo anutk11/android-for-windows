@@ -52,6 +52,11 @@ typedef struct afw_lib_s {
  * with a warning). Used to measure patching on real Android libraries. */
 extern int afw_load_patch_only;
 
+/* Normal loading refuses a library whose patching left anything unproven
+ * (look-alikes in undecided functions, undecodable exception tables). This
+ * flag overrides that, for diagnosis only. */
+extern int afw_load_allow_unproven;
+
 /* Load, relocate, link against bionic-win and run constructors.
  * Returns 0 on success; prints the reason on failure. */
 int afw_load(const char *path, afw_lib *lib, int verbose);

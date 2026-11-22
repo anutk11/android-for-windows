@@ -44,3 +44,15 @@ __attribute__((naked)) long afw_rz_safe(void) {
         "syscall\n\t"
         "ret");
 }
+
+/* Through an lea copy with a negative offset: rdx = rsp - 16, so [rdx]
+ * is below rsp even though its displacement is 0. */
+__attribute__((naked)) long afw_rz_lea(long x) {
+    __asm__ volatile(
+        "lea -16(%rsp), %rdx\n\t"
+        "mov %rdi, (%rdx)\n\t"
+        "mov $39, %eax\n\t"
+        "syscall\n\t"
+        "mov -16(%rsp), %rax\n\t"
+        "ret");
+}

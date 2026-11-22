@@ -26,4 +26,7 @@ int afw_func_list(const struct afw_lib_s *lib, unsigned char ***starts, size_t *
  * control-flow analysis must treat them as extra entry points. */
 int afw_func_landing_pads(const struct afw_lib_s *lib, uint64_t func, uint64_t *out, int max);
 
+/* Is [addr, addr+len) inside the loaded image? (overflow-safe) */
+int afw_lib_readable(const struct afw_lib_s *lib, uint64_t addr, uint64_t len);
+
 #endif

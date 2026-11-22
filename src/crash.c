@@ -23,6 +23,9 @@ static LONG WINAPI on_crash(EXCEPTION_POINTERS *ep) {
     afw_describe_address((uintptr_t)c->Rip, where, sizeof where);
     fprintf(stderr, "\n=== CRASH ===\n");
     fprintf(stderr, "exception 0x%08lx at %s\n", er->ExceptionCode, where);
+    if (er->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION && ip[0] == 0x0F && ip[1] == 0x0B)
+        fprintf(stderr, "  this is a syscall site the loader REFUSED to patch (it was turned into ud2);\n"
+                        "  see the [patch] REFUSED lines printed when the library was loaded\n");
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2)
         fprintf(stderr, "  %s address 0x%llx\n",
                 er->ExceptionInformation[0] == 0 ? "reading" :

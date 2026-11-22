@@ -25,6 +25,7 @@
 typedef SYSV void (*init_fn)(void);
 
 int afw_load_patch_only;
+int afw_load_allow_unproven;
 
 #define MAX_LIBS 64
 static afw_lib *g_libs[MAX_LIBS];
@@ -169,6 +170,9 @@ static int patch_bounds(const void *ctx, uint64_t addr, uint64_t *s, uint64_t *e
 }
 static int patch_entries(const void *ctx, uint64_t func, uint64_t *out, int max) {
     return afw_func_landing_pads((const afw_lib *)ctx, func, out, max);
+}
+static int patch_readable(const void *ctx, uint64_t addr, uint64_t len) {
+    return afw_lib_readable((const afw_lib *)ctx, addr, len);
 }
 
 int afw_load(const char *path, afw_lib *lib, int verbose) {
@@ -458,11 +462,21 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
         pc.bounds = patch_bounds; pc.ctx = lib; pc.bias = lib->bias; pc.name = lib->soname ? lib->soname : path;
         pc.ranges_are_functions = have_funcs; pc.segs = segs; pc.nsegs = nsegs;
         pc.entries = patch_entries;
+        pc.readable = patch_readable;
         if (afw_patch_code(cr, ncr, lib->stub_area, AFW_STUB_RESERVE, &pc, &lib->patch, verbose) < 0) {
             fprintf(stderr, "error: could not patch %s safely; refusing to run it\n", path);
             free(cr); free(pageprot); return -1;
         }
         free(cr);
+        if (!afw_load_patch_only && !afw_load_allow_unproven &&
+            (lib->patch.unproven || lib->patch.lsda_failures)) {
+            fprintf(stderr,
+                    "error: refusing to run %s: patching left %d unproven syscall/fs: look-alikes and %d\n"
+                    "       undecodable exception tables. Code we cannot prove safe is not run.\n"
+                    "       (--allow-unproven overrides this, for diagnosis only)\n",
+                    path, lib->patch.unproven, lib->patch.lsda_failures);
+            free(pageprot); return -1;
+        }
         afw_mem_protect(lib->stub_area, AFW_STUB_RESERVE, AFW_PROT_R | AFW_PROT_X);
         afw_flush_icache(lib->stub_area, AFW_STUB_RESERVE);
         if (verbose)

@@ -71,6 +71,7 @@ static int function_uses_red_zone(ZydisDecoder *dec, uint64_t s, uint64_t e) {
     ZydisDecodedInstruction ins;
     ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
     ZydisRegister copies[16];
+    int64_t copy_off[16];     /* copy = rsp + copy_off at the time of the copy */
     int64_t max_sub = 0;
     int ncopies = 0, pass;
     for (pass = 0; pass < 2; pass++) {
@@ -87,7 +88,10 @@ static int function_uses_red_zone(ZydisDecoder *dec, uint64_t s, uint64_t e) {
                       ops[1].reg.value == ZYDIS_REGISTER_RSP) ||
                      (ins.mnemonic == ZYDIS_MNEMONIC_LEA && ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
                       ops[1].mem.base == ZYDIS_REGISTER_RSP)) && ncopies < 16)
+                {
+                    copy_off[ncopies] = ins.mnemonic == ZYDIS_MNEMONIC_LEA ? ops[1].mem.disp.value : 0;
                     copies[ncopies++] = reg64(ops[0].reg.value);
+                }
                 /* frame allocation: sub rsp, imm */
                 if (ins.mnemonic == ZYDIS_MNEMONIC_SUB && ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
                     ops[0].reg.value == ZYDIS_REGISTER_RSP && ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
@@ -95,10 +99,13 @@ static int function_uses_red_zone(ZydisDecoder *dec, uint64_t s, uint64_t e) {
                     max_sub = (int64_t)ops[1].imm.value.s;
             } else {
                 for (i = 0; i < ins.operand_count_visible; i++) {
-                    if (ops[i].type != ZYDIS_OPERAND_TYPE_MEMORY || ops[i].mem.disp.value >= 0) continue;
-                    if (ops[i].mem.base == ZYDIS_REGISTER_RSP) return 1;
+                    if (ops[i].type != ZYDIS_OPERAND_TYPE_MEMORY) continue;
+                    if (ops[i].mem.base == ZYDIS_REGISTER_RSP && ops[i].mem.disp.value < 0) return 1;
+                    /* through a copy: rsp-relative offset = copy offset + displacement; below
+                     * what "sub rsp, K" allocated means the red zone */
                     for (k = 0; k < ncopies; k++)
-                        if (ops[i].mem.base == copies[k] && -ops[i].mem.disp.value > max_sub) return 2;
+                        if (ops[i].mem.base == copies[k] && copy_off[k] + ops[i].mem.disp.value < -max_sub)
+                            return 2;
                 }
             }
             a += ins.length;
@@ -156,7 +163,8 @@ static void reg_clear(flow_state *f, ZydisRegister r) {
 }
 
 static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t size, int *undecided,
-                                const unsigned char **why, const uint64_t *extra, int nextra) {
+                                const unsigned char **why, const uint64_t *extra, int nextra,
+                                const afw_patch_ctx *c, uint64_t **tt, size_t *ntt, size_t *captt) {
     ZydisDecodedInstruction ins;
     ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
     unsigned char *map = (unsigned char *)calloc(size ? size : 1, 1);
@@ -245,19 +253,20 @@ static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t s
                                    f->sum_cnt[reg64(ops[k].reg.value)] <= 4096) {
                             uint64_t tab = f->sum_tab[reg64(ops[k].reg.value)];
                             uint64_t n = f->sum_cnt[reg64(ops[k].reg.value)], e;
+                            int32_t ent[4096];
                             int bad = 0;
+                            /* the whole table must be inside the loaded image before any read */
+                            if (!c || !c->readable || !c->readable(c->ctx, tab, 4 * n)) bad = 1;
+                            if (!bad) memcpy(ent, (const void *)(uintptr_t)tab, (size_t)(4 * n));
                             for (e = 0; e < n && !bad; e++) {
-                                int32_t rel;
-                                uint64_t t2;
-                                memcpy(&rel, (const void *)(uintptr_t)(tab + 4 * e), 4);
-                                t2 = tab + (uint64_t)(int64_t)rel;
+                                uint64_t t2 = tab + (uint64_t)(int64_t)ent[e];
                                 if (t2 < lo || t2 >= hi) bad = 1;
                             }
                             if (bad) { *undecided = 1; *why = base + off; }
                             else for (e = 0; e < n; e++) {
-                                int32_t rel;
-                                memcpy(&rel, (const void *)(uintptr_t)(tab + 4 * e), 4);
-                                VEC_PUSH(work, nwork, capwork, (size_t)(tab + (uint64_t)(int64_t)rel - lo));
+                                uint64_t t2 = tab + (uint64_t)(int64_t)ent[e];
+                                VEC_PUSH(work, nwork, capwork, (size_t)(t2 - lo));
+                                VEC_PUSH(*tt, *ntt, *captt, t2);   /* also a branch target */
                             }
                         } else {
                             *undecided = 1; *why = base + off;
@@ -276,6 +285,12 @@ static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t s
     free(f);
     free(work);
     return map;
+}
+
+/* A refused site: its 2-byte syscall becomes ud2. Same length, nothing else
+ * changes, no stack use. Running it stops with a clear crash report. */
+static void trap_syscall(unsigned char *sys, afw_patch_report *rep) {
+    if (sys[0] == 0x0F && sys[1] == 0x05) { sys[1] = 0x0B; rep->sys_trapped++; }
 }
 
 static int has_fs_operand(const ZydisDecodedInstruction *ins, const ZydisDecodedOperand *ops) {
@@ -329,7 +344,13 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                 npads = 0;
             }
             rep->landing_pads += npads;
-            map = maps[r] = reach_map(&dec, p, ranges[r].size, &undecided[r], &why, pads, npads);
+            map = maps[r] = reach_map(&dec, p, ranges[r].size, &undecided[r], &why, pads, npads,
+                                      c, &targets, &ntargets, &captargets);
+            {
+                int q;
+                for (q = 0; q < npads; q++)       /* the unwinder jumps to landing pads: targets too */
+                    VEC_PUSH(targets, ntargets, captargets, pads[q]);
+            }
             if (lsda_failed && !undecided[r]) { undecided[r] = 1; why = NULL; }
             if (undecided[r]) {
                 rep->funcs_undecided++;
@@ -422,7 +443,8 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                 else {
                     rep->sys_refused_unknown++;
                     describe(c, p, where, sizeof where);
-                    fprintf(stderr, "  [patch] REFUSED syscall at %s: nothing safe to move before it\n", where);
+                    fprintf(stderr, "  [patch] REFUSED syscall at %s: nothing safe to move before it (now ud2)\n", where);
+                    trap_syscall(p, rep);
                 }
             }
         next_ins:
@@ -449,18 +471,21 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
 
         if (target_inside(targets, ntargets, lo, lo + (uint64_t)s->len)) {
             rep->sys_refused_branch++;
-            fprintf(stderr, "  [patch] REFUSED syscall at %s: a branch lands inside the site\n", where);
+            fprintf(stderr, "  [patch] REFUSED syscall at %s: a branch lands inside the site (now ud2)\n", where);
+            trap_syscall(s->start + s->len - 2, rep);
             continue;
         }
         if (!c || !c->bounds || !c->bounds(c->ctx, lo, &fs_, &fe_)) {
             rep->sys_refused_unknown++;
-            fprintf(stderr, "  [patch] REFUSED syscall at %s: function boundaries unknown\n", where);
+            fprintf(stderr, "  [patch] REFUSED syscall at %s: function boundaries unknown (now ud2)\n", where);
+            trap_syscall(s->start + s->len - 2, rep);
             continue;
         }
         if ((r = function_uses_red_zone(&dec, fs_, fe_)) != 0) {
             rep->sys_refused_redzone++;
             if (r == 1) rep->redzone_direct++; else rep->redzone_via_copy++;
-            fprintf(stderr, "  [patch] REFUSED syscall at %s: its function may use the red zone\n", where);
+            fprintf(stderr, "  [patch] REFUSED syscall at %s: its function may use the red zone (now ud2)\n", where);
+            trap_syscall(s->start + s->len - 2, rep);
             continue;
         }
 

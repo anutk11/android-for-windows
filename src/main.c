@@ -116,6 +116,14 @@ static int run_syscall_tests(const afw_lib *lib) {
     check("both other sites patched by moving instructions (generic syscall, mov rax)",
           lib->patch.sys_patched_moved == 2);
     check("the site with a branch into its middle was REFUSED", lib->patch.sys_refused_branch == 1);
+    {
+        const unsigned char *f = (const unsigned char *)afw_sym(lib, "afw_sys_branch_into_site");
+        int k, found = 0;
+        for (k = 0; f && k < 32; k++)
+            if (f[k] == 0x0F && f[k + 1] == 0x0B) found = 1;
+        check("...and its syscall became ud2 (a loud trap, not a Windows kernel call)",
+              lib->patch.sys_trapped == 1 && found);
+    }
 
     before = afw_syscall_counts[39];
     r = gp();
@@ -177,7 +185,8 @@ static int run_syscall_tests(const afw_lib *lib) {
 static int run_redzone_tests(const afw_lib *lib) {
     getpid_fn safe = (getpid_fn)afw_sym(lib, "afw_rz_safe");
     printf("\n=== G1 negative test: red zone ===\n");
-    check("all 3 red zone sites were REFUSED", lib->patch.sys_refused_redzone == 3);
+    check("all 4 red zone sites were REFUSED (incl. lea reg, [rsp-16])", lib->patch.sys_refused_redzone == 4);
+    check("every refused site now traps with ud2", lib->patch.sys_trapped == 4);
     check("only the safe site was patched", lib->patch.sys_patched == 1);
     check("the safe site works", safe && safe() == host_pid());
     printf("\n%s\n", g_failed ? "RED ZONE TEST FAILED" : "RED ZONE TEST PASSED");
@@ -203,6 +212,7 @@ int main(int argc, char **argv) {
         int a;
         for (a = 3; a < argc; a++) {
             if (strcmp(argv[a], "--strict") == 0) strict = 1;
+            else if (strcmp(argv[a], "--allow-unproven") == 0) afw_load_allow_unproven = 1;
             else if (strncmp(argv[a], "--min-landing-pads=", 19) == 0) min_pads = atoi(argv[a] + 19);
         }
     }

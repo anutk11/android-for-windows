@@ -22,8 +22,11 @@
  * unreached bytes stay untouched and are reported). Bytes that merely look like a
  * syscall or an fs: access but are never executed are left untouched.
  *
- * A site is REFUSED (left untouched, reported loudly) unless it is provably
- * safe:
+ * A site is REFUSED unless it is provably safe. A refused site keeps every
+ * byte except its 2-byte `syscall`, which becomes `ud2` (0F 0B): same length,
+ * nothing moves, no stack is touched - if it ever runs, the program stops with
+ * a clear report instead of entering the Windows kernel with a Linux number.
+ * Conditions:
  *   - no branch may land inside the bytes being replaced;
  *   - its function must be known (from .eh_frame, else sized symbols);
  *   - nothing in the whole function may touch memory below rsp: no [rsp-N],
@@ -61,6 +64,7 @@ typedef struct {
     int fs_disp_seen;          /* reachable fs:[disp32] accesses (any platform) */
     int landing_pads;          /* C++ landing pads used as entry points */
     int lsda_failures;         /* exception tables we could not fully decode */
+    int sys_trapped;           /* refused sites whose syscall became ud2 (loud trap) */
     int sys_outside_functions; /* syscall in executable bytes with no .eh_frame entry */
     int fs_outside_functions;
     int redzone_direct;        /* refusals by reason: [rsp-N] */
@@ -77,6 +81,8 @@ typedef struct {
     intptr_t bias;          /* to print library-relative offsets */
     const char *name;       /* library name for messages */
     int ranges_are_functions; /* ranges come from .eh_frame: follow control flow */
+    /* memory the analysis may read (switch tables) */
+    int (*readable)(const void *ctx, uint64_t addr, uint64_t len);
     /* extra entry points of a function (C++ landing pads) */
     int (*entries)(const void *ctx, uint64_t func, uint64_t *out, int max);
     const afw_code_range *segs; int nsegs; /* executable segments, for the audit */
