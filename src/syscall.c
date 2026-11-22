@@ -6,6 +6,7 @@
  */
 #include "syscall.h"
 #include "platform.h"
+#include "vma.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -128,6 +129,14 @@ int64_t afw_syscall_dispatch(int64_t nr, int64_t *a) {
     switch (nr) {
     case 1:   return sys_write(a[0], (const void *)(uintptr_t)a[1], (uint64_t)a[2]);
     case 39:  return sys_getpid();
+    case 9:   return afw_mmap((uint64_t)a[0], (uint64_t)a[1], (int)a[2], (int)a[3], (int)a[4], a[5]);
+    case 10:  return afw_mprotect((uint64_t)a[0], (uint64_t)a[1], (int)a[2]);
+    case 11:  return afw_munmap((uint64_t)a[0], (uint64_t)a[1]);
+    case 28:  return afw_madvise((uint64_t)a[0], (uint64_t)a[1], (int)a[2]);
+    case 12:  return -12;  /* brk: no heap break; bionic and Scudo use mmap */
+    case 157: /* prctl */
+        if (a[0] == 0x53564d41) return 0;  /* PR_SET_VMA (naming an area): accepted */
+        return -22;
     case 60:  /* exit: ends only the calling thread */
         fflush(stdout);
 #if defined(_WIN32)

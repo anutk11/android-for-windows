@@ -110,6 +110,11 @@ jobs:
       - name: Run G1 syscall-patching tests on Windows
         shell: cmd
         run: out\afw-loader.exe out\libsyscall_test.so
+      - name: "VMA layer: mmap / munmap / mprotect / madvise on Windows"
+        shell: cmd
+        run: |
+          clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Fe:out\vma_test.exe /Foout\ tools\vma_test.c src\vma.c src\syscall.c src\platform.c
+          out\vma_test.exe
       - name: "C++ exceptions: every landing pad found, nothing unproven (static)"
         shell: cmd
         run: out\afw-loader.exe out\libcxx_exception_test.so --patch-report --strict --min-landing-pads=1

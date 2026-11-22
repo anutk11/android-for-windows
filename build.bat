@@ -24,6 +24,6 @@ if not exist out\zydis-amalg\Zydis.c (
 clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS -Wno-unused-function -Iout\zydis-amalg ^
     /Fe:out\afw-loader.exe /Foout\ ^
     src\main.c src\elf_loader.c src\bionic_shim.c src\platform.c src\tls_patch.c src\crash.c ^
-    src\patch.c src\syscall.c src\funcs.c out\zydis-amalg\Zydis.c
+    src\patch.c src\syscall.c src\funcs.c src\vma.c out\zydis-amalg\Zydis.c
 if errorlevel 1 exit /b 1
 echo Built out\afw-loader.exe
