@@ -5,7 +5,7 @@ int afw_base_value(void);
 int afw_base_pick(void);
 int afw_base_ready(void);
 
-static __thread int t = 7;
+static __thread volatile int t = 7;   /* volatile: else folded to 7 and no PT_TLS is emitted */
 int afw_deps_check(void) {
     if (!afw_base_ready()) return -1;   /* the dependency's constructor ran first */
     return afw_base_value() + afw_base_pick() + t;
