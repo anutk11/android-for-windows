@@ -199,14 +199,20 @@ typedef int *(SYSV *tls_ptr_fn)(void);
 typedef SYSV void (*tls_wait_fn)(void);
 typedef int (SYSV *tls_worker_fn)(int, tls_wait_fn, int);
 
-static volatile long g_arrived, g_barrier_open;
-static SYSV void tls_barrier(void) {          /* two threads meet here, unless the barrier was opened */
+/* Barrier state: every read and write is atomic (reviewer 2, PR #6 A3). */
+static long g_arrived, g_barrier_open;
 #if defined(_WIN32)
-    InterlockedIncrement(&g_arrived);
+static long ld(long *p) { return InterlockedCompareExchange(p, 0, 0); }
+static void st(long *p, long v) { InterlockedExchange(p, v); }
+static void inc(long *p) { InterlockedIncrement(p); }
 #else
-    __atomic_add_fetch(&g_arrived, 1, __ATOMIC_SEQ_CST);
+static long ld(long *p) { return __atomic_load_n(p, __ATOMIC_SEQ_CST); }
+static void st(long *p, long v) { __atomic_store_n(p, v, __ATOMIC_SEQ_CST); }
+static void inc(long *p) { __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
 #endif
-    while (g_arrived < 2 && !g_barrier_open) {}
+static SYSV void tls_barrier(void) {          /* two threads meet here, unless the barrier was opened */
+    inc(&g_arrived);
+    while (ld(&g_arrived) < 2 && !ld(&g_barrier_open)) {}
 }
 
 typedef struct { tls_worker_fn fn; int id, use_ie, rc; } tls_job;
@@ -227,30 +233,78 @@ static void *tls_thread(void *p) {
 static int run_tls_threads(tls_worker_fn fn, int use_ie, int fail_second) {
     tls_job j[2] = {{fn, 1, use_ie, -1}, {fn, 2, use_ie, -1}};
     int k, created[2] = {0, 0}, ok = 1;
-    g_arrived = 0; g_barrier_open = 0;
+    st(&g_arrived, 0); st(&g_barrier_open, 0);
 #if defined(_WIN32)
     HANDLE h[2] = {NULL, NULL};
     for (k = 0; k < 2; k++) {
         h[k] = (k == 1 && fail_second) ? NULL : CreateThread(NULL, 0, tls_thread, &j[k], 0, NULL);
         created[k] = h[k] != NULL;
-        if (!created[k]) { ok = 0; g_barrier_open = 1; printf("    thread %d could not be created\n", k + 1); }
+        if (!created[k]) { ok = 0; st(&g_barrier_open, 1); printf("    thread %d could not be created\n", k + 1); }
     }
     for (k = 0; k < 2; k++)
         if (created[k]) {
-            if (WaitForSingleObject(h[k], 30000) != WAIT_OBJECT_0) { ok = 0; printf("    thread %d did not finish\n", k + 1); }
+            DWORD w = WaitForSingleObject(h[k], 30000);
+            if (w == WAIT_TIMEOUT) {          /* open the barrier, then wait for real: j is on our stack */
+                ok = 0; st(&g_barrier_open, 1);
+                printf("    thread %d did not finish in 30 s\n", k + 1);
+                w = WaitForSingleObject(h[k], INFINITE);
+            }
+            if (w != WAIT_OBJECT_0) {
+                printf("    waiting for thread %d failed (error %lu): stopping, its data is on this stack\n",
+                       k + 1, GetLastError());
+                abort();
+            }
             CloseHandle(h[k]);
         }
 #else
     pthread_t t[2];
     for (k = 0; k < 2; k++) {
         created[k] = !(k == 1 && fail_second) && pthread_create(&t[k], NULL, tls_thread, &j[k]) == 0;
-        if (!created[k]) { ok = 0; g_barrier_open = 1; printf("    thread %d could not be created\n", k + 1); }
+        if (!created[k]) { ok = 0; st(&g_barrier_open, 1); printf("    thread %d could not be created\n", k + 1); }
     }
     for (k = 0; k < 2; k++)
-        if (created[k] && pthread_join(t[k], NULL) != 0) { ok = 0; printf("    thread %d could not be joined\n", k + 1); }
+        if (created[k] && pthread_join(t[k], NULL) != 0) {
+            printf("    thread %d could not be joined: stopping, its data is on this stack\n", k + 1);
+            abort();
+        }
 #endif
     if (j[0].rc || j[1].rc) printf("    worker results: thread 1 -> %d, thread 2 -> %d\n", j[0].rc, j[1].rc);
     return ok && j[0].rc == 0 && j[1].rc == 0;
+}
+
+/* A new thread whose very first publish fails half way: afterwards it must
+ * have no block and nothing published (all its slots still zero). */
+static int g_init_fail_ok;
+#if defined(_WIN32)
+static DWORD WINAPI init_fail_thread(LPVOID p) {
+#else
+static void *init_fail_thread(void *p) {
+#endif
+    int i, clean = 1;
+    (void)p;
+    afw_tls_test_fail_publish(3);
+    if (afw_tls_thread_init() != -1) clean = 0;
+    if (afw_tls_block() != NULL) clean = 0;
+#if defined(_WIN32)
+    for (i = 0; i < 16; i++) if (afw_tls_published_slot(i) != 0) clean = 0;
+#else
+    (void)i;
+#endif
+    if (afw_tls_thread_init() != 0 || afw_tls_published_slot(0) != (uintptr_t)afw_tls_block()) clean = 0;  /* retry works */
+    g_init_fail_ok = clean;
+    return 0;
+}
+static int run_fail_init_thread(void) {
+    g_init_fail_ok = 0;
+#if defined(_WIN32)
+    HANDLE h = CreateThread(NULL, 0, init_fail_thread, NULL, 0, NULL);
+    if (!h || WaitForSingleObject(h, INFINITE) != WAIT_OBJECT_0) return 0;
+    CloseHandle(h);
+#else
+    pthread_t t;
+    if (pthread_create(&t, NULL, init_fail_thread, NULL) != 0 || pthread_join(t, NULL) != 0) return 0;
+#endif
+    return g_init_fail_ok;
 }
 
 static int run_tls_tests(const afw_lib *lib) {
@@ -282,9 +336,16 @@ static int run_tls_tests(const afw_lib *lib) {
         int *v = gd();
         int before = *v;
         uintptr_t *tp_before = afw_tls_block();
-        afw_tls_test_fail_publish(1);
-        check("rebuild whose publish fails returns -1", afw_tls_thread_rebuild() == -1);
+        afw_tls_test_fail_publish(3);           /* fails after 3 slots were already set */
+        check("rebuild whose publish fails after 3 slots returns -1", afw_tls_thread_rebuild() == -1);
+        check("... every slot the CPU sees names the old block again",
+              afw_tls_published_slot(0) == (uintptr_t)tp_before && afw_tls_published_slot(2) == tp_before[2] &&
+              afw_tls_published_slot(5) == tp_before[5]);
         check("... and the thread keeps its old block and values", afw_tls_block() == tp_before && *gd() == before);
+        afw_tls_test_fail_publish(16);          /* fails at the very last step (FLS) */
+        check("rebuild whose publish fails at the last step returns -1, old block published",
+              afw_tls_thread_rebuild() == -1 && afw_tls_published_slot(0) == (uintptr_t)tp_before);
+        check("new thread whose publish fails after 3 slots: nothing left published", run_fail_init_thread());
         check("a rebuild that succeeds still works afterwards", afw_tls_thread_rebuild() == 0 && *gd() == before);
     }
     {

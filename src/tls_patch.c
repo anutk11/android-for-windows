@@ -132,18 +132,31 @@ int afw_tls_init(void) {
     return afw_tls_thread_init();
 }
 
-static int g_fail_publish;   /* test hook: make the next publish fail */
-void afw_tls_test_fail_publish(int on) { g_fail_publish = on; }
+static int g_fail_publish = -1;   /* test hook: fail at step n (0..15 a TLS slot, 16 FLS) */
+void afw_tls_test_fail_publish(int step) { g_fail_publish = step; }
 
 /* Make blk this thread's block for the CPU (TEB TlsSlots) and for the
- * release at thread exit (FLS). Returns 0, or -1 if any step failed. */
+ * release at thread exit (FLS). A transaction (reviewer 2, PR #6 A1): the
+ * previous values are saved first, and if any step fails every step that
+ * already happened is undone, so nothing is left naming blk. 0 or -1. */
 static int publish(uintptr_t *blk, void *alloc) {
-    int i;
-    if (g_fail_publish) { g_fail_publish = 0; return -1; }
-    for (i = 0; i < BIONIC_TLS_SLOTS; i++)
-        if (!TlsSetValue(g_slot[i], (void *)blk[i])) return -1;
-    return FlsSetValue(g_fls, alloc) ? 0 : -1;
+    void *prev[BIONIC_TLS_SLOTS], *prev_fls;
+    int i, done = 0, fail = g_fail_publish;
+    g_fail_publish = -1;
+    for (i = 0; i < BIONIC_TLS_SLOTS; i++) prev[i] = TlsGetValue(g_slot[i]);
+    prev_fls = FlsGetValue(g_fls);
+    for (; done < BIONIC_TLS_SLOTS; done++)
+        if (done == fail || !TlsSetValue(g_slot[done], (void *)blk[done])) goto undo;
+    if (fail == BIONIC_TLS_SLOTS || !FlsSetValue(g_fls, alloc)) goto undo;
+    return 0;
+undo:
+    for (i = 0; i < done; i++) TlsSetValue(g_slot[i], prev[i]);   /* setting a valid index cannot fail */
+    FlsSetValue(g_fls, prev_fls);
+    return -1;
 }
+
+/* What the CPU-visible copy of slot i holds right now (tests). */
+uintptr_t afw_tls_published_slot(int i) { return (uintptr_t)TlsGetValue(g_slot[i]); }
 static uintptr_t thread_id(void) { return (uintptr_t)GetCurrentThreadId(); }
 
 #else
@@ -154,13 +167,16 @@ int afw_tls_teb_offset(int slot) { (void)slot; return -1; }
 /* Same rule as FLS on Windows: the key frees a thread's block at exit. */
 static pthread_key_t g_key;
 static void key_release(void *p) { afw_tls_static_free(p); }
-static int g_fail_publish;
-void afw_tls_test_fail_publish(int on) { g_fail_publish = on; }
-static int publish(uintptr_t *blk, void *alloc) {
+static int g_fail_publish = -1;
+void afw_tls_test_fail_publish(int step) { g_fail_publish = step; }
+static int publish(uintptr_t *blk, void *alloc) {   /* one step only: nothing to undo on failure */
+    int fail = g_fail_publish;
     (void)blk;
-    if (g_fail_publish) { g_fail_publish = 0; return -1; }
+    g_fail_publish = -1;
+    if (fail >= 0) return -1;
     return pthread_setspecific(g_key, alloc) == 0 ? 0 : -1;
 }
+uintptr_t afw_tls_published_slot(int i) { return t_block ? t_block[i] : 0; }   /* fs: is native here */
 static uintptr_t thread_id(void) { return 0; }
 int afw_tls_init(void) {
     if (pthread_key_create(&g_key, key_release) != 0) return -1;
@@ -197,10 +213,7 @@ int afw_tls_thread_rebuild(void) {
     if (t_block) memcpy(nb, t_block, BIONIC_TLS_SLOTS * sizeof *nb);
     else { nb[TLS_SLOT_THREAD_ID] = thread_id(); nb[TLS_SLOT_STACK_GUARD] = g_guard; }
     nb[TLS_SLOT_SELF] = (uintptr_t)nb;
-    if (publish(nb, new_alloc) != 0) {
-        /* put the old block back everywhere a partial publish may have reached */
-        if (t_block && publish(t_block, t_alloc) != 0)
-            fprintf(stderr, "[tls] FATAL: cannot restore the old TLS block\n"), abort();
+    if (publish(nb, new_alloc) != 0) {   /* undone completely: the old block is still the published one */
         afw_tls_static_free(new_alloc);
         fprintf(stderr, "[tls] cannot publish the rebuilt TLS block; the old one stays\n");
         return -1;
