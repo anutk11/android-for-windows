@@ -75,6 +75,7 @@ def main():
             break
         except FileNotFoundError:
             continue
+    system.close()                                      # Windows cannot delete an open file
     if apex is None:
         sys.exit("no runtime APEX in the image")
     z = zipfile.ZipFile(io.BytesIO(apex))
@@ -83,15 +84,16 @@ def main():
     payload = os.path.join(out, "apex_payload.img")
     with open(payload, "wb") as f:
         f.write(z.read("apex_payload.img"))
-    fs = Ext4(payload)
-    for src, dst in WANT.items():
-        data = fs.data(fs.lookup(src))
-        with open(os.path.join(out, dst), "wb") as f:
-            f.write(data)
-        print("== %-10s %8d bytes  build id %s" % (dst, len(data), build_id(data)))
+    with Ext4(payload) as fs:
+        for src, dst in WANT.items():
+            data = fs.data(fs.lookup(src))
+            with open(os.path.join(out, dst), "wb") as f:
+                f.write(data)
+            print("== %-10s %8d bytes  build id %s" % (dst, len(data), build_id(data)))
     os.remove(payload)
     shutil.rmtree(parts, ignore_errors=True)            # the partitions are large and not needed
-    got = build_id(open(os.path.join(out, "libc.so"), "rb").read())
+    with open(os.path.join(out, "libc.so"), "rb") as f:
+        got = build_id(f.read())
     if got != PINNED_LIBC_BUILD_ID:
         sys.exit("libc.so Build ID %s, expected %s - the SDK image changed" % (got, PINNED_LIBC_BUILD_ID))
     print("== libc.so Build ID matches the pinned value")

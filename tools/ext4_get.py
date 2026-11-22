@@ -12,6 +12,15 @@ import sys
 
 
 class Ext4:
+    def close(self):
+        self.f.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
     def __init__(self, path):
         self.f = open(path, "rb")
         sb = self.read_at(1024, 1024)
