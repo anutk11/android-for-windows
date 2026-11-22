@@ -22,8 +22,9 @@
 int afw_tls_init(void);
 
 /* Set up a new thread's bionic TLS block. Call at the start of every thread
- * that will run Android code. */
-void afw_tls_thread_init(void);
+ * that will run Android code. Returns 0, or -1 if the block could not be
+ * allocated: the thread must then not run Android code. */
+int afw_tls_thread_init(void);
 
 /* Replace the calling thread's block with one built from the final static
  * TLS layout (bionic slots carried over). Returns 0 or -1. */

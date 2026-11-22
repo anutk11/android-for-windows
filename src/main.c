@@ -215,7 +215,7 @@ static DWORD WINAPI tls_thread(LPVOID p) {
 static void *tls_thread(void *p) {
 #endif
     tls_job *j = (tls_job *)p;
-    afw_tls_thread_init();                     /* every thread that runs Android code */
+    if (afw_tls_thread_init() != 0) { j->rc = -2; tls_barrier(); return 0; }   /* no partial state */
     j->rc = j->fn(j->id, tls_barrier, j->use_ie);
     return 0;
 }

@@ -98,6 +98,20 @@ jobs:
           grep -q "GATE libc.so: would REFUSE" out/patch-scan.txt
           grep -q "GATE ld-android.so: would REFUSE" out/patch-scan.txt   # 3 unproven look-alikes, known
           echo "gate results as expected"
+          echo "--- libc ELF TLS: who uses the TPOFF64 GOT entry (issue #3, proposal 1; issue #4)" | tee out/libc-tls-scan.txt
+          {
+            readelf -lW out/bionic/libc.so | grep -E "Type|TLS"
+            readelf -rW out/bionic/libc.so | grep -E "TPOFF|DTPMOD|DTPOFF" || echo "no TLS relocations"
+            objdump -d --no-show-raw-insn out/bionic/libc.so > out/libc.dis
+            for got in $(readelf -rW out/bionic/libc.so | awk '/TPOFF64/{print $1}' | sed 's/^0*//'); do
+              echo "== instructions that load GOT entry 0x$got (the TPOFF64 value):"
+              grep -n "# $got <\|# $got\b" out/libc.dis | sed 's/^[0-9]*://' || true
+            done
+            echo "== every fs: access other than fs:0x28, with 10 instructions before and 3 after:"
+            grep -nE "%fs:" out/libc.dis | grep -v "%fs:0x28" | cut -d: -f1 | while read n; do
+              echo "----"; sed -n "$((n>10?n-10:1)),$((n+3))p" out/libc.dis
+            done
+          } | tee -a out/libc-tls-scan.txt
           echo "--- full record of every UNPROVEN site (for docs/unproven/)"
           grep "^UNPROVEN-DETAIL" out/patch-scan.txt | sed 's/^UNPROVEN-DETAIL //' > out/unproven-scan.txt
           cat out/unproven-scan.txt

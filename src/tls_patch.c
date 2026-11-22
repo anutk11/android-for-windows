@@ -58,36 +58,55 @@ static unsigned char *find_fs_disp(unsigned char *ip, unsigned char **disp, int 
     return fs;
 }
 
+static SRWLOCK g_patch_lock = SRWLOCK_INIT;
+
+/* Rewrites one faulting fs:[disp32] read, in place, to gs:[TEB slot].
+ * Order (reviewer 1, issue #2): the new disp32 first, then the prefix.
+ * Every in-between state (old prefix fs:, any mix of old and new disp
+ * bytes, all below 64KB) still faults, so another thread can never run
+ * a half-written instruction: it faults, waits for the lock, sees gs:
+ * and simply runs the finished instruction again. */
 static LONG CALLBACK fs_handler(EXCEPTION_POINTERS *ep) {
-    unsigned char *ip, *fs, *disp = NULL;
+    unsigned char *ip, *fs, *disp = NULL, *q;
     int32_t off, nd;
     int reg_form;
-    DWORD old;
+    DWORD old, tmp;
+    LONG rc = EXCEPTION_CONTINUE_SEARCH;
 
     if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
         return EXCEPTION_CONTINUE_SEARCH;
     ip = (unsigned char *)ep->ContextRecord->Rip;
+    AcquireSRWLockExclusive(&g_patch_lock);
+    /* already rewritten by another thread while we waited: just run it again */
+    for (q = ip; q < ip + 4 && (*q == 0x65 || *q == 0x66 || *q == 0xF2 || *q == 0xF3); q++)
+        if (*q == 0x65) { rc = EXCEPTION_CONTINUE_EXECUTION; goto out; }
     fs = find_fs_disp(ip, &disp, &reg_form);
-    if (!fs) return EXCEPTION_CONTINUE_SEARCH;
-
+    if (!fs) goto out;
     if (reg_form) {
         fprintf(stderr, "[tls] unsupported register-based fs: access at %p\n", (void *)ip);
-        return EXCEPTION_CONTINUE_SEARCH;
+        goto out;
     }
     memcpy(&off, disp, 4);
-    if (off < 0 || off >= 8 * BIONIC_TLS_SLOTS || (off & 7)) {
+    if (off != 0 && off != 0x28) {   /* same rule as the load gate: tp and stack guard only */
         fprintf(stderr, "[tls] unsupported fs:[0x%x] access at %p\n", off, (void *)ip);
-        return EXCEPTION_CONTINUE_SEARCH;
+        goto out;
     }
     nd = TEB_TLS_SLOTS + 8 * (int32_t)g_slot[off / 8];
-
-    VirtualProtect(fs, 16, PAGE_EXECUTE_READWRITE, &old);
-    *fs = 0x65;                      /* fs: -> gs: */
-    memcpy(disp, &nd, 4);
-    VirtualProtect(fs, 16, old, &old);
+    if (!VirtualProtect(fs, 16, PAGE_EXECUTE_READWRITE, &old)) {
+        fprintf(stderr, "[tls] cannot make code writable at %p (error %lu; ACG?): the fs: access stays "
+                        "unpatched and this is a crash, not a skip\n", (void *)ip, GetLastError());
+        goto out;
+    }
+    memcpy(disp, &nd, 4);            /* 1. displacement (still fs:, still faults) */
+    MemoryBarrier();
+    *fs = 0x65;                      /* 2. prefix fs: -> gs: (one byte, atomic) */
+    VirtualProtect(fs, 16, old, &tmp);
     FlushInstructionCache(GetCurrentProcess(), fs, 16);
     InterlockedIncrement(&g_patches);
-    return EXCEPTION_CONTINUE_EXECUTION;
+    rc = EXCEPTION_CONTINUE_EXECUTION;
+out:
+    ReleaseSRWLockExclusive(&g_patch_lock);
+    return rc;
 }
 
 /* Frees a thread's block when the thread exits. Never FlsFree: that would
@@ -110,8 +129,7 @@ int afw_tls_init(void) {
     if (g_fls == FLS_OUT_OF_INDEXES) { fprintf(stderr, "[tls] no FLS index\n"); return -1; }
     AddVectoredExceptionHandler(1, fs_handler);
     g_ready = 1;
-    afw_tls_thread_init();
-    return t_block ? 0 : -1;
+    return afw_tls_thread_init();
 }
 
 static void publish(void) {
@@ -120,13 +138,14 @@ static void publish(void) {
     FlsSetValue(g_fls, t_alloc);
 }
 
-void afw_tls_thread_init(void) {
+int afw_tls_thread_init(void) {
     if (!t_block) t_block = afw_tls_static_alloc(&t_alloc);
-    if (!t_block) { fprintf(stderr, "[tls] cannot allocate the thread's TLS block\n"); return; }
+    if (!t_block) { fprintf(stderr, "[tls] cannot allocate the thread's TLS block\n"); return -1; }
     t_block[TLS_SLOT_SELF] = (uintptr_t)t_block;
     t_block[TLS_SLOT_THREAD_ID] = (uintptr_t)GetCurrentThreadId();
     t_block[TLS_SLOT_STACK_GUARD] = g_guard;
     publish();
+    return 0;
 }
 
 int afw_tls_thread_rebuild(void) {
@@ -151,15 +170,15 @@ static pthread_key_t g_key;
 static void key_release(void *p) { afw_tls_static_free(p); }
 int afw_tls_init(void) {
     if (pthread_key_create(&g_key, key_release) != 0) return -1;
-    afw_tls_thread_init();
-    return t_block ? 0 : -1;
+    return afw_tls_thread_init();
 }
-void afw_tls_thread_init(void) {
+int afw_tls_thread_init(void) {
     if (!t_block) t_block = afw_tls_static_alloc(&t_alloc);
-    if (!t_block) return;
+    if (!t_block) return -1;
     t_block[TLS_SLOT_SELF] = (uintptr_t)t_block;
     t_block[TLS_SLOT_STACK_GUARD] = g_guard;
     pthread_setspecific(g_key, t_alloc);
+    return 0;
 }
 int afw_tls_thread_rebuild(void) {
     void *old_alloc = t_alloc, *new_alloc;
