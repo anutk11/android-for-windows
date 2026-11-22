@@ -173,8 +173,12 @@ static int run_syscall_tests(const afw_lib *lib) {
              * library's own .bss, through a patched site, as libc does it */
             volatile char *pg = (volatile char *)afw_sym(lib, "afw_sys_bss_page");
             long a = (long)(uintptr_t)pg;
+            long mr;
             pg[0] = 5;
-            check("mprotect(PROT_READ) on the library's own .bss succeeds", gen(10, a, 4096, 1, 0, 0, 0) == 0);
+            mr = gen(10, a, 4096, 1, 0, 0, 0);
+            printf("  mprotect(.bss page at image+0x%llx, PROT_READ) -> %ld\n",
+                   (unsigned long long)((uintptr_t)pg - (uintptr_t)lib->base), mr);
+            check("mprotect(PROT_READ) on the library's own .bss succeeds", mr == 0);
             check("... the contents are kept", pg[0] == 5);
             check("mprotect(PROT_READ|PROT_WRITE) back succeeds, and the page is writable",
                   gen(10, a, 4096, 3, 0, 0, 0) == 0 && (pg[0] = 6, pg[0] == 6));
