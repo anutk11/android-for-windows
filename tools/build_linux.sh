@@ -8,5 +8,6 @@ if [ ! -f "$ZA/Zydis.c" ]; then
   mkdir -p "$ZA" && mv "$ROOT/third_party/zydis/amalgamated-dist/"Zydis.[ch] "$ZA/"
   rmdir "$ROOT/third_party/zydis/amalgamated-dist"
 fi
-cc -O2 -Wall -Wno-unused-function -I"$ZA" -o "$ROOT/out/afw-loader" "$ROOT"/src/*.c "$ZA/Zydis.c"
-echo "built $ROOT/out/afw-loader"
+OUTBIN="${OUTBIN:-$ROOT/out/afw-loader}"
+cc -O2 -Wall -Wno-unused-function ${EXTRA_CFLAGS:-} -I"$ZA" -o "$OUTBIN" "$ROOT"/src/*.c "$ZA/Zydis.c"
+echo "built $OUTBIN"

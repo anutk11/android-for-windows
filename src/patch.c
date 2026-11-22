@@ -422,9 +422,12 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                 uint64_t sf0, se0;
                 if (!c || !c->bounds || !c->bounds(c->ctx, ip, &sf0, &se0)) {
                     /* not inside a known function: decoded data, or unknown code - leave it */
-                    rep->sys_refused_unknown++;
+                    /* not inside a known function: may be data, so its bytes are not
+                     * changed - but the library will not be run (load gate) */
+                    rep->sys_untouched++;
                     describe(c, p, where, sizeof where);
-                    fprintf(stderr, "  [patch] syscall bytes at %s are outside every known function: not touched\n", where);
+                    fprintf(stderr, "  [patch] syscall bytes at %s are outside every known function: "
+                                    "not touched, library will not be run\n", where);
                     goto next_ins;
                 }
                 memset(&s, 0, sizeof s);

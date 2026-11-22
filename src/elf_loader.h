@@ -57,6 +57,12 @@ extern int afw_load_patch_only;
  * flag overrides that, for diagnosis only. */
 extern int afw_load_allow_unproven;
 
+/* The load gate: 1 if patching left the library provably safe to run.
+ * Blocks on: unproven look-alikes, undecodable exception tables, syscall
+ * bytes that were neither patched nor turned into ud2, syscall bytes in
+ * executable sections outside every known function. */
+int afw_gate_ok(const afw_lib *lib);
+
 /* Load, relocate, link against bionic-win and run constructors.
  * Returns 0 on success; prints the reason on failure. */
 int afw_load(const char *path, afw_lib *lib, int verbose);

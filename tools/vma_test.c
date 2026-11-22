@@ -70,6 +70,15 @@ int main(void) {
     memset(p, 0x5a, 1920 * K);
     check("write and read back the middle", p[0] == 0x5a && p[1920 * K - 1] == 0x5a);
     WIN_CHECK("trimmed edge is decommitted", (uint64_t)b, "reserved");
+#if defined(_WIN32)
+    {
+        uint64_t q;
+        int all = 1;
+        for (q = (uint64_t)b + 64 * K; q < (uint64_t)b + 1984 * K; q += 4 * K)
+            if (strcmp(state(q), "commit-rw") != 0) all = 0;
+        check("EVERY page of the middle is committed RW (all 480 checked)", all);
+    }
+#endif
     check("munmap the middle", MUNMAP(b + 64 * K, 1920 * K) == 0);
     check("whole Windows allocation released", afw_vma_alloc_count() == 0);
     WIN_CHECK("address range is free again", (uint64_t)b, "free");
@@ -129,7 +138,38 @@ int main(void) {
     WIN_CHECK("its neighbour stays RW", (uint64_t)b, "commit-rw");
     MUNMAP(b, 16 * K);
 
-    printf("7. Arguments\n");
+    printf("7. MAP_FIXED over a page that has content\n");
+    b = MMAP(0, 16 * K, RW, ANON);
+    p = (unsigned char *)(uintptr_t)b;
+    memset(p, 0xaa, 16 * K);
+    check("MAP_FIXED over the second page", MMAP(b + 4 * K, 4 * K, RW, ANON | LNX_MAP_FIXED) == b + 4 * (int64_t)K);
+    check("that page is zeroed", all_zero(p + 4 * K, 4 * K));
+    check("neighbours unchanged", p[0] == 0xaa && p[4 * K - 1] == 0xaa && p[8 * K] == 0xaa);
+    MUNMAP(b, 16 * K);
+
+    printf("8. PROT_NONE page, then MADV_DONTNEED, then RW again\n");
+    b = MMAP(0, 8 * K, RW, ANON);
+    p = (unsigned char *)(uintptr_t)b;
+    memset(p, 0x33, 8 * K);
+    MPROTECT(b, 8 * K, 0);
+    check("madvise(DONTNEED) on PROT_NONE pages", MADVISE(b, 8 * K, LNX_MADV_DONTNEED) == 0);
+    WIN_CHECK("page dropped back to reserved (no commit charge)", (uint64_t)b, "reserved");
+    check("mprotect RW again", MPROTECT(b, 8 * K, RW) == 0);
+    check("contents are zero, not the old 0x33", all_zero(p, 8 * K));
+    MUNMAP(b, 8 * K);
+
+    printf("9. Small mapping: the rest of Windows' 64KB granule is not exposed\n");
+    b = MMAP(0, 4 * K, RW, ANON);
+    WIN_CHECK("the mapped page is committed", (uint64_t)b, "commit-rw");
+    WIN_CHECK("the next 4KB is not part of any reservation", (uint64_t)b + 4 * K, "free");
+    MUNMAP(b, 4 * K);
+
+    printf("10. Arguments\n");
+    check("length overflow -> EINVAL (munmap, mprotect, madvise)",
+          MUNMAP(0x10000, (int64_t)(UINT64_MAX - 100)) == -22 &&
+          MPROTECT(0x10000, (int64_t)(UINT64_MAX - 100), RW) == -22 &&
+          MADVISE(0x10000, (int64_t)(UINT64_MAX - 100), LNX_MADV_DONTNEED) == -22);
+    check("address + length overflow -> EINVAL", MUNMAP((int64_t)(UINT64_MAX - 0xfff), 0x2000) == -22);
     check("unaligned address -> EINVAL", MUNMAP(4097, 4096) == -22 && MPROTECT(4097, 4096, RW) == -22);
     check("zero length mmap -> EINVAL", MMAP(0, 0, RW, ANON) == -22);
     b = MMAP(0, 100, RW, ANON);

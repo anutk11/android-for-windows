@@ -65,6 +65,7 @@ typedef struct {
     int landing_pads;          /* C++ landing pads used as entry points */
     int lsda_failures;         /* exception tables we could not fully decode */
     int sys_trapped;           /* refused sites whose syscall became ud2 (loud trap) */
+    int sys_untouched;         /* syscall bytes neither patched nor trapped: blocks loading */
     int sys_outside_functions; /* syscall in executable bytes with no .eh_frame entry */
     int fs_outside_functions;
     int redzone_direct;        /* refusals by reason: [rsp-N] */

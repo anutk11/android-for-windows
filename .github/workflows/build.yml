@@ -83,10 +83,41 @@ jobs:
             echo "================ $f"
             out/afw-loader "$f" --patch-report 2>&1 | grep -vE "^  MISSING" | tee -a out/patch-scan.txt
           done
+          echo "--- expected load-gate results (an unexpected change fails the build)"
+          grep -q "GATE libc.so: would RUN" out/patch-scan.txt
+          grep -q "GATE ld-android.so: would REFUSE" out/patch-scan.txt   # 3 unproven look-alikes, known
+          echo "gate results as expected"
       - uses: actions/upload-artifact@v4
         with:
           name: bionic-scan-report
           path: out/*-scan.txt
+
+  # Every test again on Linux under AddressSanitizer + UBSan (mandatory)
+  linux-asan:
+    needs: android-lib
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/download-artifact@v4
+        with:
+          name: libhello
+          path: out
+      - name: Build loader and VMA tests with ASan + UBSan
+        run: |
+          OUTBIN=out/afw-asan EXTRA_CFLAGS="-g -fsanitize=address,undefined -fno-sanitize-recover=undefined" bash tools/build_linux.sh
+          cc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall \
+             -o out/vma_test tools/vma_test.c src/vma.c src/syscall.c src/platform.c
+      - name: Run all tests under ASan
+        run: |
+          set -e
+          out/vma_test
+          out/afw-asan out/libhello.so
+          out/afw-asan out/libsyscall_test.so
+          out/afw-asan out/libredzone_test.so
+          out/afw-asan out/libcxx_exception_test.so --patch-report --strict --min-landing-pads=1
+          out/afw-asan out/libc++_shared.so --patch-report
 
   # 2. Build the loader on Windows and run the Android library with it
   windows:
@@ -118,6 +149,14 @@ jobs:
       - name: "C++ exceptions: every landing pad found, nothing unproven (static)"
         shell: cmd
         run: out\afw-loader.exe out\libcxx_exception_test.so --patch-report --strict --min-landing-pads=1
+      - name: "A refused site must trap loudly (ud2), not reach the Windows kernel"
+        shell: cmd
+        run: |
+          out\afw-loader.exe out\libsyscall_test.so --call-trap > out\trap.txt 2>&1
+          if %errorlevel% equ 0 (type out\trap.txt & echo did not crash & exit /b 1)
+          if %errorlevel% equ 99 (type out\trap.txt & echo did not trap & exit /b 1)
+          type out\trap.txt | findstr /c:"exception 0xc000001d" /c:"REFUSED to patch"
+          findstr /c:"the loader REFUSED to patch" out\trap.txt
       - name: "Negative test: red zone sites must be refused"
         shell: cmd
         run: out\afw-loader.exe out\libredzone_test.so

@@ -195,7 +195,7 @@ static int run_redzone_tests(const afw_lib *lib) {
 
 int main(int argc, char **argv) {
     afw_lib lib;
-    int verbose = 1, rc = 0, strict = 0, min_pads = 0;
+    int verbose = 1, rc = 0, strict = 0, min_pads = 0, call_trap = 0;
 
     setvbuf(stdout, NULL, _IONBF, 0); /* never lose output on a crash */
     afw_crash_init();
@@ -210,9 +210,10 @@ int main(int argc, char **argv) {
     if (argc > 2 && strcmp(argv[2], "--patch-report") == 0) afw_load_patch_only = 1;
     {
         int a;
-        for (a = 3; a < argc; a++) {
+        for (a = 2; a < argc; a++) {
             if (strcmp(argv[a], "--strict") == 0) strict = 1;
             else if (strcmp(argv[a], "--allow-unproven") == 0) afw_load_allow_unproven = 1;
+            else if (strcmp(argv[a], "--call-trap") == 0) call_trap = 1;
             else if (strncmp(argv[a], "--min-landing-pads=", 19) == 0) min_pads = atoi(argv[a] + 19);
         }
     }
@@ -246,6 +247,9 @@ int main(int argc, char **argv) {
     if (lib.patch.sys_refused_redzone)
         printf("  red zone refusals: %d [rsp-N], %d [frame reg - N] beyond sub rsp\n",
                lib.patch.redzone_direct, lib.patch.redzone_via_copy);
+    if (afw_load_patch_only)
+        printf("GATE %s: %s\n", lib.soname ? lib.soname : argv[1],
+               afw_gate_ok(&lib) ? "would RUN" : "would REFUSE");
     if (afw_load_patch_only && strict) {
         int bad = lib.patch.unproven || lib.patch.lsda_failures ||
                   lib.patch.landing_pads < min_pads;
@@ -269,6 +273,14 @@ int main(int argc, char **argv) {
     if (afw_sym(&lib, "afw_add")) rc = run_m0_tests(&lib);
     if (afw_sym(&lib, "afw_sys_getpid")) rc |= run_syscall_tests(&lib);
     if (afw_sym(&lib, "afw_rz_safe")) rc |= run_redzone_tests(&lib);
+    if (call_trap) {
+        typedef long (SYSV *f1)(int);
+        f1 f = (f1)afw_sym(&lib, "afw_sys_branch_into_site");
+        printf("\nCalling a REFUSED site on purpose (expect a clear crash report)...\n");
+        if (f) f(0);
+        printf("ERROR: the refused site did not trap\n");
+        return 99;
+    }
 
     afw_unload(&lib);
     return rc;

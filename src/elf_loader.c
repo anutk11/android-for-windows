@@ -27,6 +27,11 @@ typedef SYSV void (*init_fn)(void);
 int afw_load_patch_only;
 int afw_load_allow_unproven;
 
+int afw_gate_ok(const afw_lib *lib) {
+    const afw_patch_report *r = &lib->patch;
+    return !r->unproven && !r->lsda_failures && !r->sys_untouched && !r->sys_outside_functions;
+}
+
 #define MAX_LIBS 64
 static afw_lib *g_libs[MAX_LIBS];
 static int g_nlibs;
@@ -468,13 +473,14 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
             free(cr); free(pageprot); return -1;
         }
         free(cr);
-        if (!afw_load_patch_only && !afw_load_allow_unproven &&
-            (lib->patch.unproven || lib->patch.lsda_failures)) {
+        if (!afw_load_patch_only && !afw_load_allow_unproven && !afw_gate_ok(lib)) {
             fprintf(stderr,
-                    "error: refusing to run %s: patching left %d unproven syscall/fs: look-alikes and %d\n"
-                    "       undecodable exception tables. Code we cannot prove safe is not run.\n"
+                    "error: refusing to run %s: patching left %d unproven syscall/fs: look-alikes,\n"
+                    "       %d undecodable exception tables, %d untouched syscall sites and %d syscall\n"
+                    "       bytes outside known functions. Code we cannot prove safe is not run.\n"
                     "       (--allow-unproven overrides this, for diagnosis only)\n",
-                    path, lib->patch.unproven, lib->patch.lsda_failures);
+                    path, lib->patch.unproven, lib->patch.lsda_failures, lib->patch.sys_untouched,
+                    lib->patch.sys_outside_functions);
             free(pageprot); return -1;
         }
         afw_mem_protect(lib->stub_area, AFW_STUB_RESERVE, AFW_PROT_R | AFW_PROT_X);
