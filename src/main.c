@@ -612,6 +612,13 @@ int main(int argc, char **argv) {
             else if (strncmp(argv[a], "--min-landing-pads=", 19) == 0) min_pads = atoi(argv[a] + 19);
             else if (strncmp(argv[a], "--preload-fail=", 15) == 0) preload_fail = argv[a] + 15;
             else if (strcmp(argv[a], "--with-deps") == 0) with_deps = 1;
+            else if (strncmp(argv[a], "--watchdog=", 11) == 0) {
+                int sec = atoi(argv[a] + 11);
+                if (sec <= 0 || afw_watchdog_start((unsigned)sec) != 0) {
+                    fprintf(stderr, "error: --watchdog=SECONDS needs a positive number\n");
+                    return 2;
+                }
+            }
         }
     }
     if (afw_check_security() != 0) return 1;

@@ -236,7 +236,7 @@ jobs:
         timeout-minutes: 3       # a hang is a result too: the output so far is printed live
         shell: cmd
         run: |
-          out\afw-loader.exe out\bionic\libc.so --with-deps 2>&1
+          out\afw-loader.exe out\bionic\libc.so --with-deps --watchdog=60 2>&1
           echo exit code %errorlevel%
       - name: "VMA layer: mmap / munmap / mprotect / madvise on Windows"
         shell: cmd
