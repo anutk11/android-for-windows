@@ -68,6 +68,7 @@ typedef struct {
     int sys_untouched;         /* syscall bytes neither patched nor trapped: blocks loading */
     int sys_outside_functions; /* syscall in executable bytes with no .eh_frame entry */
     int fs_outside_functions;
+    int fs_unsupported;        /* reachable fs: access other than a read of fs:[0] / fs:[0x28]: blocks loading */
     int redzone_direct;        /* refusals by reason: [rsp-N] */
     int redzone_via_copy;      /* [reg-N] beyond what sub rsp allocated */
     /* every reachable fs:[disp32] access by (offset, instruction, read/write) */

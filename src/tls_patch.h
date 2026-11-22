@@ -25,6 +25,10 @@ int afw_tls_init(void);
  * that will run Android code. */
 void afw_tls_thread_init(void);
 
+/* Replace the calling thread's block with one built from the final static
+ * TLS layout (bionic slots carried over). Returns 0 or -1. */
+int afw_tls_thread_rebuild(void);
+
 /* Windows TEB offset (gs:) that holds bionic slot `slot`, or -1 when there
  * is none (non-Windows, or slot out of range). Used by load-time patching. */
 int afw_tls_teb_offset(int slot);

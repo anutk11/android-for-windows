@@ -11,12 +11,14 @@
  *   - a write through fs:[x] updates the TEB slot, not the block itself.
  */
 #include "tls_patch.h"
+#include "tls_static.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static _Thread_local uintptr_t *t_block;
+static _Thread_local uintptr_t *t_block;   /* tp: bionic slots, module TLS below it */
+static _Thread_local void *t_alloc;       /* the allocation that holds t_block */
 static uintptr_t g_guard = 0x5afe5afe5afe5afeULL;
 
 uintptr_t *afw_tls_block(void) { return t_block; }
@@ -88,6 +90,12 @@ static LONG CALLBACK fs_handler(EXCEPTION_POINTERS *ep) {
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
+/* Frees a thread's block when the thread exits. Never FlsFree: that would
+ * run this for every live thread (reviewer 3, issue #4). Not called on
+ * TerminateThread: one block leaks, accepted. */
+static DWORD g_fls = FLS_OUT_OF_INDEXES;
+static VOID WINAPI fls_release(PVOID p) { afw_tls_static_free(p); }
+
 int afw_tls_init(void) {
     int i;
     if (g_ready) return 0;
@@ -98,29 +106,70 @@ int afw_tls_init(void) {
             return -1;
         }
     }
+    g_fls = FlsAlloc(fls_release);
+    if (g_fls == FLS_OUT_OF_INDEXES) { fprintf(stderr, "[tls] no FLS index\n"); return -1; }
     AddVectoredExceptionHandler(1, fs_handler);
     g_ready = 1;
     afw_tls_thread_init();
-    return 0;
+    return t_block ? 0 : -1;
+}
+
+static void publish(void) {
+    int i;
+    for (i = 0; i < BIONIC_TLS_SLOTS; i++) TlsSetValue(g_slot[i], (void *)t_block[i]);
+    FlsSetValue(g_fls, t_alloc);
 }
 
 void afw_tls_thread_init(void) {
-    int i;
-    if (!t_block) t_block = (uintptr_t *)calloc(BIONIC_TLS_SLOTS, sizeof(uintptr_t));
+    if (!t_block) t_block = afw_tls_static_alloc(&t_alloc);
+    if (!t_block) { fprintf(stderr, "[tls] cannot allocate the thread's TLS block\n"); return; }
     t_block[TLS_SLOT_SELF] = (uintptr_t)t_block;
     t_block[TLS_SLOT_THREAD_ID] = (uintptr_t)GetCurrentThreadId();
     t_block[TLS_SLOT_STACK_GUARD] = g_guard;
-    for (i = 0; i < BIONIC_TLS_SLOTS; i++) TlsSetValue(g_slot[i], (void *)t_block[i]);
+    publish();
+}
+
+int afw_tls_thread_rebuild(void) {
+    void *old_alloc = t_alloc, *new_alloc;
+    uintptr_t *old = t_block, *nb = afw_tls_static_alloc(&new_alloc);
+    if (!nb) return -1;
+    if (old) memcpy(nb, old, BIONIC_TLS_SLOTS * sizeof *nb);
+    nb[TLS_SLOT_SELF] = (uintptr_t)nb;
+    t_block = nb; t_alloc = new_alloc;
+    publish();                       /* the FLS value now names the new block */
+    afw_tls_static_free(old_alloc);
+    return 0;
 }
 
 #else
 /* Linux: fs: already works natively; nothing to patch. */
 long afw_tls_patch_count(void) { return 0; }
 int afw_tls_teb_offset(int slot) { (void)slot; return -1; }
-int afw_tls_init(void) { afw_tls_thread_init(); return 0; }
+#include <pthread.h>
+/* Same rule as FLS on Windows: the key frees a thread's block at exit. */
+static pthread_key_t g_key;
+static void key_release(void *p) { afw_tls_static_free(p); }
+int afw_tls_init(void) {
+    if (pthread_key_create(&g_key, key_release) != 0) return -1;
+    afw_tls_thread_init();
+    return t_block ? 0 : -1;
+}
 void afw_tls_thread_init(void) {
-    if (!t_block) t_block = (uintptr_t *)calloc(BIONIC_TLS_SLOTS, sizeof(uintptr_t));
+    if (!t_block) t_block = afw_tls_static_alloc(&t_alloc);
+    if (!t_block) return;
     t_block[TLS_SLOT_SELF] = (uintptr_t)t_block;
     t_block[TLS_SLOT_STACK_GUARD] = g_guard;
+    pthread_setspecific(g_key, t_alloc);
+}
+int afw_tls_thread_rebuild(void) {
+    void *old_alloc = t_alloc, *new_alloc;
+    uintptr_t *old = t_block, *nb = afw_tls_static_alloc(&new_alloc);
+    if (!nb) return -1;
+    if (old) memcpy(nb, old, BIONIC_TLS_SLOTS * sizeof *nb);
+    nb[TLS_SLOT_SELF] = (uintptr_t)nb;
+    t_block = nb; t_alloc = new_alloc;
+    pthread_setspecific(g_key, t_alloc);
+    afw_tls_static_free(old_alloc);
+    return 0;
 }
 #endif

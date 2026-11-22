@@ -135,5 +135,12 @@ typedef struct {
 #define R_X86_64_JUMP_SLOT 7
 #define R_X86_64_RELATIVE 8
 #define R_X86_64_IRELATIVE 37
+#define R_X86_64_DTPMOD64 16
+#define R_X86_64_DTPOFF64 17
+#define R_X86_64_TPOFF64 18
+#define R_X86_64_TLSDESC 36
+#ifndef STT_TLS
+#define STT_TLS 6
+#endif
 
 #endif

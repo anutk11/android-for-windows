@@ -17,6 +17,13 @@
 #include "crash.h"
 #include "syscall.h"
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
+
 #define AFW_VERSION "0.2.0-M1-dev"
 
 /* Signatures of the test library's functions (Android = System V ABI). */
@@ -182,6 +189,82 @@ static int run_syscall_tests(const afw_lib *lib) {
     return g_failed ? 1 : 0;
 }
 
+
+/* ---- G1-TLS (docs/design/G1-TLS.md, section 5) ---------------------- */
+typedef int (SYSV *tls_int_fn)(void);
+typedef long (SYSV *tls_long_fn)(void);
+typedef uintptr_t (SYSV *tls_uptr_fn)(void);
+typedef int *(SYSV *tls_ptr_fn)(void);
+typedef SYSV void (*tls_wait_fn)(void);
+typedef int (SYSV *tls_worker_fn)(int, tls_wait_fn, int);
+
+static volatile long g_arrived;
+static SYSV void tls_barrier(void) {          /* two threads meet here */
+#if defined(_WIN32)
+    InterlockedIncrement(&g_arrived);
+#else
+    __atomic_add_fetch(&g_arrived, 1, __ATOMIC_SEQ_CST);
+#endif
+    while (g_arrived < 2) {}
+}
+
+typedef struct { tls_worker_fn fn; int id, use_ie, rc; } tls_job;
+#if defined(_WIN32)
+static DWORD WINAPI tls_thread(LPVOID p) {
+#else
+static void *tls_thread(void *p) {
+#endif
+    tls_job *j = (tls_job *)p;
+    afw_tls_thread_init();                     /* every thread that runs Android code */
+    j->rc = j->fn(j->id, tls_barrier, j->use_ie);
+    return 0;
+}
+
+static int run_tls_threads(tls_worker_fn fn, int use_ie) {
+    tls_job j[2] = {{fn, 1, use_ie, -1}, {fn, 2, use_ie, -1}};
+    int k;
+    g_arrived = 0;
+#if defined(_WIN32)
+    HANDLE h[2];
+    for (k = 0; k < 2; k++) h[k] = CreateThread(NULL, 0, tls_thread, &j[k], 0, NULL);
+    WaitForMultipleObjects(2, h, TRUE, INFINITE);
+    for (k = 0; k < 2; k++) CloseHandle(h[k]);
+#else
+    pthread_t t[2];
+    for (k = 0; k < 2; k++) pthread_create(&t[k], NULL, tls_thread, &j[k]);
+    for (k = 0; k < 2; k++) pthread_join(t[k], NULL);
+#endif
+    if (j[0].rc || j[1].rc) printf("    worker results: thread 1 -> %d, thread 2 -> %d\n", j[0].rc, j[1].rc);
+    return j[0].rc == 0 && j[1].rc == 0;
+}
+
+static int run_tls_tests(const afw_lib *lib) {
+    tls_int_fn tdata = (tls_int_fn)afw_sym(lib, "afw_tls_tdata");
+    tls_int_fn tbss = (tls_int_fn)afw_sym(lib, "afw_tls_tbss");
+    tls_long_fn local = (tls_long_fn)afw_sym(lib, "afw_tls_local");
+    tls_uptr_fn aligned = (tls_uptr_fn)afw_sym(lib, "afw_tls_aligned_addr");
+    tls_int_fn first = (tls_int_fn)afw_sym(lib, "afw_tls_aligned_first");
+    tls_ptr_fn gd = (tls_ptr_fn)afw_sym(lib, "afw_tls_addr_gd");
+    tls_ptr_fn ie = (tls_ptr_fn)afw_sym(lib, "afw_tls_addr_ie");
+    tls_worker_fn worker = (tls_worker_fn)afw_sym(lib, "afw_tls_worker");
+    printf("\nG1-TLS tests (ELF thread-local storage):\n");
+    check(".tdata variable has its initial value", tdata() == 0x5eed1234);
+    check(".tbss variable starts at zero", tbss() == 0);
+    check("static __thread (relocation with symbol 0)", local() == 77);
+    check("aligned(64) variable is 64-byte aligned", (aligned() & 63) == 0);
+    check("aligned variable has its initial value", first() == 7);
+    check("general-dynamic address lies below tp", (uintptr_t)gd() < (uintptr_t)afw_tls_block());
+#if defined(_WIN32)
+    check("initial-exec (fs:[0] + TPOFF64) == general-dynamic", ie() == gd());
+    check("two threads, initial-exec: private copies", run_tls_threads(worker, 1));
+#else
+    (void)ie;   /* on Linux fs: belongs to the host C library: initial-exec runs only on Windows */
+#endif
+    check("two threads, general-dynamic: private copies", run_tls_threads(worker, 0));
+    printf("%s\n", g_failed ? "G1-TLS TESTS FAILED" : "G1-TLS TESTS PASSED");
+    return g_failed ? 1 : 0;
+}
+
 static int run_redzone_tests(const afw_lib *lib) {
     getpid_fn safe = (getpid_fn)afw_sym(lib, "afw_rz_safe");
     printf("\n=== G1 negative test: red zone ===\n");
@@ -281,6 +364,7 @@ int main(int argc, char **argv) {
     if (afw_sym(&lib, "afw_add")) rc = run_m0_tests(&lib);
     if (afw_sym(&lib, "afw_sys_getpid")) rc |= run_syscall_tests(&lib);
     if (afw_sym(&lib, "afw_rz_safe")) rc |= run_redzone_tests(&lib);
+    if (afw_sym(&lib, "afw_tls_worker")) rc |= run_tls_tests(&lib);
     if (call_trap) {
         typedef long (SYSV *f1)(int);
         f1 f = (f1)afw_sym(&lib, "afw_sys_branch_into_site");

@@ -1,0 +1,4 @@
+/* fs_gate_test.c - must be REFUSED by the load gate (G1-TLS test 7):
+ * one read of a bionic slot other than tp / stack guard, one write. */
+long afw_fs_other_slot(void) { long v; __asm__ volatile("mov %%fs:0x10, %0" : "=r"(v)); return v; }
+void afw_fs_write(long v) { __asm__ volatile("mov %0, %%fs:0x28" : : "r"(v)); }

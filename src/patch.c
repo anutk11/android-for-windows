@@ -530,7 +530,7 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                     uint64_t fs_, fe_;
                     int inside = c && c->bounds && c->bounds(c->ctx, ip, &fs_, &fe_);
                     describe(c, p, where, sizeof where);
-                    if (inside) rep->fs_reg_in_func++; else rep->fs_reg_outside++;
+                    if (inside) { rep->fs_reg_in_func++; rep->fs_unsupported++; } else rep->fs_reg_outside++;
                     fprintf(stderr, "  [patch] fs:[reg] at %s: %s\n", where,
                             inside ? "INSIDE a known function - real ELF TLS access (needs G2)"
                                    : "outside every known function - data decoded as code, ignored");
@@ -549,6 +549,17 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                         rep->fs_kind[q].write = w; rep->fs_kind[q].count = 0; rep->nfs_kind++;
                     }
                     if (q < rep->nfs_kind) rep->fs_kind[q].count++;
+                    /* measured: real code only READS tp (fs:[0]) and the stack guard
+                     * (fs:[0x28]), both constant per thread, so a per-thread copy in
+                     * the TEB is exact. Anything else is not proven: block loading. */
+                    if (w || (d0 != 0 && d0 != 0x28)) {
+                        rep->fs_unsupported++;
+                        describe(c, p, where, sizeof where);
+                        fprintf(stderr, "  [patch] fs: access at %s is %s fs:[0x%llx]: not supported, "
+                                        "library will not be run\n", where, w ? "a WRITE to" : "a read of",
+                                (long long)d0);
+                        dump_ins(p, &ins, ops);
+                    }
                 }
 #if defined(_WIN32)
                 {
