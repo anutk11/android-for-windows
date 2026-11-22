@@ -99,14 +99,20 @@ int afw_tls_static_finish(void) {
     /* Own copies of the (relocated) .tdata images from now on: a library
      * whose load fails later may release its mapping, and threads created
      * later must not read from it (reviewer 4, PR #9). */
-    for (m = 0; m < g_layout.nmod; m++) {
-        void *copy = NULL;
-        if (g_seg[m].p_filesz) {
-            copy = malloc((size_t)g_seg[m].p_filesz);
-            if (!copy) { fprintf(stderr, "error: out of memory copying TLS images\n"); return -1; }
-            memcpy(copy, g_image[m], (size_t)g_seg[m].p_filesz);
+    {   /* all copies first, then swap: a failed malloc halfway leaves g_image
+         * untouched and frees what was copied (reviewer 4, PR #9 note) */
+        void *copy[AFW_TLS_MAX_MODULES] = {0};
+        for (m = 0; m < g_layout.nmod; m++) {
+            if (!g_seg[m].p_filesz) continue;
+            copy[m] = malloc((size_t)g_seg[m].p_filesz);
+            if (!copy[m]) {
+                while (m-- > 0) free(copy[m]);
+                fprintf(stderr, "error: out of memory copying TLS images\n");
+                return -1;
+            }
+            memcpy(copy[m], g_image[m], (size_t)g_seg[m].p_filesz);
         }
-        g_image[m] = copy;
+        for (m = 0; m < g_layout.nmod; m++) g_image[m] = copy[m];
     }
     g_finished = 1;
     return afw_tls_thread_rebuild();
