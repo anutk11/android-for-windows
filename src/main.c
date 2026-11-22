@@ -189,6 +189,19 @@ static int run_syscall_tests(const afw_lib *lib) {
               sw && v == host_pid() && afw_syscall_counts[39] == before + 1 && sw(6) == 16);
     }
 
+    {   /* writev: libc's abort message goes through it (measured on Windows, PR #11) */
+        static const char p1[] = "  writev: ", p2[] = "two parts\n";
+        uint64_t iov[6] = {(uint64_t)(uintptr_t)p1, sizeof p1 - 1, 0, 0, (uint64_t)(uintptr_t)p2, sizeof p2 - 1};
+        int64_t a[6] = {1, (int64_t)(uintptr_t)iov, 3, 0, 0, 0};
+        int64_t bad[6] = {1, (int64_t)(uintptr_t)iov, 1025, 0, 0, 0};
+        int64_t badfd[6] = {7, (int64_t)(uintptr_t)iov, 3, 0, 0, 0};
+        fflush(stdout);
+        check("writev writes every iovec (an empty one included) and returns the total",
+              afw_syscall_dispatch(20, a) == (int64_t)(sizeof p1 - 1 + sizeof p2 - 1));
+        check("writev: more than IOV_MAX iovecs -> -EINVAL", afw_syscall_dispatch(20, bad) == -22);
+        check("writev: unknown fd -> -EBADF", afw_syscall_dispatch(20, badfd) == -9)   /* EBADF */;
+    }
+
     printf("\n");
     afw_syscall_report();
     printf("\n%s\n", g_failed ? "G1 SYSCALL TESTS FAILED" : "G1 SYSCALL TESTS PASSED");

@@ -17,6 +17,7 @@
 #include <windows.h>
 #else
 #include <unistd.h>
+#include <sys/syscall.h>
 #endif
 
 #define LNX_ENOSYS 38
@@ -122,6 +123,31 @@ static int64_t sys_write(int64_t fd, const void *buf, uint64_t len) {
 #endif
 }
 
+/* writev: each iovec in order through write(); stops at the first short or
+ * failed write, like Linux returns the bytes written so far. */
+static int64_t sys_writev(int64_t fd, const uint64_t *iov, int64_t cnt) {
+    int64_t total = 0, i;
+    if (cnt < 0 || cnt > 1024) return -22;          /* EINVAL beyond IOV_MAX */
+    for (i = 0; i < cnt; i++) {
+        uint64_t len = iov[2 * i + 1];
+        int64_t r;
+        if (!len) continue;
+        r = sys_write(fd, (const void *)(uintptr_t)iov[2 * i], len);
+        if (r < 0) return total ? total : r;
+        total += r;
+        if ((uint64_t)r < len) break;
+    }
+    return total;
+}
+
+static int64_t sys_gettid(void) {   /* the same id the thread area holds (tls_patch.c) */
+#if defined(_WIN32)
+    return (int64_t)GetCurrentThreadId();
+#else
+    return (int64_t)syscall(SYS_gettid);
+#endif
+}
+
 static int64_t sys_getpid(void) {
 #if defined(_WIN32)
     return (int64_t)GetCurrentProcessId();
@@ -135,6 +161,8 @@ int64_t afw_syscall_dispatch(int64_t nr, int64_t *a) {
     switch (nr) {
     case 1:   return sys_write(a[0], (const void *)(uintptr_t)a[1], (uint64_t)a[2]);
     case 39:  return sys_getpid();
+    case 20:  return sys_writev(a[0], (const uint64_t *)(uintptr_t)a[1], a[2]);
+    case 186: return sys_gettid();
     case 9:   return afw_mmap((uint64_t)a[0], (uint64_t)a[1], (int)a[2], (int)a[3], (int)a[4], a[5]);
     case 10:  return afw_mprotect((uint64_t)a[0], (uint64_t)a[1], (int)a[2]);
     case 11:  return afw_munmap((uint64_t)a[0], (uint64_t)a[1]);
