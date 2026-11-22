@@ -1067,6 +1067,22 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                                                                     ZYAN_NULL);
                                     fprintf(stderr, "           unresolved jump +0x%llx: %s\n",
                                             (long long)((intptr_t)g_unres[u] - c->bias), tx);
+                                    {   /* the 12 instructions before it, linearly from the function start */
+                                        unsigned char *w[12], *q3;
+                                        int nw3 = 0, x;
+                                        for (q3 = p; q3 < g_unres[u];) {
+                                            int ok3 = ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, q3, (ZyanUSize)(end - q3), &ins, ops));
+                                            if (ok3) { if (nw3 == 12) { memmove(w, w + 1, 11 * sizeof *w); nw3 = 11; } w[nw3++] = q3; }
+                                            q3 += ok3 ? ins.length : 1;
+                                        }
+                                        for (x = 0; x < nw3; x++)
+                                            if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, w[x], 16, &ins, ops))) {
+                                                ZydisFormatterFormatInstruction(&fm, &ins, ops, ins.operand_count_visible, tx,
+                                                                                sizeof tx, (ZyanU64)((intptr_t)w[x] - c->bias), ZYAN_NULL);
+                                                fprintf(stderr, "             %c 0x%llx: %s\n", maps[r] && maps[r][w[x] - p] == 1 ? 'R' : '-',
+                                                        (long long)((intptr_t)w[x] - c->bias), tx);
+                                            }
+                                    }
                                 }
                         }
                     } else { maps0[r] = map; map = maps[r] = m2; undecided[r] = und2; why = why2; }
