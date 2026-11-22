@@ -26,12 +26,7 @@
 #define SHT_SYMTAB 2
 #define SHT_DYNSYM 11
 
-typedef struct {
-    uint32_t sh_name, sh_type;
-    uint64_t sh_flags, sh_addr, sh_offset, sh_size;
-    uint32_t sh_link, sh_info;
-    uint64_t sh_addralign, sh_entsize;
-} Elf64_Shdr;
+
 
 typedef struct { uint64_t addr; uint64_t size; const char *name; } func_sym;
 

@@ -135,7 +135,8 @@ static void dump_ins(const unsigned char *p, const ZydisDecodedInstruction *ins,
  * UNDECIDED: the bytes no path reaches are never decoded or changed, and any
  * syscall/fs: look-alike among them is reported as unproven (not "never runs").
  */
-static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t size, int *undecided) {
+static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t size, int *undecided,
+                                const unsigned char **why) {
     ZydisDecodedInstruction ins;
     ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
     unsigned char *map = (unsigned char *)calloc(size ? size : 1, 1);
@@ -179,9 +180,9 @@ static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t s
                                 VEC_PUSH(work, nwork, capwork, (size_t)(t2 - lo));
                                 got++;
                             }
-                            if (!got) *undecided = 1;
+                            if (!got) { *undecided = 1; *why = base + off; }
                         } else {
-                            *undecided = 1;
+                            *undecided = 1; *why = base + off;
                         }
                     }
                 }
@@ -235,8 +236,18 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
         uint32_t prev_imm = 0;
         unsigned char *map = NULL;
         if (c && c->ranges_are_functions) {
-            map = maps[r] = reach_map(&dec, p, ranges[r].size, &undecided[r]);
-            if (undecided[r]) rep->funcs_undecided++;
+            const unsigned char *why = NULL;
+            map = maps[r] = reach_map(&dec, p, ranges[r].size, &undecided[r], &why);
+            if (undecided[r]) {
+                rep->funcs_undecided++;
+                if (verbose && why && ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, why, 16, &ins, ops))) {
+                    char w2[160];
+                    describe(c, p, where, sizeof where);
+                    describe(c, why, w2, sizeof w2);
+                    fprintf(stderr, "  [flow] function at %s: unresolved indirect jump at %s\n", where, w2);
+                    dump_ins(why, &ins, ops);
+                }
+            }
         }
         while (p < end) {
             uint64_t ip = (uint64_t)(uintptr_t)p;
