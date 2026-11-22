@@ -39,6 +39,10 @@ typedef struct afw_lib_s {
     int nxsec;
     afw_patch_report patch;
 
+    char sha256[65];            /* of the file as read, before mapping or patching */
+    afw_attest attest_buf[16];      /* attestations matched to this binary */
+    const unsigned char *load_prot;  /* per-page PF_ flags from the file, only while patching */
+    size_t load_npages;
     int tls_module;             /* 1-based static TLS module id, 0 = no PT_TLS */
 
     /* report */
@@ -58,6 +62,7 @@ extern int afw_load_patch_only;
  * (look-alikes in undecided functions, undecodable exception tables). This
  * flag overrides that, for diagnosis only. */
 extern int afw_load_allow_unproven;
+extern int afw_attest_dump;   /* print ATTEST-DETAIL evidence while loading */
 
 /* The load gate: 1 if patching left the library provably safe to run.
  * Blocks on: unproven look-alikes, undecodable exception tables, syscall

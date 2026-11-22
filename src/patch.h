@@ -68,6 +68,9 @@ typedef struct {
     int sys_untouched;         /* syscall bytes neither patched nor trapped: blocks loading */
     int sys_outside_functions; /* syscall in executable bytes with no .eh_frame entry */
     int fs_outside_functions;
+    int attest_applied;        /* attestations verified and used */
+    int attest_rejected;       /* attestations whose re-verification failed (not used) */
+    int via_attestation;       /* look-alikes reached ONLY through attested table entries */
     int fs_reg_trampolined;    /* fs:[reg] rewritten through a jmp trampoline (Windows) */
     int fs_reg_feasible;       /* fs:[reg] a trampoline can handle (counted on every platform) */
     int fs_unsupported;        /* reachable fs: access other than a read of fs:[0] / fs:[0x28]: blocks loading */
@@ -89,6 +92,13 @@ typedef struct { unsigned char *addr; size_t size; } afw_code_range;
 
 typedef int (*afw_bounds_fn)(const void *ctx, uint64_t addr, uint64_t *start, uint64_t *end);
 
+/* A human attestation, pinned to one exact binary (sha256 of the file, see
+ * src/attest.c): entries [0, k) of the jump table at table_rva, used by the
+ * indirect jump at jmp_rva, are code addresses. Verified again at every
+ * load; used only as extra entry points for the control-flow analysis.
+ * It does NOT claim the table has k entries. */
+typedef struct { uint64_t jmp_rva, table_rva; int k; const char *note; } afw_attest;
+
 typedef struct {
     afw_bounds_fn bounds;   /* function boundaries */
     const void *ctx;
@@ -97,9 +107,13 @@ typedef struct {
     int ranges_are_functions; /* ranges come from .eh_frame: follow control flow */
     /* memory the analysis may read (switch tables) */
     int (*readable)(const void *ctx, uint64_t addr, uint64_t len);
+    /* mapped read-only in the file (PF_R without PF_W): attested tables must be */
+    int (*readonly)(const void *ctx, uint64_t addr, uint64_t len);
+    int attest_dump;        /* print the evidence behind every attestation (ATTEST-DETAIL lines) */
     /* extra entry points of a function (C++ landing pads) */
     int (*entries)(const void *ctx, uint64_t func, uint64_t *out, int max);
     const afw_code_range *segs; int nsegs; /* executable segments, for the audit */
+    const afw_attest *attest; int nattest;  /* attestations for THIS binary (hash matched) */
 } afw_patch_ctx;
 
 /* Returns 0 on success, 1 if some sites were refused, -1 on a fatal error
