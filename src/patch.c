@@ -506,6 +506,50 @@ static void attest_dump(ZydisDecoder *dec, const afw_patch_ctx *c, unsigned char
         fprintf(stderr, "ATTEST-DETAIL   %c %s 0x%llx: %s\n", map && map[hist[h] - fstart] == 1 ? 'R' : '-',
                 hist[h] == J ? ">>" : "  ", (long long)((intptr_t)hist[h] - bias), text);
     }
+    {   /* where the index comes from: every branch in the function into the dispatch block */
+        unsigned char *blk = NULL, *q2;
+        char nmf[160];
+        describe(c, fstart, nmf, sizeof nmf);
+        fprintf(stderr, "ATTEST-DETAIL function: %s\n", nmf);
+        for (h = nh - 1; h > 0; h--) {           /* the dispatch block starts after the last branch before J */
+            if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, hist[h - 1], 16, &ins, ops))) break;
+            if (is_branch(&ins)) { blk = hist[h]; break; }
+        }
+        if (!blk && nh) blk = hist[0];
+        fprintf(stderr, "ATTEST-DETAIL dispatch block starts at 0x%llx; branches into it from this function:\n",
+                (long long)((intptr_t)blk - bias));
+        for (q2 = fstart; blk && q2 < fend;) {
+            int ok = ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, q2, (ZyanUSize)(fend - q2), &ins, ops));
+            if (ok && is_branch(&ins) && ins.operand_count_visible >= 1 &&
+                ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                ZyanU64 t;
+                if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&ins, &ops[0], (ZyanU64)(uintptr_t)q2, &t)) &&
+                    (unsigned char *)(uintptr_t)t == blk) {
+                    /* the 8 instructions before that branch, linearly */
+                    unsigned char *w[9], *r2;
+                    int nw2 = 0, x;
+                    for (r2 = fstart; r2 <= q2;) {
+                        ZydisDecodedInstruction i2;
+                        ZydisDecodedOperand o2[ZYDIS_MAX_OPERAND_COUNT];
+                        int ok2 = ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, r2, (ZyanUSize)(fend - r2), &i2, o2));
+                        if (ok2) { if (nw2 == 9) { memmove(w, w + 1, 8 * sizeof *w); nw2 = 8; } w[nw2++] = r2; }
+                        r2 += ok2 ? i2.length : 1;
+                    }
+                    fprintf(stderr, "ATTEST-DETAIL   -- from 0x%llx:\n", (long long)((intptr_t)q2 - bias));
+                    for (x = 0; x < nw2; x++) {
+                        ZydisDecodedInstruction i3;
+                        ZydisDecodedOperand o3[ZYDIS_MAX_OPERAND_COUNT];
+                        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, w[x], 16, &i3, o3))) continue;
+                        ZydisFormatterFormatInstruction(&f, &i3, o3, i3.operand_count_visible, text, sizeof text,
+                                                        (ZyanU64)((intptr_t)w[x] - bias), ZYAN_NULL);
+                        fprintf(stderr, "ATTEST-DETAIL     %c 0x%llx: %s\n", map && map[w[x] - fstart] == 1 ? 'R' : '-',
+                                (long long)((intptr_t)w[x] - bias), text);
+                    }
+                }
+            }
+            q2 += ok ? ins.length : 1;
+        }
+    }
     fprintf(stderr, "ATTEST-DETAIL table entries [0, k+2) (int32 relative to the table):\n");
     for (e = 0; e < a->k + 2; e++) {
         int32_t v;
