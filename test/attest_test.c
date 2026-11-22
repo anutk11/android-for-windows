@@ -10,6 +10,8 @@
  *   VARIANT 5 bypass     a second path jumps straight to the jmp, around the chain: REJECTED
  *   VARIANT 6 second     another unresolved jmp reg in the same function could land in the chain: REJECTED
  *   VARIANT 7 behind     an unresolved jmp reg reachable only through the attested entries: REJECTED
+ *   VARIANT 8 again      a second dispatch through the SAME table behind the entries
+ *                        (clang duplicates switch dispatches, measured in libc++): APPLIED
  */
 #ifndef VARIANT
 #define VARIANT 1
@@ -61,6 +63,15 @@ __attribute__((naked)) int afw_at_dispatch(int i) {
         "c1:\n\t"
 #if VARIANT == 7
         "jmp *%rsi\n\t"                          /* unresolved, behind the attested entries */
+#elif VARIANT == 8
+        "test %esi, %esi\n\t"                    /* second dispatch through the same table */
+        "jz 3f\n\t"
+        "mov %esi, %edx\n\t"
+        "lea afw_at_tbl(%rip), %rcx\n\t"
+        "movslq (%rcx,%rdx,4), %rax\n\t"
+        "add %rcx, %rax\n\t"
+        "jmp *%rax\n"
+        "3:\n\t"
 #endif
         "mov $1, %eax\n\t"
         "ret\n"

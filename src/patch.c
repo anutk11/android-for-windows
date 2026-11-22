@@ -427,97 +427,102 @@ static void note_unresolved(const unsigned char *p) {
  * memory the file maps read-only; each of entries [0, k) lands inside the
  * function on the start of a validly decoded instruction that is not int3
  * padding. Fills out[] with the k targets and returns k, or -1 + reason. */
+/* One jump J dispatches through table T, and nothing else decides it:
+ * J is a reached "jmp reg" in this function, the straight-line chain
+ * lea T -> movsxd [base + idx*4] -> add -> jmp proves the register, and no
+ * branch target lands in (lea, J] - none recorded by the analysis, no direct
+ * branch or call anywhere in the library's code (linear sweep of every
+ * executable segment), no entry [0, k) of T. (reviewer 2, PR #7) */
+static int jump_uses_table(ZydisDecoder *dec, const afw_patch_ctx *c, unsigned char *fstart, size_t fsize,
+                           const unsigned char *map, unsigned char *J, uint64_t T, int k,
+                           const uint64_t *tt, size_t ntt, const char **why) {
+    ZydisDecodedInstruction ins;
+    ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+    unsigned char *fend = fstart + fsize, *q, *win[16], *lea_at = NULL;
+    int nw = 0, at_j = 0, ok_chain, e;
+    uint64_t lo, hi;
+    size_t ti;
+    if (J < fstart || J >= fend) { *why = "jump not inside this function"; return 0; }
+    if (!map || map[J - fstart] != 1) { *why = "jump not reached by the analysis"; return 0; }
+    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, J, (ZyanUSize)(fend - J), &ins, ops)) ||
+        ins.mnemonic != ZYDIS_MNEMONIC_JMP || ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) {
+        *why = "no indirect jmp reg at the jump"; return 0;
+    }
+    for (q = fstart; q <= J && q < fend;) {
+        int ok = ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, q, (ZyanUSize)(fend - q), &ins, ops));
+        if (!ok) nw = 0;                         /* the window must decode cleanly up to J */
+        else { if (nw == 16) { memmove(win, win + 1, 15 * sizeof *win); nw = 15; } win[nw++] = q; }
+        if (q == J) at_j = ok;
+        q += ok ? ins.length : 1;
+    }
+    if (!at_j) { *why = "the linear decoding of the function does not land on the jump"; return 0; }
+    ok_chain = attest_chain(dec, win, nw, map, fstart, T, &lea_at, why);
+    if (!ok_chain) return 0;
+    lo = (uint64_t)(uintptr_t)lea_at; hi = (uint64_t)(uintptr_t)J;
+    for (ti = 0; ti < ntt; ti++)
+        if (tt[ti] > lo && tt[ti] <= hi) goto inside;
+    {
+        int g, nsweep = c->nsegs;
+        for (g = 0; g < (nsweep ? nsweep : 1); g++) {
+            unsigned char *s0 = nsweep ? c->segs[g].addr : fstart;
+            unsigned char *s1 = nsweep ? s0 + c->segs[g].size : fend;
+            for (q = s0; q < s1;) {
+                int ok = ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, q, (ZyanUSize)(s1 - q), &ins, ops));
+                if (ok && is_branch(&ins) && ins.operand_count_visible >= 1 &&
+                    ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                    ZyanU64 t;
+                    if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&ins, &ops[0], (ZyanU64)(uintptr_t)q, &t)) &&
+                        (uint64_t)t > lo && (uint64_t)t <= hi)
+                        goto inside;
+                }
+                q += ok ? ins.length : 1;
+            }
+        }
+    }
+    for (e = 0; e < k; e++) {
+        int32_t v;
+        uint64_t tgt;
+        if (!c->readable || !c->readable(c->ctx, T + 4u * (unsigned)e, 4)) break;
+        memcpy(&v, (const void *)(uintptr_t)(T + 4u * (unsigned)e), 4);
+        tgt = T + (uint64_t)(int64_t)v;
+        if (tgt > lo && tgt <= hi) goto inside;
+    }
+    return 1;
+inside:
+    *why = "a branch lands inside the dispatch chain (lea .. jmp): the chain does not decide every way to the jump";
+    return 0;
+}
+
+/* Re-verify one attestation against the bytes in memory (reviewers 2 and 3,
+ * #2 and PR #7): J dispatches through T (jump_uses_table), J is the only
+ * unresolved indirect jump the analysis reached, the table lies in memory
+ * the file maps read-only, and each of entries [0, k) lands inside the
+ * function on the start of a validly decoded instruction that is not int3
+ * padding. Fills out[] with the k targets and returns k, or -1 + reason. */
 static int attest_verify(ZydisDecoder *dec, const afw_patch_ctx *c, unsigned char *fstart, size_t fsize,
                          const unsigned char *map, const afw_attest *a, uint64_t *out, int max,
-                         const uint64_t *tt, size_t ntt, int und_count, const unsigned char *und_why,
-                         const char **why) {
+                         const uint64_t *tt, size_t ntt, const char **why) {
     ZydisDecodedInstruction ins;
     ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
     unsigned char *fend = fstart + fsize, *J = (unsigned char *)(c->bias + (intptr_t)a->jmp_rva), *q;
     uint64_t T = (uint64_t)(c->bias + (intptr_t)a->table_rva);
     unsigned char *starts;
-    int lea_ok = 0, e;
+    int e;
     if (a->k <= 0 || a->k > max) { *why = "entry count out of range"; return -1; }
-    if (J < fstart || J >= fend) { *why = "jump not inside this function"; return -1; }
-    if (!map || map[J - fstart] != 1) { *why = "jump not reached by the analysis"; return -1; }
-    /* J must be the ONLY unresolved indirect jump the analysis reached in this
-     * function: another one could land anywhere, inside the chain included
-     * (reviewer 2, PR #7) */
-    (void)und_count; (void)und_why;
     if (g_nunres != 1 || g_unres[0] != J) {     /* distinct unresolved jumps of the last analysis */
         *why = "the function has another unresolved indirect jump besides the attested one"; return -1;
-    }
-    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, J, (ZyanUSize)(fend - J), &ins, ops)) ||
-        ins.mnemonic != ZYDIS_MNEMONIC_JMP || ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) {
-        *why = "no indirect jmp reg at the attested address"; return -1;
     }
     if (!c->readonly || !c->readonly(c->ctx, T, 4u * (unsigned)a->k)) {
         *why = "table not in memory the file maps read-only"; return -1;
     }
+    if (!jump_uses_table(dec, c, fstart, fsize, map, J, T, a->k, tt, ntt, why)) return -1;
     starts = (unsigned char *)calloc(fsize, 1);
     if (!starts) { *why = "out of memory"; return -1; }
-    {
-        unsigned char *win[16];
-        int nw = 0, at_j = 0;
-        for (q = fstart; q < fend;) {
-            int ok = ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, q, (ZyanUSize)(fend - q), &ins, ops));
-            if (ok) starts[q - fstart] = 1;              /* undecodable bytes are never a boundary */
-            if (q <= J) {
-                if (!ok) nw = 0;                         /* the window must decode cleanly up to J */
-                else { if (nw == 16) { memmove(win, win + 1, 15 * sizeof *win); nw = 15; } win[nw++] = q; }
-                if (q == J) at_j = ok;
-            }
-            q += ok ? ins.length : 1;
-        }
-        {
-            unsigned char *lea_at = NULL;
-            lea_ok = at_j && attest_chain(dec, win, nw, map, fstart, T, &lea_at, why);
-            if (!at_j) *why = "the linear decoding of the function does not land on the jump";
-            /* every way to the jump goes through the chain (reviewer 2, PR #7): no
-             * branch target in (lea, J] - neither a direct branch of this function,
-             * nor any target the analysis has recorded, nor an entry of the table */
-            if (lea_ok) {
-                uint64_t lo = (uint64_t)(uintptr_t)lea_at, hi = (uint64_t)(uintptr_t)J;
-                size_t ti;
-                int e2;
-                for (ti = 0; ti < ntt && lea_ok; ti++)
-                    if (tt[ti] > lo && tt[ti] <= hi) lea_ok = 0;
-                /* direct branches and calls anywhere in the library's executable
-                 * code, not only this function and not only those the analysis has
-                 * seen so far (reviewer 2): a linear sweep of every executable
-                 * segment. Data decoded as code can only add false targets, which
-                 * only rejects more. */
-                {
-                    int g, nsweep = c->nsegs;
-                    for (g = 0; g < (nsweep ? nsweep : 1) && lea_ok; g++) {
-                        unsigned char *s0 = nsweep ? c->segs[g].addr : fstart;
-                        unsigned char *s1 = nsweep ? s0 + c->segs[g].size : fend;
-                        for (q = s0; q < s1 && lea_ok;) {
-                            int ok = ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, q, (ZyanUSize)(s1 - q), &ins, ops));
-                            if (ok && is_branch(&ins) && ins.operand_count_visible >= 1 &&
-                                ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-                                ZyanU64 t;
-                                if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&ins, &ops[0], (ZyanU64)(uintptr_t)q, &t)) &&
-                                    (uint64_t)t > lo && (uint64_t)t <= hi)
-                                    lea_ok = 0;
-                            }
-                            q += ok ? ins.length : 1;
-                        }
-                    }
-                }
-                for (e2 = 0; e2 < a->k && lea_ok; e2++) {
-                    int32_t v;
-                    uint64_t tgt;
-                    if (!c->readable || !c->readable(c->ctx, T + 4u * (unsigned)e2, 4)) break;
-                    memcpy(&v, (const void *)(uintptr_t)(T + 4u * (unsigned)e2), 4);
-                    tgt = T + (uint64_t)(int64_t)v;
-                    if (tgt > lo && tgt <= hi) lea_ok = 0;
-                }
-                if (!lea_ok) *why = "a branch lands inside the dispatch chain (lea .. jmp): the chain does not decide every way to the jump";
-            }
-        }
+    for (q = fstart; q < fend;) {
+        int ok = ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, q, (ZyanUSize)(fend - q), &ins, ops));
+        if (ok) starts[q - fstart] = 1;              /* undecodable bytes are never a boundary */
+        q += ok ? ins.length : 1;
     }
-    if (!lea_ok) { free(starts); return -1; }
     for (e = 0; e < a->k; e++) {
         int32_t v;
         uint64_t tgt;
@@ -535,6 +540,26 @@ static int attest_verify(ZydisDecoder *dec, const afw_patch_ctx *c, unsigned cha
     }
     free(starts);
     return a->k;
+}
+
+/* After re-running the analysis with the attested entries: every unresolved
+ * jump it reached must dispatch through the SAME attested table (clang may
+ * duplicate a switch dispatch, e.g. in a loop: measured in libc++ 0xd4873),
+ * each one proven by jump_uses_table. Anything else rejects. */
+static int all_jumps_use_table(ZydisDecoder *dec, const afw_patch_ctx *c, unsigned char *fstart, size_t fsize,
+                               const unsigned char *map, const afw_attest *a, const uint64_t *tt, size_t ntt) {
+    uint64_t T = (uint64_t)(c->bias + (intptr_t)a->table_rva);
+    unsigned char *list[16];
+    int n = g_nunres, u;
+    const char *why = "";
+    if (n > 16) return 0;
+    for (u = 0; u < n; u++) list[u] = (unsigned char *)g_unres[u];
+    for (u = 0; u < n; u++)
+        if (!jump_uses_table(dec, c, fstart, fsize, map, list[u], T, a->k, tt, ntt, &why)) {
+            fprintf(stderr, "           +0x%llx: %s\n", (long long)((intptr_t)list[u] - c->bias), why);
+            return 0;
+        }
+    return 1;
 }
 
 /* The evidence behind one attestation, for the people who sign it: the
@@ -1024,7 +1049,7 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                     if (a < 64) attest_used[a] = 1;
                     if (c->attest_dump) attest_dump(&dec, c, p, ranges[r].size, map, &c->attest[a]);
                     k = attest_verify(&dec, c, p, ranges[r].size, map, &c->attest[a], pads + npads, 1024 - npads,
-                                      targets, ntargets, undecided[r], why, &awhy);
+                                      targets, ntargets, &awhy);
                     describe(c, J, where, sizeof where);
                     if (k < 0) {
                         rep->attest_rejected++;
@@ -1046,15 +1071,17 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                     for (q2 = npads - added; q2 < npads; q2++)   /* the jump lands there: branch targets */
                         VEC_PUSH(targets, ntargets, captargets, pads[q2]);
                     if (!m2) { fprintf(stderr, "  [attest] FATAL: out of memory re-running the analysis\n"); fatal = 1; }
-                    else if (g_nunres != 1 ||
-                             (uint64_t)(uintptr_t)g_unres[0] != (uint64_t)(c->bias + (intptr_t)c->attest[last_a].jmp_rva)) {
-                        /* code reached through the attested entries has ANOTHER unresolved
-                         * indirect jump: it could land in the chain - the attestation fails */
+                    else if (!all_jumps_use_table(&dec, c, p, ranges[r].size, m2, &c->attest[last_a],
+                                                  targets, ntargets)) {
+                        /* code reached through the attested entries has an unresolved
+                         * jump that is NOT a proven dispatch through the same table: it
+                         * could land in the chain - the attestation fails */
                         free(m2);
                         rep->attest_applied--; rep->attest_rejected++;
                         describe(c, p, where, sizeof where);
                         fprintf(stderr, "  [attest] REJECTED in the function at %s: code reached through the attested "
-                                        "entries has another unresolved indirect jump - not used\n", where);
+                                        "entries has another unresolved indirect jump that is not a dispatch through "
+                                        "the same table - not used\n", where);
                         {
                             int u;
                             ZydisFormatter fm;
