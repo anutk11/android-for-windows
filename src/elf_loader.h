@@ -61,6 +61,8 @@ extern int afw_load_patch_only;
  * (look-alikes in undecided functions, undecodable exception tables). This
  * flag overrides that, for diagnosis only. */
 extern int afw_load_allow_unproven;
+/* How many libraries are registered (tests: a failed load must not count). */
+int afw_loaded_count(void);
 
 /* The load gate: 1 if patching left the library provably safe to run.
  * Blocks on: unproven look-alikes, undecodable exception tables, syscall

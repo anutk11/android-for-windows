@@ -121,7 +121,9 @@ static size_t count_symbols(const uint32_t *hash, const uint32_t *gnu) {
 static int defer_ifunc(afw_lib *lib, uint64_t *where, uint64_t resolver) {
     if (lib->nirel == lib->capirel) {
         size_t nc = lib->capirel ? lib->capirel * 2 : 64;
-        void *nb = realloc(lib->irel, nc * sizeof *lib->irel);
+        void *nb;
+        if (nc < lib->capirel || nc > SIZE_MAX / sizeof *lib->irel) { fprintf(stderr, "error: too many IFUNCs\n"); return -1; }
+        nb = realloc(lib->irel, nc * sizeof *lib->irel);
         if (!nb) { fprintf(stderr, "error: out of memory\n"); return -1; }
         lib->irel = nb; lib->capirel = nc;
     }
@@ -564,7 +566,10 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
                     lib->patch.fs_reg_feasible - lib->patch.fs_reg_trampolined);
             free(pageprot); return -1;
         }
-        afw_mem_protect(lib->stub_area, AFW_STUB_RESERVE, AFW_PROT_R | AFW_PROT_X);
+        if (afw_mem_protect(lib->stub_area, AFW_STUB_RESERVE, AFW_PROT_R | AFW_PROT_X) != 0) {
+            fprintf(stderr, "error: cannot make the stub area executable\n");
+            free(pageprot); return -1;
+        }
         afw_flush_icache(lib->stub_area, AFW_STUB_RESERVE);
         if (verbose)
             printf("Patched:    syscalls %d + %d moved (%d stubs), refused %d; fs: %d; fs:[reg] %d real, %d data\n",
@@ -630,6 +635,8 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
 
 /* A failed load leaves nothing behind (reviewer 4, #8): no entry in the
  * library list (main's lib is on its stack), no mapping, no TLS module. */
+int afw_loaded_count(void) { return g_nlibs; }
+
 int afw_load(const char *path, afw_lib *lib, int verbose) {
     int k, rc = load_inner(path, lib, verbose);
     if (rc == 0) return 0;
@@ -652,6 +659,7 @@ void *afw_sym(const afw_lib *lib, const char *name) {
             strcmp(lib->strtab + s->st_name, name) == 0) {
             if (ELF64_ST_TYPE(s->st_info) == STT_GNU_IFUNC) {   /* the value is the resolver */
                 typedef SYSV void *(*resolver_fn)(void);
+                if (afw_load_patch_only) return NULL;            /* measuring: never run library code */
                 return ((resolver_fn)(uintptr_t)(lib->bias + s->st_value))();
             }
             return (void *)(lib->bias + s->st_value);

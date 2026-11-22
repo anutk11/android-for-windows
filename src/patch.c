@@ -422,7 +422,9 @@ static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t s
                         reg_clear(f, reg64(ops[w].reg.value));
                 /* every write of a 32-bit general register zero-extends it */
                 for (w = 0; w < ins.operand_count; w++)
-                    if (ops[w].type == ZYDIS_OPERAND_TYPE_REGISTER && (ops[w].actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) &&
+                    if (ops[w].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                        (ops[w].actions & ZYDIS_OPERAND_ACTION_WRITE) &&            /* unconditional only */
+                        !(ops[w].actions & ZYDIS_OPERAND_ACTION_CONDWRITE) &&
                         ops[w].size == 32 && ZydisRegisterGetClass(ops[w].reg.value) == ZYDIS_REGCLASS_GPR32)
                         f->zext[reg64(ops[w].reg.value)] = 1;
                 if (recognised && dst != ZYDIS_REGISTER_NONE) {

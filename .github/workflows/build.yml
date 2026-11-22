@@ -161,13 +161,16 @@ jobs:
           out/afw-asan out/libredzone_test.so
           out/afw-asan out/libtls_test.so
           out/afw-asan out/libifunc_test.so
+          # a refused library (PT_TLS + fs:[reg], refused on Linux) leaves nothing behind
+          out/afw-asan out/libtls_test.so --preload-fail=out/libtls_ie_test.so | tee out/preload.txt
+          grep -q "refused, and nothing left behind" out/preload.txt
           # a 32-bit compare / 8-bit copy does not bound a 64-bit index: both tables UNPROVEN, refused
           out/afw-asan out/libflow_test.so --patch-report > out/flow.txt 2>&1 || true
           grep -E "UNPROVEN:|^GATE" out/flow.txt
           test "$(grep -c "\[audit\] UNPROVEN: syscall" out/flow.txt)" -eq 2
           grep -q "would REFUSE" out/flow.txt
           if out/afw-asan out/libfs_gate_test.so > out/fsgate.txt 2>&1; then cat out/fsgate.txt; echo "fs: gate did not refuse"; exit 1; fi
-          grep -q "5 unsupported fs: accesses" out/fsgate.txt
+          grep -q "6 unsupported fs: accesses" out/fsgate.txt
           # fs:[reg] is rewritten on Windows only: on Linux the gate must refuse it
           if out/afw-asan out/libtls_ie_test.so > out/ie.txt 2>&1; then cat out/ie.txt; echo "fs:[reg] ran unrewritten"; exit 1; fi
           grep -q "8 fs:\[reg\] accesses not rewritten" out/ie.txt
@@ -226,7 +229,7 @@ jobs:
         run: |
           out\afw-loader.exe out\libfs_gate_test.so > out\fsgate.txt 2>&1
           if %errorlevel% equ 0 (type out\fsgate.txt & echo fs: gate did not refuse & exit /b 1)
-          findstr /c:"5 unsupported fs: accesses" out\fsgate.txt
+          findstr /c:"6 unsupported fs: accesses" out\fsgate.txt
       - name: "Negative test: red zone sites must be refused"
         shell: cmd
         run: out\afw-loader.exe out\libredzone_test.so
