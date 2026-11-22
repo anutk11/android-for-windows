@@ -39,7 +39,10 @@ typedef struct afw_lib_s {
     int nxsec;
     afw_patch_report patch;
 
-    int tls_module;             /* 1-based static TLS module id, 0 = no PT_TLS */
+    int tls_module;
+    /* IRELATIVE relocations, run only after the code is patched and executable */
+    struct { uint64_t *where; uint64_t resolver; } *irel;
+    size_t nirel, capirel;             /* 1-based static TLS module id, 0 = no PT_TLS */
 
     /* report */
     int nrelocs;
@@ -58,6 +61,8 @@ extern int afw_load_patch_only;
  * (look-alikes in undecided functions, undecodable exception tables). This
  * flag overrides that, for diagnosis only. */
 extern int afw_load_allow_unproven;
+/* How many libraries are registered (tests: a failed load must not count). */
+int afw_loaded_count(void);
 
 /* The load gate: 1 if patching left the library provably safe to run.
  * Blocks on: unproven look-alikes, undecodable exception tables, syscall

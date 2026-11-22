@@ -115,8 +115,8 @@ static int run_syscall_tests(const afw_lib *lib) {
     printf("\n=== G1 tests: Linux syscalls rewritten at load time ===\n");
     check("test functions found", gp && wr && unk && xmm);
     if (g_failed) return 1;
-    check("every safe 'mov eax; syscall' site was patched (5, one behind a switch table)",
-          lib->patch.sys_patched == 5);
+    check("every safe 'mov eax; syscall' site was patched (6, one behind a switch table)",
+          lib->patch.sys_patched == 6);
     /* "jmp reg" without a switch table is usually a tail call through a
      * function pointer (afw_apply, crtbegin): undecided, but harmless as long
      * as no syscall/fs: look-alike sits in the bytes nothing reaches. */
@@ -146,6 +146,11 @@ static int run_syscall_tests(const afw_lib *lib) {
     check("unimplemented syscall returns -ENOSYS", r == -38);
 
     check("xmm registers survive a syscall", xmm(3.25) == 3.25);
+    {
+        typedef int (SYSV *flags_fn)(void);
+        flags_fn fl = (flags_fn)afw_sym(lib, "afw_sys_keeps_flags");
+        if (fl) check("RFLAGS (CF, ZF) survive a syscall, as with sysret", fl() == 3);
+    }
 
     {
         typedef long (SYSV *gen_fn)(long, long, long, long, long, long, long);
@@ -439,6 +444,7 @@ static int run_redzone_tests(const afw_lib *lib) {
 int main(int argc, char **argv) {
     afw_lib lib;
     int verbose = 1, rc = 0, strict = 0, min_pads = 0, call_trap = 0;
+    const char *preload_fail = NULL;
 
     setvbuf(stdout, NULL, _IONBF, 0); /* never lose output on a crash */
     afw_crash_init();
@@ -458,10 +464,24 @@ int main(int argc, char **argv) {
             else if (strcmp(argv[a], "--allow-unproven") == 0) afw_load_allow_unproven = 1;
             else if (strcmp(argv[a], "--call-trap") == 0) call_trap = 1;
             else if (strncmp(argv[a], "--min-landing-pads=", 19) == 0) min_pads = atoi(argv[a] + 19);
+            else if (strncmp(argv[a], "--preload-fail=", 15) == 0) preload_fail = argv[a] + 15;
         }
     }
     if (afw_check_security() != 0) return 1;
     if (afw_tls_init() != 0) return 1;
+
+    /* test: a library that must FAIL to load leaves nothing behind - not in
+     * the library list, and its TLS module does not block the next library */
+    if (preload_fail) {
+        static afw_lib failed;
+        int before = afw_loaded_count();
+        printf("Loading %s, which must be refused...\n", preload_fail);
+        if (afw_load(preload_fail, &failed, 0) == 0) { printf("FAIL: it loaded\n"); return 1; }
+        if (afw_loaded_count() != before || failed.base != NULL || failed.tls_module != 0) {
+            printf("FAIL: the failed load left state behind\n"); return 1;
+        }
+        printf("  [ OK ] refused, and nothing left behind (libraries registered: %d)\n", afw_loaded_count());
+    }
 
     if (afw_load(argv[1], &lib, verbose) != 0) {
         printf("\nLoad failed.\n");
@@ -526,6 +546,15 @@ int main(int argc, char **argv) {
     if (afw_sym(&lib, "afw_rz_safe")) rc |= run_redzone_tests(&lib);
     if (afw_sym(&lib, "afw_tls_worker")) rc |= run_tls_tests(&lib);
     if (afw_sym(&lib, "afw_ie_read_b")) rc |= run_ie_tests(&lib);
+    if (afw_sym(&lib, "afw_ifunc_call")) {
+        typedef int (SYSV *ifn)(void);
+        printf("\nIFUNC test (resolver runs after patching, reads the stack guard):\n");
+        check("IFUNC symbol (JUMP_SLOT) returns the resolved function's value", ((ifn)afw_sym(&lib, "afw_ifunc_call"))() == 42);
+        check("hidden IFUNC (IRELATIVE) returns the resolved function's value",
+              ((ifn)afw_sym(&lib, "afw_ifunc_call_hidden"))() == 42);
+        printf("%s\n", g_failed ? "IFUNC TEST FAILED" : "IFUNC TEST PASSED");
+        rc |= g_failed;
+    }
     if (call_trap) {
         typedef long (SYSV *f1)(int);
         f1 f = (f1)afw_sym(&lib, "afw_sys_branch_into_site");

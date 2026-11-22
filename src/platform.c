@@ -35,6 +35,11 @@ void *afw_mem_alloc(size_t size) {
     return VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 }
 
+void afw_mem_free(void *addr, size_t size) {
+    (void)size;
+    if (addr) VirtualFree(addr, 0, MEM_RELEASE);
+}
+
 int afw_mem_protect(void *addr, size_t size, int prot) {
     DWORD p, old;
     int x = prot & AFW_PROT_X, w = prot & AFW_PROT_W, r = prot & AFW_PROT_R;
@@ -59,6 +64,10 @@ void *afw_mem_alloc(size_t size) {
     void *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     return p == MAP_FAILED ? NULL : p;
+}
+
+void afw_mem_free(void *addr, size_t size) {
+    if (addr) munmap(addr, size);
 }
 
 int afw_mem_protect(void *addr, size_t size, int prot) {

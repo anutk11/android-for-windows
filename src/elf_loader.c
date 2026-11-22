@@ -32,6 +32,7 @@ int afw_gate_ok(const afw_lib *lib) {
     const afw_patch_report *r = &lib->patch;
     return !r->unproven && !r->lsda_failures && !r->sys_untouched && !r->sys_outside_functions &&
            !r->fs_unsupported &&
+           !r->fs_outside_functions &&   /* fs: look-alikes outside .eh_frame (reviewer 4); measured 0 in bionic */
            /* every fs:[reg] must really be rewritten (Windows); measurement mode
             * reports what Windows would do */
            (afw_load_patch_only || r->fs_reg_trampolined == r->fs_reg_feasible);
@@ -116,6 +117,26 @@ static size_t count_symbols(const uint32_t *hash, const uint32_t *gnu) {
     return 0;
 }
 
+/* Record a resolver to run once the code is patched and executable (6c). */
+static int defer_ifunc(afw_lib *lib, uint64_t *where, uint64_t resolver) {
+    if (lib->nirel == lib->capirel) {
+        size_t nc = lib->capirel ? lib->capirel * 2 : 64;
+        void *nb;
+        if (nc < lib->capirel || nc > SIZE_MAX / sizeof *lib->irel) { fprintf(stderr, "error: too many IFUNCs\n"); return -1; }
+        nb = realloc(lib->irel, nc * sizeof *lib->irel);
+        if (!nb) { fprintf(stderr, "error: out of memory\n"); return -1; }
+        lib->irel = nb; lib->capirel = nc;
+    }
+    lib->irel[lib->nirel].where = where;
+    lib->irel[lib->nirel].resolver = resolver;
+    lib->nirel++;
+    return 0;
+}
+
+#ifndef STT_GNU_IFUNC
+#define STT_GNU_IFUNC 10
+#endif
+
 /* Apply one array of RELA relocations. */
 static int apply_rela(afw_lib *lib, const Elf64_Rela *rel, size_t count,
                       const uint64_t *symaddr) {
@@ -126,6 +147,17 @@ static int apply_rela(afw_lib *lib, const Elf64_Rela *rel, size_t count,
         uint64_t *where = (uint64_t *)(lib->bias + rel[i].r_offset);
         uint64_t S = sym ? symaddr[sym] : 0;
         int64_t A = rel[i].r_addend;
+
+        /* a symbol of this library that is an IFUNC: its value is the RESOLVER;
+         * the address comes from running it, later (step 6c) */
+        if (sym && lib->symtab[sym].st_shndx != SHN_UNDEF &&
+            ELF64_ST_TYPE(lib->symtab[sym].st_info) == STT_GNU_IFUNC &&
+            (type == R_X86_64_64 || type == R_X86_64_GLOB_DAT || type == R_X86_64_JUMP_SLOT)) {
+            if (afw_load_patch_only) continue;
+            if (A != 0) { fprintf(stderr, "error: IFUNC relocation with an addend\n"); return -1; }
+            if (defer_ifunc(lib, where, S) != 0) return -1;
+            continue;
+        }
 
         switch (type) {
         case R_X86_64_NONE: break;
@@ -164,10 +196,11 @@ static int apply_rela(afw_lib *lib, const Elf64_Rela *rel, size_t count,
             fprintf(stderr, "error: TLSDESC relocation (TLS descriptors) not supported yet\n");
             return -1;
         case R_X86_64_IRELATIVE: {
-            typedef SYSV uint64_t (*resolver_fn)(void);
+            /* The resolver is library code: it may run only once the code is
+             * patched and executable and TLS is set up (reviewer 4, #8). Record
+             * it; afw_load runs it in step 6c, before RELRO is applied. */
             if (afw_load_patch_only) break;  /* never run library code when measuring */
-            resolver_fn r = (resolver_fn)(uintptr_t)(lib->bias + A);
-            *where = r();
+            if (defer_ifunc(lib, where, (uint64_t)(lib->bias + A)) != 0) return -1;
             break;
         }
         default:
@@ -215,7 +248,7 @@ static int patch_readable(const void *ctx, uint64_t addr, uint64_t len) {
     return afw_lib_readable((const afw_lib *)ctx, addr, len);
 }
 
-int afw_load(const char *path, afw_lib *lib, int verbose) {
+static int load_inner(const char *path, afw_lib *lib, int verbose) {
     size_t fsize = 0, i;
     unsigned char *file;
     Elf64_Ehdr *eh;
@@ -533,7 +566,10 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
                     lib->patch.fs_reg_feasible - lib->patch.fs_reg_trampolined);
             free(pageprot); return -1;
         }
-        afw_mem_protect(lib->stub_area, AFW_STUB_RESERVE, AFW_PROT_R | AFW_PROT_X);
+        if (afw_mem_protect(lib->stub_area, AFW_STUB_RESERVE, AFW_PROT_R | AFW_PROT_X) != 0) {
+            fprintf(stderr, "error: cannot make the stub area executable\n");
+            free(pageprot); return -1;
+        }
         afw_flush_icache(lib->stub_area, AFW_STUB_RESERVE);
         if (verbose)
             printf("Patched:    syscalls %d + %d moved (%d stubs), refused %d; fs: %d; fs:[reg] %d real, %d data\n",
@@ -542,29 +578,51 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
                    lib->patch.fs_patched, lib->patch.fs_reg_in_func, lib->patch.fs_reg_outside);
     }
 
-    /* 6. Memory protection ------------------------------------------- */
-    if (relro_ph) {
-        size_t p;
-        size_t first = (size_t)((ALIGN_DOWN(relro_ph->p_vaddr, AFW_PAGE_SIZE) - lo) / AFW_PAGE_SIZE);
-        size_t last = (size_t)((ALIGN_DOWN(relro_ph->p_vaddr + relro_ph->p_memsz, AFW_PAGE_SIZE) - lo) / AFW_PAGE_SIZE);
-        for (p = first; p < last && p < npages; p++) pageprot[p] &= (unsigned char)~PF_W;
-    }
+    /* 6a. Memory protection: code becomes executable (already patched) - */
     for (i = 0; i < npages;) {
         size_t j = i;
         while (j < npages && pageprot[j] == pageprot[i]) j++;
-        afw_mem_protect(lib->base + i * AFW_PAGE_SIZE, (j - i) * AFW_PAGE_SIZE, pageprot[i]);
+        if (afw_mem_protect(lib->base + i * AFW_PAGE_SIZE, (j - i) * AFW_PAGE_SIZE, pageprot[i]) != 0) {
+            fprintf(stderr, "error: cannot set memory protection\n");
+            free(pageprot); return -1;
+        }
         i = j;
     }
-    free(pageprot);
     afw_flush_icache(lib->base, lib->size);
+
+    if (!afw_load_patch_only) {
+        /* 6b. Static TLS layout is final now: every thread block, including this
+         *     thread's, gets the relocated .tdata images. Before any library code. */
+        if (afw_tls_static_finish() != 0) { free(pageprot); return -1; }
+
+        /* 6c. IRELATIVE resolvers: the first library code to run, on patched,
+         *     executable code, writing into pages that are still writable */
+        for (i = 0; i < lib->nirel; i++) {
+            typedef SYSV uint64_t (*resolver_fn)(void);
+            resolver_fn r = (resolver_fn)(uintptr_t)lib->irel[i].resolver;
+            *lib->irel[i].where = r();
+        }
+        if (verbose && lib->nirel) printf("IFUNC:      %zu resolver(s) run after patching\n", lib->nirel);
+    }
+    free(lib->irel); lib->irel = NULL; lib->nirel = lib->capirel = 0;
+
+    /* 6d. RELRO: read-only from now on --------------------------------- */
+    if (relro_ph) {
+        size_t p, first = (size_t)((ALIGN_DOWN(relro_ph->p_vaddr, AFW_PAGE_SIZE) - lo) / AFW_PAGE_SIZE);
+        size_t last = (size_t)((ALIGN_DOWN(relro_ph->p_vaddr + relro_ph->p_memsz, AFW_PAGE_SIZE) - lo) / AFW_PAGE_SIZE);
+        for (p = first; p < last && p < npages; p++) {
+            pageprot[p] &= (unsigned char)~PF_W;
+            if (afw_mem_protect(lib->base + p * AFW_PAGE_SIZE, AFW_PAGE_SIZE, pageprot[p]) != 0) {
+                fprintf(stderr, "error: cannot apply RELRO\n");
+                free(pageprot); return -1;
+            }
+        }
+    }
+    free(pageprot);
 
     if (afw_load_patch_only) return 0;
 
-    /* 7. Static TLS layout is final now: every thread block, including this
-     *    thread's, gets the relocated .tdata images. Before any library code. */
-    if (afw_tls_static_finish() != 0) return -1;
-
-    /* 8. Constructors ------------------------------------------------ */
+    /* 7. Constructors ------------------------------------------------ */
     if (verbose) printf("Running %zu constructor(s)...\n",
                         lib->init_array_count + (lib->init ? 1 : 0));
     if (lib->init) ((init_fn)(uintptr_t)lib->init)();
@@ -575,13 +633,37 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
     return 0;
 }
 
+/* A failed load leaves nothing behind (reviewer 4, #8): no entry in the
+ * library list (main's lib is on its stack), no mapping, no TLS module. */
+int afw_loaded_count(void) { return g_nlibs; }
+
+int afw_load(const char *path, afw_lib *lib, int verbose) {
+    int k, rc = load_inner(path, lib, verbose);
+    if (rc == 0) return 0;
+    for (k = 0; k < g_nlibs; k++)
+        if (g_libs[k] == lib) { memmove(&g_libs[k], &g_libs[k + 1], (size_t)(g_nlibs - k - 1) * sizeof *g_libs); g_nlibs--; break; }
+    if (lib->tls_module && afw_tls_static_unregister(lib->tls_module) != 0)
+        fprintf(stderr, "warning: TLS module of the failed library stays registered\n");
+    lib->tls_module = 0;
+    free(lib->irel); lib->irel = NULL; lib->nirel = lib->capirel = 0;
+    if (lib->base) afw_mem_free(lib->base, lib->size + AFW_STUB_RESERVE);
+    lib->base = NULL; lib->stub_area = NULL;
+    return rc;
+}
+
 void *afw_sym(const afw_lib *lib, const char *name) {
     size_t i;
     for (i = 1; i < lib->nsyms; i++) {
         const Elf64_Sym *s = &lib->symtab[i];
         if (s->st_shndx != SHN_UNDEF && ELF64_ST_BIND(s->st_info) != STB_LOCAL &&
-            strcmp(lib->strtab + s->st_name, name) == 0)
+            strcmp(lib->strtab + s->st_name, name) == 0) {
+            if (ELF64_ST_TYPE(s->st_info) == STT_GNU_IFUNC) {   /* the value is the resolver */
+                typedef SYSV void *(*resolver_fn)(void);
+                if (afw_load_patch_only) return NULL;            /* measuring: never run library code */
+                return ((resolver_fn)(uintptr_t)(lib->bias + s->st_value))();
+            }
             return (void *)(lib->bias + s->st_value);
+        }
     }
     return NULL;
 }

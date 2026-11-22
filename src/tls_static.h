@@ -17,6 +17,10 @@
  * already fixed, bad alignment, too many modules. */
 int afw_tls_static_register(const void *image, const afw_tls_segment *seg, const char *name);
 
+/* Undo the last registration (a library that failed to load). Returns 0,
+ * or -1 if mod is not the last module or the layout is already fixed. */
+int afw_tls_static_unregister(int mod);
+
 /* Fix the layout. After this, register() refuses (dynamic TLS is G2).
  * Rebuilds the calling thread's block. Idempotent. Returns 0 or -1. */
 int afw_tls_static_finish(void);

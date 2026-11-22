@@ -36,6 +36,16 @@ int afw_tls_static_register(const void *image, const afw_tls_segment *seg, const
     return m + 1;
 }
 
+int afw_tls_static_unregister(int mod) {
+    if (g_finished || mod < 1 || mod != g_layout.nmod) return -1;
+    g_layout.nmod--;
+    g_layout.off[mod - 1] = 0;
+    g_image[mod - 1] = NULL;
+    memset(&g_seg[mod - 1], 0, sizeof g_seg[mod - 1]);
+    /* max_align may stay larger than needed: only wastes a little padding */
+    return 0;
+}
+
 uint64_t afw_tls_static_off(int mod) {
     return (mod >= 1 && mod <= g_layout.nmod) ? g_layout.off[mod - 1] : 0;
 }
@@ -74,10 +84,23 @@ void afw_tls_static_free(void *block) {
 }
 
 int afw_tls_static_finish(void) {
+    int m;
     if (g_finished) return 0;
     if (afw_tls_layout_finish(&g_layout) != 0) {
         fprintf(stderr, "error: static TLS layout overflow\n");
         return -1;
+    }
+    /* Own copies of the (relocated) .tdata images from now on: a library
+     * whose load fails later may release its mapping, and threads created
+     * later must not read from it (reviewer 4, PR #9). */
+    for (m = 0; m < g_layout.nmod; m++) {
+        void *copy = NULL;
+        if (g_seg[m].p_filesz) {
+            copy = malloc((size_t)g_seg[m].p_filesz);
+            if (!copy) { fprintf(stderr, "error: out of memory copying TLS images\n"); return -1; }
+            memcpy(copy, g_image[m], (size_t)g_seg[m].p_filesz);
+        }
+        g_image[m] = copy;
     }
     g_finished = 1;
     return afw_tls_thread_rebuild();
