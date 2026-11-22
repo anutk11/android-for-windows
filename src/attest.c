@@ -10,8 +10,12 @@
  * the entries only as extra entry points. Sites reached that way are
  * reported as ATTESTED, never as proven. A different binary gets nothing.
  *
- * Signers: listed per record. Adding or changing a record needs the
- * written approval of all three reviewers (docs/COLLABORATION.md, rule 6).
+ * Adding or changing a record needs the written approval of every reviewer
+ * (docs/COLLABORATION.md, rule 6), recorded in the pull request.
+ * Signatures for the four records below (PR #7):
+ *   reviewer 3 - signed all four (index origin checked in attest-scan.txt)
+ *   reviewer 2 - pending
+ *   reviewer 1 - pending
  */
 #include "attest.h"
 

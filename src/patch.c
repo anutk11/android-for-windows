@@ -344,7 +344,7 @@ static int writes_reg(const ZydisDecodedInstruction *ins, const ZydisDecodedOper
  *   rT  <- lea rT, [rip + T]
  * with rT not written between the lea and the add. Returns 1 if proven. */
 static int attest_chain(ZydisDecoder *dec, unsigned char *const *win, int n, const unsigned char *map,
-                        unsigned char *fstart, uint64_t T, const char **why) {
+                        unsigned char *fstart, uint64_t T, unsigned char **lea_at, const char **why) {
     ZydisDecodedInstruction ins;
     ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
     ZydisRegister rx, ra, rb, rt = ZYDIS_REGISTER_NONE, rload = ZYDIS_REGISTER_NONE;
@@ -405,6 +405,7 @@ static int attest_chain(ZydisDecoder *dec, unsigned char *const *win, int n, con
     (void)rt; (void)rload; (void)iload;
     if (iadd < 0) { *why = "nothing sets the jump register"; return 0; }
     if (ilea < 0) { *why = "no lea T -> movsxd [base + idx*4] -> add -> jmp chain for the attested table"; return 0; }
+    *lea_at = win[ilea];
     return 1;
 }
 
@@ -417,7 +418,7 @@ static int attest_chain(ZydisDecoder *dec, unsigned char *const *win, int n, con
  * padding. Fills out[] with the k targets and returns k, or -1 + reason. */
 static int attest_verify(ZydisDecoder *dec, const afw_patch_ctx *c, unsigned char *fstart, size_t fsize,
                          const unsigned char *map, const afw_attest *a, uint64_t *out, int max,
-                         const char **why) {
+                         const uint64_t *tt, size_t ntt, const char **why) {
     ZydisDecodedInstruction ins;
     ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
     unsigned char *fend = fstart + fsize, *J = (unsigned char *)(c->bias + (intptr_t)a->jmp_rva), *q;
@@ -449,8 +450,41 @@ static int attest_verify(ZydisDecoder *dec, const afw_patch_ctx *c, unsigned cha
             }
             q += ok ? ins.length : 1;
         }
-        lea_ok = at_j && attest_chain(dec, win, nw, map, fstart, T, why);
-        if (!at_j) *why = "the linear decoding of the function does not land on the jump";
+        {
+            unsigned char *lea_at = NULL;
+            lea_ok = at_j && attest_chain(dec, win, nw, map, fstart, T, &lea_at, why);
+            if (!at_j) *why = "the linear decoding of the function does not land on the jump";
+            /* every way to the jump goes through the chain (reviewer 2, PR #7): no
+             * branch target in (lea, J] - neither a direct branch of this function,
+             * nor any target the analysis has recorded, nor an entry of the table */
+            if (lea_ok) {
+                uint64_t lo = (uint64_t)(uintptr_t)lea_at, hi = (uint64_t)(uintptr_t)J;
+                size_t ti;
+                int e2;
+                for (ti = 0; ti < ntt && lea_ok; ti++)
+                    if (tt[ti] > lo && tt[ti] <= hi) lea_ok = 0;
+                for (q = fstart; q < fend && lea_ok;) {
+                    int ok = ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, q, (ZyanUSize)(fend - q), &ins, ops));
+                    if (ok && is_branch(&ins) && ins.operand_count_visible >= 1 &&
+                        ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                        ZyanU64 t;
+                        if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&ins, &ops[0], (ZyanU64)(uintptr_t)q, &t)) &&
+                            (uint64_t)t > lo && (uint64_t)t <= hi)
+                            lea_ok = 0;
+                    }
+                    q += ok ? ins.length : 1;
+                }
+                for (e2 = 0; e2 < a->k && lea_ok; e2++) {
+                    int32_t v;
+                    uint64_t tgt;
+                    if (!c->readable || !c->readable(c->ctx, T + 4u * (unsigned)e2, 4)) break;
+                    memcpy(&v, (const void *)(uintptr_t)(T + 4u * (unsigned)e2), 4);
+                    tgt = T + (uint64_t)(int64_t)v;
+                    if (tgt > lo && tgt <= hi) lea_ok = 0;
+                }
+                if (!lea_ok) *why = "a branch lands inside the dispatch chain (lea .. jmp): the chain does not decide every way to the jump";
+            }
+        }
     }
     if (!lea_ok) { free(starts); return -1; }
     for (e = 0; e < a->k; e++) {
@@ -957,7 +991,8 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                     if (J < p || J >= end) continue;
                     if (a < 64) attest_used[a] = 1;
                     if (c->attest_dump) attest_dump(&dec, c, p, ranges[r].size, map, &c->attest[a]);
-                    k = attest_verify(&dec, c, p, ranges[r].size, map, &c->attest[a], pads + npads, 1024 - npads, &awhy);
+                    k = attest_verify(&dec, c, p, ranges[r].size, map, &c->attest[a], pads + npads, 1024 - npads,
+                                      targets, ntargets, &awhy);
                     describe(c, J, where, sizeof where);
                     if (k < 0) {
                         rep->attest_rejected++;

@@ -7,6 +7,7 @@
  *   VARIANT 2 unrelated  a lea of T exists, but the jump uses another table: REJECTED
  *   VARIANT 3 writable   the table is in .data: REJECTED (not read-only)
  *   VARIANT 4 padding    an entry lands on int3 padding: REJECTED
+ *   VARIANT 5 bypass     a second path jumps straight to the jmp, around the chain: REJECTED
  */
 #ifndef VARIANT
 #define VARIANT 1
@@ -20,7 +21,16 @@
 
 __attribute__((naked)) int afw_at_dispatch(int i) {
     __asm__(
-#if VARIANT == 2
+#if VARIANT == 5
+        "cmp $100, %edi\n\t"                     /* i == 100: rax = c1, straight to the jmp */
+        "jne 2f\n\t"
+        "lea c1(%rip), %rax\n\t"
+        "jmp afw_at_jmp\n"
+        "2:\n\t"
+        "lea afw_at_tbl(%rip), %rcx\n\t"
+        "movslq (%rcx,%rdi,4), %rax\n\t"
+        "add %rcx, %rax\n\t"
+#elif VARIANT == 2
         "lea afw_at_tbl(%rip), %rcx\n\t"          /* lea of the attested table: not used by the jump */
         "lea other_tbl(%rip), %rdx\n\t"
         "movslq (%rdx,%rdi,4), %rax\n\t"
