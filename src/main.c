@@ -190,6 +190,17 @@ static int run_syscall_tests(const afw_lib *lib) {
                            ok ? 0ul : (unsigned long)GetLastError(), (unsigned long)old);
                     if (ok) VirtualProtect((void *)(uintptr_t)a, 4096, old, &old);
                 }
+                {
+                    MEMORY_BASIC_INFORMATION mi;
+                    uintptr_t q;
+                    for (q = (uintptr_t)lib->base; q < (uintptr_t)lib->base + lib->size + 0x10000; q += mi.RegionSize) {
+                        if (!VirtualQuery((void *)q, &mi, sizeof mi)) break;
+                        printf("    region +0x%llx size 0x%llx state 0x%lx protect 0x%lx type 0x%lx allocbase %s\n",
+                               (unsigned long long)(q - (uintptr_t)lib->base), (unsigned long long)mi.RegionSize,
+                               (unsigned long)mi.State, (unsigned long)mi.Protect, (unsigned long)mi.Type,
+                               mi.AllocationBase == (void *)lib->base ? "=base" : "OTHER");
+                    }
+                }
 #endif
             }
             check("mprotect(PROT_READ) on the library's own .bss succeeds", mr == 0);
