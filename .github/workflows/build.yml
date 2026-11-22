@@ -41,6 +41,8 @@ jobs:
             -o out/libdeps_base.so test/deps_base.c
           "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 -nostdlib -Lout -ldeps_base \
             -o out/libdeps_user.so test/deps_user.c
+          echo "deps libraries (default NDK relocation packing on purpose):"
+          "$TC/llvm-readelf" -dW out/libdeps_base.so out/libdeps_user.so | grep -iE "relr|rela|init_array|needed" || true
           "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 \
             -Wl,--pack-dyn-relocs=none -o out/libflow_test.so test/flow_test.c
           echo "--- fs:[reg] forms in libtls_ie_test.so"

@@ -176,6 +176,16 @@ static int defer_ifunc(afw_lib *lib, uint64_t *where, uint64_t resolver) {
     return 0;
 }
 
+#ifndef DT_RELRENT
+#define DT_RELRENT 37
+#endif
+#ifndef DT_TEXTREL
+#define DT_TEXTREL 22
+#endif
+#define DT_ANDROID_RELR_    0x6fffe000
+#define DT_ANDROID_RELRSZ_  0x6fffe001
+#define DT_ANDROID_RELRENT_ 0x6fffe003
+
 /* Apply one array of RELA relocations. */
 static int apply_rela(afw_lib *lib, const Elf64_Rela *rel, size_t count,
                       const uint64_t *symaddr, const unsigned char *imp_ifunc) {
@@ -437,8 +447,18 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
             case DT_JMPREL: jmprel = (const Elf64_Rela *)(uintptr_t)ptr; break;
             case DT_PLTRELSZ: pltrelsz = d->d_val; break;
             case DT_PLTREL: pltrel = (int64_t)d->d_val; break;
-            case DT_RELR: relr = (const uint64_t *)(uintptr_t)ptr; break;
-            case DT_RELRSZ: relrsz = d->d_val; break;
+            /* RELR; the NDK writes it under Android's own tags below API 30
+             * (--use-android-relr-tags). Ignoring those tags skipped every
+             * relative relocation silently (measured: libdeps_base.so, PR #11). */
+            case DT_RELR: case DT_ANDROID_RELR_: relr = (const uint64_t *)(uintptr_t)ptr; break;
+            case DT_RELRSZ: case DT_ANDROID_RELRSZ_: relrsz = d->d_val; break;
+            case DT_RELRENT: case DT_ANDROID_RELRENT_:
+                if (d->d_val != 8) { fprintf(stderr, "error: RELR entry size %llu\n", (unsigned long long)d->d_val);
+                                     free(pageprot); return -1; }
+                break;
+            case DT_TEXTREL:
+                fprintf(stderr, "error: text relocations (DT_TEXTREL) are not supported\n");
+                free(pageprot); return -1;
             case DT_INIT: lib->init = ptr; break;
             case DT_FINI: lib->fini = ptr; break;
             case DT_INIT_ARRAY: lib->init_array = (uint64_t *)(uintptr_t)ptr; break;
