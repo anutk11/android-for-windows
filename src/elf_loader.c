@@ -220,6 +220,18 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
     }
     ph = (Elf64_Phdr *)(file + eh->e_phoff);
 
+    /* Executable sections (when section headers exist): the audit sweeps
+     * only these, not whole PT_LOAD segments that also hold .dynstr/.rodata */
+    if (eh->e_shoff && eh->e_shnum && eh->e_shoff + (uint64_t)eh->e_shnum * sizeof(Elf64_Shdr) <= fsize) {
+        const Elf64_Shdr *sh = (const Elf64_Shdr *)(file + eh->e_shoff);
+        for (i = 0; i < eh->e_shnum && lib->nxsec < 16; i++)
+            if ((sh[i].sh_flags & (SHF_ALLOC | SHF_EXECINSTR)) == (SHF_ALLOC | SHF_EXECINSTR) && sh[i].sh_size) {
+                lib->xsec_vaddr[lib->nxsec] = sh[i].sh_addr;
+                lib->xsec_size[lib->nxsec] = sh[i].sh_size;
+                lib->nxsec++;
+            }
+    }
+
     /* 2. Map segments ------------------------------------------------ */
     for (i = 0; i < eh->e_phnum; i++) {
         if (ph[i].p_type == PT_LOAD) {
@@ -419,7 +431,13 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
             }
         }
         free(fstart); free(fsize);
-        {
+        if (lib->nxsec) {
+            for (k = 0; k < lib->nxsec && k < 8; k++) {
+                segs[k].addr = (unsigned char *)(lib->bias + lib->xsec_vaddr[k]);
+                segs[k].size = (size_t)lib->xsec_size[k];
+            }
+            nsegs = k;
+        } else {
             int nseg = 0;
             for (i = 0; i < npages && nseg < 8;) {
                 size_t j = i;

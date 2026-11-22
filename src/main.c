@@ -106,7 +106,9 @@ static int run_syscall_tests(const afw_lib *lib) {
     printf("\n=== G1 tests: Linux syscalls rewritten at load time ===\n");
     check("test functions found", gp && wr && unk && xmm);
     if (g_failed) return 1;
-    check("every safe 'mov eax; syscall' site was patched (4)", lib->patch.sys_patched == 4);
+    check("every safe 'mov eax; syscall' site was patched (5, one behind a switch table)",
+          lib->patch.sys_patched == 5);
+    check("no function left undecided (switch table resolved)", lib->patch.funcs_undecided == 0);
     check("both other sites patched by moving instructions (generic syscall, mov rax)",
           lib->patch.sys_patched_moved == 2);
     check("the site with a branch into its middle was REFUSED", lib->patch.sys_refused_branch == 1);
@@ -151,6 +153,15 @@ static int run_syscall_tests(const afw_lib *lib) {
         check("never-executed syscall/fs: look-alikes left byte for byte", b && memcmp(b, want, 16) == 0);
         check("...and counted by the audit as unreachable", lib->patch.unreachable_ignored >= 2);
         check("the function around them still works", fake && fake() == 7);
+    }
+    {
+        typedef long (SYSV *sw_fn)(int);
+        sw_fn sw = (sw_fn)afw_sym(lib, "afw_switch_syscall");
+        long v;
+        before = afw_syscall_counts[39];
+        v = sw ? sw(4) : 0;
+        check("syscall reached only through a switch table was patched and works",
+              sw && v == host_pid() && afw_syscall_counts[39] == before + 1 && sw(6) == 16);
     }
 
     printf("\n");
@@ -205,8 +216,10 @@ int main(int argc, char **argv) {
     printf("  fs: accesses patched:  %d (fs:[reg]: %d real, %d data)\n", lib.patch.fs_patched,
            lib.patch.fs_reg_in_func, lib.patch.fs_reg_outside);
 
-    printf("  audit: %d unreachable look-alikes left alone; outside .eh_frame: %d syscall, %d fs:\n",
-           lib.patch.unreachable_ignored, lib.patch.sys_outside_functions, lib.patch.fs_outside_functions);
+    printf("  audit: %d unreachable look-alikes left alone, %d UNPROVEN (in %d functions with unresolved "
+           "indirect jumps); outside .eh_frame: %d syscall, %d fs:\n",
+           lib.patch.unreachable_ignored, lib.patch.unproven, lib.patch.funcs_undecided,
+           lib.patch.sys_outside_functions, lib.patch.fs_outside_functions);
     if (lib.patch.sys_refused_redzone)
         printf("  red zone refusals: %d [rsp-N], %d [frame reg - N] beyond sub rsp\n",
                lib.patch.redzone_direct, lib.patch.redzone_via_copy);
@@ -214,10 +227,11 @@ int main(int argc, char **argv) {
         int total = lib.patch.sys_patched + lib.patch.sys_patched_moved + lib.patch.sys_refused_branch +
                     lib.patch.sys_refused_redzone + lib.patch.sys_refused_unknown;
         printf("\nPATCH REPORT %s: %d syscall sites: %d patched (A), %d patched (B), refused %d "
-               "(branch %d, red zone %d, unknown %d); fs:[disp32] %d patched\n",
+               "(branch %d, red zone %d, unknown %d); fs:[disp32] %d reachable, %d patched\n",
                lib.soname ? lib.soname : argv[1], total, lib.patch.sys_patched, lib.patch.sys_patched_moved,
                total - lib.patch.sys_patched - lib.patch.sys_patched_moved, lib.patch.sys_refused_branch,
-               lib.patch.sys_refused_redzone, lib.patch.sys_refused_unknown, lib.patch.fs_patched);
+               lib.patch.sys_refused_redzone, lib.patch.sys_refused_unknown, lib.patch.fs_disp_seen,
+               lib.patch.fs_patched);
         return 0;
     }
 

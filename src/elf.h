@@ -89,6 +89,17 @@ typedef struct {
     uint64_t d_val;
 } Elf64_Dyn;
 
+/* Section headers */
+#define SHF_ALLOC 0x2
+#define SHF_EXECINSTR 0x4
+
+typedef struct {
+    uint32_t sh_name, sh_type;
+    uint64_t sh_flags, sh_addr, sh_offset, sh_size;
+    uint32_t sh_link, sh_info;
+    uint64_t sh_addralign, sh_entsize;
+} Elf64_Shdr;
+
 /* Symbols */
 #define STB_LOCAL 0
 #define STB_GLOBAL 1

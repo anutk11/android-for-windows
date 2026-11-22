@@ -18,6 +18,7 @@
 #include <intrin.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 static void wrfsbase(uint64_t v) {
     /* wrfsbase rax = F3 48 0F AE D0 */
@@ -75,6 +76,28 @@ static DWORD WINAPI worker(void *arg) {
     return 0;
 }
 
+typedef LONG (WINAPI *RtlGetVersion_fn)(OSVERSIONINFOW *);
+
+/* Step-by-step: WHEN is the fs base lost? (reviewer 1) */
+static void when_is_it_lost(void) {
+    static uint64_t block[16];
+    uint64_t r;
+    block[0] = (uint64_t)(uintptr_t)block;
+    printf("4. When is the fs base lost? (main thread)\n");
+    __try { wrfsbase((uint64_t)(uintptr_t)block); } __except (EXCEPTION_EXECUTE_HANDLER) { printf("   WRFSBASE faulted\n"); return; }
+    r = rdfsbase();
+    printf("   a) right after WRFSBASE, no system call:   %s\n", r == (uint64_t)(uintptr_t)block ? "kept" : "LOST");
+    wrfsbase((uint64_t)(uintptr_t)block);
+    GetFileAttributesA("C:\\");        /* one system call (NtQueryAttributesFile), no wait */
+    r = rdfsbase();
+    printf("   b) after one system call:                 %s\n", r == (uint64_t)(uintptr_t)block ? "kept" : "LOST");
+    wrfsbase((uint64_t)(uintptr_t)block);
+    Sleep(20);                           /* the thread is switched out and back */
+    r = rdfsbase();
+    printf("   c) after a sleep (context switch):         %s\n", r == (uint64_t)(uintptr_t)block ? "kept" : "LOST");
+    wrfsbase(0);
+}
+
 int main(void) {
     int regs[4];
     thread_state a = {{0}}, b = {{0}};
@@ -83,6 +106,16 @@ int main(void) {
 
     setvbuf(stdout, NULL, _IONBF, 0);
     printf("=== WRFSBASE experiment ===\n");
+    {
+        int b[12];
+        char brand[49] = {0};
+        OSVERSIONINFOW v = {sizeof v};
+        RtlGetVersion_fn rgv = (RtlGetVersion_fn)GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlGetVersion");
+        __cpuid(b, 0x80000002); __cpuid(b + 4, 0x80000003); __cpuid(b + 8, 0x80000004);
+        memcpy(brand, b, 48);
+        if (rgv) rgv(&v);
+        printf("CPU: %s\nWindows: %lu.%lu build %lu\n", brand, v.dwMajorVersion, v.dwMinorVersion, v.dwBuildNumber);
+    }
     __cpuidex(regs, 7, 0);
     printf("1. CPU has FSGSBASE (CPUID.7.EBX[0]): %s\n", (regs[1] & 1) ? "yes" : "no");
     if (!(regs[1] & 1)) { printf("RESULT: not available on this CPU\n"); return 0; }
@@ -96,6 +129,8 @@ int main(void) {
         printf("RESULT: WRFSBASE is not usable -> keep patching fs: accesses\n");
         return 0;
     }
+
+    when_is_it_lost();
 
     a.id = 1; b.id = 2;
     ha = CreateThread(NULL, 0, worker, &a, 0, NULL);

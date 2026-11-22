@@ -61,6 +61,15 @@ jobs:
           if [ -f out/bionic/linker64 ]; then
             out/scan/syscall_scan out/bionic/linker64 | tee out/linker64-scan.txt
           fi
+      - name: "Analyse: ELF TLS in the real libc.so"
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"; TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "--- PT_TLS"; "$TC/llvm-readelf" -lW out/bionic/libc.so | grep -E "TLS|Type"
+          echo "--- TLS relocations by type"; "$TC/llvm-readelf" -rW out/bionic/libc.so | grep -oE "R_X86_64_(TPOFF64|TPOFF32|DTPMOD64|DTPOFF64|GOTTPOFF|TLSGD|TLSLD|TLSDESC)" | sort | uniq -c
+          echo "--- TPOFF64 relocations (offset, symbol)"; "$TC/llvm-readelf" -rW out/bionic/libc.so | grep TPOFF | head -20
+          echo "--- TLS symbols"; "$TC/llvm-readelf" -sW out/bionic/libc.so | grep " TLS " | head -20
+          echo "--- one fs:[reg] site (gwp_asan initPRNG)"
+          "$TC/llvm-objdump" -d --no-show-raw-insn --disassemble-symbols=_ZN8gwp_asan20GuardedPoolAllocator8initPRNGEv out/bionic/libc.so | head -25
       - name: "Measure: patch the real libraries (never run them)"
         run: |
           bash tools/build_linux.sh

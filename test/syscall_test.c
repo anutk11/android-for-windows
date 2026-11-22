@@ -93,3 +93,23 @@ __attribute__((naked)) long afw_fake_site(void) {
         "1:\tmov $7, %eax\n\t"
         "ret");
 }
+
+/*
+ * A syscall reached ONLY through a switch jump table (clang emits
+ * "lea; movsxd; add; jmp reg"). Control-flow analysis must resolve the table
+ * and patch it; otherwise this raw syscall would stay and run on Windows.
+ */
+long afw_switch_syscall(int k) {
+    long r;
+    switch (k) {
+    case 0: __asm__ volatile("nop" ::: "memory"); return 10;
+    case 1: __asm__ volatile("nop; nop" ::: "memory"); return 11;
+    case 2: __asm__ volatile("nop; nop; nop" ::: "memory"); return 12;
+    case 3: __asm__ volatile("pause" ::: "memory"); return 13;
+    case 4: __asm__ volatile("mov $39, %%eax\n\tsyscall" : "=a"(r) : : "rcx", "r11", "memory"); return r;
+    case 5: __asm__ volatile("lfence" ::: "memory"); return 15;
+    case 6: __asm__ volatile("sfence" ::: "memory"); return 16;
+    case 7: __asm__ volatile("mfence" ::: "memory"); return 17;
+    default: return -1;
+    }
+}

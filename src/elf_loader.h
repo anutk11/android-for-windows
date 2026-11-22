@@ -35,6 +35,8 @@ typedef struct afw_lib_s {
     /* load-time patching */
     unsigned char *stub_area;
     const unsigned char *eh_frame_hdr;   /* for function boundaries */
+    uint64_t xsec_vaddr[16], xsec_size[16]; /* SHF_EXECINSTR sections */
+    int nxsec;
     afw_patch_report patch;
 
     /* report */

@@ -127,33 +127,63 @@ static void dump_ins(const unsigned char *p, const ZydisDecodedInstruction *ins,
 
 /*
  * Control-flow reachability inside one function: 1 marks an instruction
- * start that some path from the entry reaches. Direct branches are followed;
- * if the function has an indirect jump (switch tables), the bytes still
- * unvisited are swept linearly as well, so no real code is missed.
+ * start that some path from the entry reaches. Direct branches are followed.
+ * Indirect jumps through a clang switch table
+ *     lea rT, [rip + table] ; movsxd rX, dword [rT + rI*4] ; add rX, rT ; jmp rX
+ * are resolved by reading the table while its entries stay inside the
+ * function. An indirect jump that cannot be resolved makes the function
+ * UNDECIDED: the bytes no path reaches are never decoded or changed, and any
+ * syscall/fs: look-alike among them is reported as unproven (not "never runs").
  */
-static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t size) {
+static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t size, int *undecided) {
     ZydisDecodedInstruction ins;
     ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
     unsigned char *map = (unsigned char *)calloc(size ? size : 1, 1);
     size_t *work = NULL, nwork = 0, capwork = 0, off;
-    int indirect = 0;
+    uint64_t lea_val[ZYDIS_REGISTER_MAX_VALUE + 1];
+    uint64_t lo = (uint64_t)(uintptr_t)base, hi = lo + size, table = 0;
+    memset(lea_val, 0, sizeof lea_val);
+    *undecided = 0;
     VEC_PUSH(work, nwork, capwork, (size_t)0);
     while (nwork) {
         off = work[--nwork];
         while (off < size && map[off] != 1) {
             int k, stop = 0;
+            uint64_t ip = lo + off;
             if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, base + off, (ZyanUSize)(size - off), &ins, ops))) break;
             map[off] = 1;
+            /* remember rip-relative lea results and switch-table loads */
+            if (ins.mnemonic == ZYDIS_MNEMONIC_LEA && ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                ops[1].mem.base == ZYDIS_REGISTER_RIP)
+                lea_val[reg64(ops[0].reg.value)] = ip + ins.length + (uint64_t)ops[1].mem.disp.value;
+            if (ins.mnemonic == ZYDIS_MNEMONIC_MOVSXD && ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                ops[1].mem.scale == 4 && ops[1].mem.base != ZYDIS_REGISTER_NONE && lea_val[ops[1].mem.base])
+                table = lea_val[ops[1].mem.base];
             if (ins.meta.category == ZYDIS_CATEGORY_COND_BR || ins.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
                 for (k = 0; k < ins.operand_count_visible; k++) {
                     ZyanU64 t;
                     if (ops[k].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && ops[k].imm.is_relative &&
-                        ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&ins, &ops[k], (ZyanU64)(uintptr_t)(base + off), &t)) &&
-                        t >= (ZyanU64)(uintptr_t)base && t < (ZyanU64)(uintptr_t)(base + size))
-                        VEC_PUSH(work, nwork, capwork, (size_t)(t - (ZyanU64)(uintptr_t)base));
-                    else if (ops[k].type != ZYDIS_OPERAND_TYPE_IMMEDIATE &&
-                             ins.meta.category == ZYDIS_CATEGORY_UNCOND_BR)
-                        indirect = 1;
+                        ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&ins, &ops[k], ip, &t))) {
+                        if (t >= lo && t < hi) VEC_PUSH(work, nwork, capwork, (size_t)(t - lo));
+                    } else if (ins.meta.category == ZYDIS_CATEGORY_UNCOND_BR && ops[k].visibility == ZYDIS_OPERAND_VISIBILITY_EXPLICIT) {
+                        if (ops[k].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[k].mem.base == ZYDIS_REGISTER_RIP) {
+                            /* jmp [rip+x]: tail call through the GOT, leaves the function */
+                        } else if (ops[k].type == ZYDIS_OPERAND_TYPE_REGISTER && table) {
+                            int e, got = 0;
+                            for (e = 0; e < 4096; e++) {
+                                int32_t rel;
+                                uint64_t t2;
+                                memcpy(&rel, (const void *)(uintptr_t)(table + 4u * (unsigned)e), 4);
+                                t2 = table + (uint64_t)(int64_t)rel;
+                                if (t2 < lo || t2 >= hi) break;
+                                VEC_PUSH(work, nwork, capwork, (size_t)(t2 - lo));
+                                got++;
+                            }
+                            if (!got) *undecided = 1;
+                        } else {
+                            *undecided = 1;
+                        }
+                    }
                 }
                 if (ins.meta.category == ZYDIS_CATEGORY_UNCOND_BR) stop = 1;
             }
@@ -162,22 +192,6 @@ static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t s
                 stop = 1;
             off += ins.length;
             if (stop) break;
-        }
-    }
-    if (indirect) {
-        /* linear sweep of the gaps: code reached only through a jump table */
-        off = 0;
-        while (off < size) {
-            if (map[off] == 1) {
-                if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, base + off, (ZyanUSize)(size - off), &ins, ops)))
-                    off += ins.length;
-                else off++;
-                continue;
-            }
-            if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, base + off, (ZyanUSize)(size - off), &ins, ops))) {
-                map[off] = 1;
-                off += ins.length;
-            } else off++;
         }
     }
     free(work);
@@ -207,6 +221,7 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
     int r, fatal = 0;
     char where[160];
     unsigned char **maps = (unsigned char **)calloc(nranges ? (size_t)nranges : 1, sizeof *maps);
+    int *undecided = (int *)calloc(nranges ? (size_t)nranges : 1, sizeof *undecided);
 
     memset(rep, 0, sizeof *rep);
     ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
@@ -219,7 +234,10 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
         int prev_mov_eax = 0;
         uint32_t prev_imm = 0;
         unsigned char *map = NULL;
-        if (c && c->ranges_are_functions) map = maps[r] = reach_map(&dec, p, ranges[r].size);
+        if (c && c->ranges_are_functions) {
+            map = maps[r] = reach_map(&dec, p, ranges[r].size, &undecided[r]);
+            if (undecided[r]) rep->funcs_undecided++;
+        }
         while (p < end) {
             uint64_t ip = (uint64_t)(uintptr_t)p;
             int k, movable;
@@ -254,6 +272,7 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                     dump_ins(p, &ins, ops);
                     continue;
                 }
+                rep->fs_disp_seen++;
 #if defined(_WIN32)
                 {
                     int64_t d = ops[k].mem.disp.value;
@@ -409,10 +428,17 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                                             "(data, or code without unwind info): not touched\n", where);
                         } else rep->fs_outside_functions++;
                     } else if (maps[found] && maps[found][p - ranges[found].addr] != 1) {
-                        rep->unreachable_ignored++;
                         describe(c, p, where, sizeof where);
-                        fprintf(stderr, "  [audit] %s-looking bytes at %s are inside a function but never executed: "
-                                        "left untouched\n", is_sys ? "syscall" : "fs:", where);
+                        if (undecided[found]) {
+                            rep->unproven++;
+                            fprintf(stderr, "  [audit] UNPROVEN: %s-looking bytes at %s, in a function with an unresolved "
+                                            "indirect jump: not touched\n", is_sys ? "syscall" : "fs:", where);
+                        } else {
+                            rep->unreachable_ignored++;
+                            if (verbose > 1)
+                                fprintf(stderr, "  [audit] %s-looking bytes at %s: no path reaches them, left untouched\n",
+                                        is_sys ? "syscall" : "fs:", where);
+                        }
                     }
                 }
                 p += ins.length;
@@ -420,7 +446,7 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
         }
     }
     for (r = 0; r < nranges; r++) free(maps[r]);
-    free(maps);
+    free(maps); free(undecided);
 
     free(targets); free(sites);
     if (fatal) return -1;

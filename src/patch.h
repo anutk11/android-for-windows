@@ -17,8 +17,9 @@
  * call rel32 reaches; running out of room or range is a load error.
  *
  * Only instructions that control flow can reach from a function's entry are
- * considered (direct branches followed; functions with indirect jumps get
- * their remaining bytes swept linearly). Bytes that merely look like a
+ * considered (direct branches and clang switch tables followed; a function
+ * with an indirect jump that cannot be resolved is UNDECIDED and its
+ * unreached bytes stay untouched and are reported). Bytes that merely look like a
  * syscall or an fs: access but are never executed are left untouched.
  *
  * A site is REFUSED (left untouched, reported loudly) unless it is provably
@@ -55,6 +56,9 @@ typedef struct {
     int stubs;
     /* audit: candidate bytes found by a plain linear sweep of the segments */
     int unreachable_ignored;   /* inside a function, but no path reaches them */
+    int unproven;              /* unreached, in a function with an unresolved indirect jump */
+    int funcs_undecided;       /* functions with an unresolved indirect jump */
+    int fs_disp_seen;          /* reachable fs:[disp32] accesses (any platform) */
     int sys_outside_functions; /* syscall in executable bytes with no .eh_frame entry */
     int fs_outside_functions;
     int redzone_direct;        /* refusals by reason: [rsp-N] */
