@@ -128,22 +128,41 @@ static void dump_ins(const unsigned char *p, const ZydisDecodedInstruction *ins,
 /*
  * Control-flow reachability inside one function: 1 marks an instruction
  * start that some path from the entry reaches. Direct branches are followed.
- * Indirect jumps through a clang switch table
- *     lea rT, [rip + table] ; movsxd rX, dword [rT + rI*4] ; add rX, rT ; jmp rX
- * are resolved by reading the table while its entries stay inside the
- * function. An indirect jump that cannot be resolved makes the function
- * UNDECIDED: the bytes no path reaches are never decoded or changed, and any
- * syscall/fs: look-alike among them is reported as unproven (not "never runs").
+ *
+ * Switch tables are followed only when the whole chain is PROVEN along the
+ * path (registers tracked per path):
+ *     cmp  rI, N ; ja default        -> rI < N+1        (bound, also via mov copies)
+ *     lea  rT, [rip + table]         -> rT = table
+ *     movsxd rX, dword [rT + rI*4]   -> rX = table entry, rI bounded
+ *     add  rX, rT                    -> rX = table + entry
+ *     jmp  rX
+ * and every one of the N+1 entries lands inside the function. Anything less
+ * (unknown bound, unrelated registers, an entry outside) makes the function
+ * UNDECIDED: bytes no proven path reaches are never decoded or changed.
  */
+#define NREG (ZYDIS_REGISTER_MAX_VALUE + 1)
+typedef struct {
+    uint64_t lea[NREG];      /* rip-relative lea result held by the register */
+    uint64_t bound[NREG];    /* register known to be < bound (0 = unknown) */
+    uint64_t ent_tab[NREG];  /* register holds an entry of table ent_tab, read via ent_base */
+    uint64_t ent_cnt[NREG];
+    ZydisRegister ent_base[NREG];
+    uint64_t sum_tab[NREG];  /* register = table + entry (proven) */
+    uint64_t sum_cnt[NREG];
+} flow_state;
+
+static void reg_clear(flow_state *f, ZydisRegister r) {
+    f->lea[r] = f->bound[r] = f->ent_tab[r] = f->sum_tab[r] = 0;
+}
+
 static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t size, int *undecided,
                                 const unsigned char **why, const uint64_t *extra, int nextra) {
     ZydisDecodedInstruction ins;
     ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
     unsigned char *map = (unsigned char *)calloc(size ? size : 1, 1);
     size_t *work = NULL, nwork = 0, capwork = 0, off;
-    uint64_t lea_val[ZYDIS_REGISTER_MAX_VALUE + 1];
-    uint64_t lo = (uint64_t)(uintptr_t)base, hi = lo + size, table = 0;
-    memset(lea_val, 0, sizeof lea_val);
+    uint64_t lo = (uint64_t)(uintptr_t)base, hi = lo + size;
+    flow_state *f = (flow_state *)malloc(sizeof *f);
     *undecided = 0;
     VEC_PUSH(work, nwork, capwork, (size_t)0);
     {
@@ -152,40 +171,94 @@ static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t s
             if (extra[e] >= lo && extra[e] < hi) VEC_PUSH(work, nwork, capwork, (size_t)(extra[e] - lo));
     }
     while (nwork) {
+        ZydisRegister cmp_reg = ZYDIS_REGISTER_NONE;
+        uint64_t cmp_imm = 0;
         off = work[--nwork];
+        memset(f, 0, sizeof *f);                  /* register facts hold along one path only */
         while (off < size && map[off] != 1) {
-            int k, stop = 0;
+            int k, stop = 0, w;
             uint64_t ip = lo + off;
+            ZydisRegister pending_cmp = cmp_reg;
             if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, base + off, (ZyanUSize)(size - off), &ins, ops))) break;
             map[off] = 1;
-            /* remember rip-relative lea results and switch-table loads */
-            if (ins.mnemonic == ZYDIS_MNEMONIC_LEA && ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                ops[1].mem.base == ZYDIS_REGISTER_RIP)
-                lea_val[reg64(ops[0].reg.value)] = ip + ins.length + (uint64_t)ops[1].mem.disp.value;
-            if (ins.mnemonic == ZYDIS_MNEMONIC_MOVSXD && ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
-                ops[1].mem.scale == 4 && ops[1].mem.base != ZYDIS_REGISTER_NONE && lea_val[ops[1].mem.base])
-                table = lea_val[ops[1].mem.base];
+            cmp_reg = ZYDIS_REGISTER_NONE;
+
+            /* --- facts produced by this instruction --- */
+            if (ins.mnemonic == ZYDIS_MNEMONIC_CMP && ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                cmp_reg = reg64(ops[0].reg.value);
+                cmp_imm = ops[1].imm.value.u;
+            } else if (pending_cmp != ZYDIS_REGISTER_NONE &&
+                       (ins.mnemonic == ZYDIS_MNEMONIC_JNBE || ins.mnemonic == ZYDIS_MNEMONIC_JNB)) {
+                /* fall-through of "ja/jae default": unsigned index < bound */
+                f->bound[pending_cmp] = ins.mnemonic == ZYDIS_MNEMONIC_JNBE ? cmp_imm + 1 : cmp_imm;
+            }
+            {
+                /* new values: clear facts of every register this instruction writes,
+                 * then record what it proves */
+                uint64_t keep_lea = 0, keep_bound = 0, keep_tab = 0, keep_cnt = 0, keep_sum = 0, keep_scnt = 0;
+                ZydisRegister keep_base = ZYDIS_REGISTER_NONE, dst = ZYDIS_REGISTER_NONE;
+                int recognised = 0;
+                if (ins.operand_count_visible >= 2 && ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                    dst = reg64(ops[0].reg.value);
+                    if (ins.mnemonic == ZYDIS_MNEMONIC_LEA && ops[1].mem.base == ZYDIS_REGISTER_RIP &&
+                        ops[1].mem.index == ZYDIS_REGISTER_NONE) {
+                        keep_lea = ip + ins.length + (uint64_t)ops[1].mem.disp.value; recognised = 1;
+                    } else if (ins.mnemonic == ZYDIS_MNEMONIC_MOV && ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                        ZydisRegister src = reg64(ops[1].reg.value);   /* copies keep the bound */
+                        keep_bound = f->bound[src]; keep_lea = f->lea[src]; recognised = 1;
+                    } else if (ins.mnemonic == ZYDIS_MNEMONIC_MOVSXD && ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                               ops[1].mem.scale == 4 && ops[1].mem.disp.value == 0 &&
+                               ops[1].mem.base != ZYDIS_REGISTER_NONE && f->lea[ops[1].mem.base] &&
+                               ops[1].mem.index != ZYDIS_REGISTER_NONE && f->bound[reg64(ops[1].mem.index)]) {
+                        keep_tab = f->lea[ops[1].mem.base]; keep_cnt = f->bound[reg64(ops[1].mem.index)];
+                        keep_base = ops[1].mem.base; recognised = 1;
+                    } else if (ins.mnemonic == ZYDIS_MNEMONIC_ADD && ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                               f->ent_tab[dst] && reg64(ops[1].reg.value) == f->ent_base[dst] &&
+                               f->lea[f->ent_base[dst]] == f->ent_tab[dst]) {
+                        keep_sum = f->ent_tab[dst]; keep_scnt = f->ent_cnt[dst]; recognised = 1;
+                    }
+                }
+                for (w = 0; w < ins.operand_count; w++)
+                    if (ops[w].type == ZYDIS_OPERAND_TYPE_REGISTER && (ops[w].actions & ZYDIS_OPERAND_ACTION_MASK_WRITE))
+                        reg_clear(f, reg64(ops[w].reg.value));
+                if (recognised && dst != ZYDIS_REGISTER_NONE) {
+                    f->lea[dst] = keep_lea; f->bound[dst] = keep_bound;
+                    f->ent_tab[dst] = keep_tab; f->ent_cnt[dst] = keep_cnt; f->ent_base[dst] = keep_base;
+                    f->sum_tab[dst] = keep_sum; f->sum_cnt[dst] = keep_scnt;
+                }
+            }
+
+            /* --- control flow --- */
             if (ins.meta.category == ZYDIS_CATEGORY_COND_BR || ins.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
                 for (k = 0; k < ins.operand_count_visible; k++) {
                     ZyanU64 t;
                     if (ops[k].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && ops[k].imm.is_relative &&
                         ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&ins, &ops[k], ip, &t))) {
                         if (t >= lo && t < hi) VEC_PUSH(work, nwork, capwork, (size_t)(t - lo));
-                    } else if (ins.meta.category == ZYDIS_CATEGORY_UNCOND_BR && ops[k].visibility == ZYDIS_OPERAND_VISIBILITY_EXPLICIT) {
+                    } else if (ins.meta.category == ZYDIS_CATEGORY_UNCOND_BR &&
+                               ops[k].visibility == ZYDIS_OPERAND_VISIBILITY_EXPLICIT) {
                         if (ops[k].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[k].mem.base == ZYDIS_REGISTER_RIP) {
                             /* jmp [rip+x]: tail call through the GOT, leaves the function */
-                        } else if (ops[k].type == ZYDIS_OPERAND_TYPE_REGISTER && table) {
-                            int e, got = 0;
-                            for (e = 0; e < 4096; e++) {
+                        } else if (ops[k].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                                   f->sum_tab[reg64(ops[k].reg.value)] &&
+                                   f->sum_cnt[reg64(ops[k].reg.value)] <= 4096) {
+                            uint64_t tab = f->sum_tab[reg64(ops[k].reg.value)];
+                            uint64_t n = f->sum_cnt[reg64(ops[k].reg.value)], e;
+                            int bad = 0;
+                            for (e = 0; e < n && !bad; e++) {
                                 int32_t rel;
                                 uint64_t t2;
-                                memcpy(&rel, (const void *)(uintptr_t)(table + 4u * (unsigned)e), 4);
-                                t2 = table + (uint64_t)(int64_t)rel;
-                                if (t2 < lo || t2 >= hi) break;
-                                VEC_PUSH(work, nwork, capwork, (size_t)(t2 - lo));
-                                got++;
+                                memcpy(&rel, (const void *)(uintptr_t)(tab + 4 * e), 4);
+                                t2 = tab + (uint64_t)(int64_t)rel;
+                                if (t2 < lo || t2 >= hi) bad = 1;
                             }
-                            if (!got) { *undecided = 1; *why = base + off; }
+                            if (bad) { *undecided = 1; *why = base + off; }
+                            else for (e = 0; e < n; e++) {
+                                int32_t rel;
+                                memcpy(&rel, (const void *)(uintptr_t)(tab + 4 * e), 4);
+                                VEC_PUSH(work, nwork, capwork, (size_t)(tab + (uint64_t)(int64_t)rel - lo));
+                            }
                         } else {
                             *undecided = 1; *why = base + off;
                         }
@@ -200,6 +273,7 @@ static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t s
             if (stop) break;
         }
     }
+    free(f);
     free(work);
     return map;
 }
@@ -242,10 +316,21 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
         unsigned char *map = NULL;
         if (c && c->ranges_are_functions) {
             const unsigned char *why = NULL;
-            uint64_t pads[256];
-            int npads = c->entries ? c->entries(c->ctx, (uint64_t)(uintptr_t)p, pads, 256) : 0;
+            uint64_t pads[1024];
+            int npads = c->entries ? c->entries(c->ctx, (uint64_t)(uintptr_t)p, pads, 1024) : 0;
+            int lsda_failed = npads < 0;
+            if (lsda_failed) {
+                /* unsupported format, corrupt table, or more pads than we hold:
+                 * we cannot claim to know every entry point */
+                rep->lsda_failures++;
+                describe(c, p, where, sizeof where);
+                fprintf(stderr, "  [flow] function at %s: exception table %s - function UNDECIDED\n", where,
+                        npads == -2 ? "has more landing pads than supported" : "could not be decoded");
+                npads = 0;
+            }
             rep->landing_pads += npads;
             map = maps[r] = reach_map(&dec, p, ranges[r].size, &undecided[r], &why, pads, npads);
+            if (lsda_failed && !undecided[r]) { undecided[r] = 1; why = NULL; }
             if (undecided[r]) {
                 rep->funcs_undecided++;
                 if (verbose && why && ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, why, 16, &ins, ops))) {

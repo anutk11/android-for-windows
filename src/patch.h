@@ -60,6 +60,7 @@ typedef struct {
     int funcs_undecided;       /* functions with an unresolved indirect jump */
     int fs_disp_seen;          /* reachable fs:[disp32] accesses (any platform) */
     int landing_pads;          /* C++ landing pads used as entry points */
+    int lsda_failures;         /* exception tables we could not fully decode */
     int sys_outside_functions; /* syscall in executable bytes with no .eh_frame entry */
     int fs_outside_functions;
     int redzone_direct;        /* refusals by reason: [rsp-N] */

@@ -114,7 +114,9 @@ int main(void) {
         __cpuid(b, 0x80000002); __cpuid(b + 4, 0x80000003); __cpuid(b + 8, 0x80000004);
         memcpy(brand, b, 48);
         if (rgv) rgv(&v);
-        printf("CPU: %s\nWindows: %lu.%lu build %lu\n", brand, v.dwMajorVersion, v.dwMinorVersion, v.dwBuildNumber);
+        printf("CPU: %s\nlogical processors: %lu\nWindows: %lu.%lu build %lu\n", brand,
+               (unsigned long)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS),
+               v.dwMajorVersion, v.dwMinorVersion, v.dwBuildNumber);
     }
     __cpuidex(regs, 7, 0);
     printf("1. CPU has FSGSBASE (CPUID.7.EBX[0]): %s\n", (regs[1] & 1) ? "yes" : "no");

@@ -7,6 +7,7 @@
  * If the library is test/hello.c (libhello.so), the M0 tests run as well.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "bionic_shim.h"
@@ -185,7 +186,7 @@ static int run_redzone_tests(const afw_lib *lib) {
 
 int main(int argc, char **argv) {
     afw_lib lib;
-    int verbose = 1, rc = 0;
+    int verbose = 1, rc = 0, strict = 0, min_pads = 0;
 
     setvbuf(stdout, NULL, _IONBF, 0); /* never lose output on a crash */
     afw_crash_init();
@@ -198,6 +199,13 @@ int main(int argc, char **argv) {
     }
     if (argc > 2 && strcmp(argv[2], "-v") == 0) verbose = 2;
     if (argc > 2 && strcmp(argv[2], "--patch-report") == 0) afw_load_patch_only = 1;
+    {
+        int a;
+        for (a = 3; a < argc; a++) {
+            if (strcmp(argv[a], "--strict") == 0) strict = 1;
+            else if (strncmp(argv[a], "--min-landing-pads=", 19) == 0) min_pads = atoi(argv[a] + 19);
+        }
+    }
     if (afw_check_security() != 0) return 1;
     if (afw_tls_init() != 0) return 1;
 
@@ -219,7 +227,8 @@ int main(int argc, char **argv) {
     printf("  fs: accesses patched:  %d (fs:[reg]: %d real, %d data)\n", lib.patch.fs_patched,
            lib.patch.fs_reg_in_func, lib.patch.fs_reg_outside);
 
-    printf("  C++ landing pads followed: %d\n", lib.patch.landing_pads);
+    printf("  C++ landing pads followed: %d (exception tables not decodable: %d)\n",
+           lib.patch.landing_pads, lib.patch.lsda_failures);
     printf("  audit: %d unreachable look-alikes left alone, %d UNPROVEN (in %d functions with unresolved "
            "indirect jumps); outside .eh_frame: %d syscall, %d fs:\n",
            lib.patch.unreachable_ignored, lib.patch.unproven, lib.patch.funcs_undecided,
@@ -227,6 +236,14 @@ int main(int argc, char **argv) {
     if (lib.patch.sys_refused_redzone)
         printf("  red zone refusals: %d [rsp-N], %d [frame reg - N] beyond sub rsp\n",
                lib.patch.redzone_direct, lib.patch.redzone_via_copy);
+    if (afw_load_patch_only && strict) {
+        int bad = lib.patch.unproven || lib.patch.lsda_failures ||
+                  lib.patch.landing_pads < min_pads;
+        printf("STRICT: %s (unproven %d, undecodable exception tables %d, landing pads %d, required >= %d)\n",
+               bad ? "FAILED" : "PASSED", lib.patch.unproven, lib.patch.lsda_failures,
+               lib.patch.landing_pads, min_pads);
+        if (bad) return 1;
+    }
     if (afw_load_patch_only) {
         int total = lib.patch.sys_patched + lib.patch.sys_patched_moved + lib.patch.sys_refused_branch +
                     lib.patch.sys_refused_redzone + lib.patch.sys_refused_unknown;

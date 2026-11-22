@@ -129,27 +129,46 @@ static const unsigned char *find_fde(const afw_lib *lib, uint64_t addr) {
     return (const unsigned char *)(uintptr_t)(hdr + (int64_t)tab[2 * lo + 1]);
 }
 
+/* Inside the loaded image? Used to reject corrupt exception tables. */
+static int in_image(const afw_lib *lib, const unsigned char *p, size_t n) {
+    return p >= lib->base && p + n <= lib->base + lib->size;
+}
+
+/*
+ * Returns: >= 0 number of landing pads (0 = function has no LSDA or no pads)
+ *          -1 the table uses a format we do not decode, or is corrupt
+ *          -2 more landing pads than `max`
+ * Callers must treat < 0 as "entry points unknown" (UNDECIDED).
+ */
 int afw_func_landing_pads(const afw_lib *lib, uint64_t func, uint64_t *out, int max) {
     const unsigned char *fde = find_fde(lib, func), *p, *cs_end;
     uint64_t s0, e0, lsda, lpstart, cs_len;
     unsigned char lp_enc, tt_enc, cs_enc;
     int n = 0;
-    if (!fde || !fde_parse(fde, &s0, &e0, &lsda) || s0 != func || !lsda) return 0;
+    if (!fde || !fde_parse(fde, &s0, &e0, &lsda) || s0 != func) return 0;
+    if (!lsda) return 0;                                   /* no exception table */
     p = (const unsigned char *)(uintptr_t)lsda;
+    if (!in_image(lib, p, 4)) return -1;
     lp_enc = *p++;
     lpstart = func;
-    if (lp_enc != PE_OMIT && !read_enc(&p, lp_enc, 0, &lpstart)) return 0;
+    if (lp_enc != PE_OMIT && !read_enc(&p, lp_enc, 0, &lpstart)) return -1;
     tt_enc = *p++;
     if (tt_enc != PE_OMIT) uleb(&p);
     cs_enc = *p++;
+    if ((cs_enc & 0x70) != 0 || cs_enc == PE_OMIT) return -1;  /* call-site values are plain offsets */
     cs_len = uleb(&p);
     cs_end = p + cs_len;
-    while (p < cs_end && n < max) {
+    if (cs_len > (1u << 20) || !in_image(lib, p, (size_t)cs_len)) return -1;
+    while (p < cs_end) {
         uint64_t start, len, lp;
         if (!read_enc(&p, cs_enc, 0, &start) || !read_enc(&p, cs_enc, 0, &len) ||
-            !read_enc(&p, cs_enc, 0, &lp)) break;
-        uleb(&p);                                  /* action */
-        if (lp && lpstart + lp >= s0 && lpstart + lp < e0) out[n++] = lpstart + lp;
+            !read_enc(&p, cs_enc, 0, &lp)) return -1;
+        uleb(&p);                                          /* action */
+        if (p > cs_end) return -1;                         /* entry runs past the table */
+        if (!lp) continue;                                 /* call site without landing pad */
+        if (lpstart + lp < s0 || lpstart + lp >= e0) return -1;  /* pad outside the function */
+        if (n == max) return -2;
+        out[n++] = lpstart + lp;
     }
     return n;
 }

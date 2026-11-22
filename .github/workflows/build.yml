@@ -29,6 +29,10 @@ jobs:
             -Wl,--pack-dyn-relocs=none -o out/libsyscall_test.so test/syscall_test.c
           "$TC/clang" --target=x86_64-linux-android24 -shared -fPIC -O2 \
             -Wl,--pack-dyn-relocs=none -o out/libredzone_test.so test/redzone_test.c
+          "$TC/clang++" --target=x86_64-linux-android24 -shared -fPIC -O2 -fstack-protector-strong \
+            -Wl,--pack-dyn-relocs=none -o out/libcxx_exception_test.so test/cxx_exception_test.cpp
+          echo "--- landing pads in libcxx_exception_test.so (from .gcc_except_table)"
+          "$TC/llvm-readelf" -SW out/libcxx_exception_test.so | grep -E "gcc_except|eh_frame"
           "$TC/llvm-readelf" -h -d out/libhello.so
           echo "--- TLS relocations (GOTTPOFF/TPOFF would mean real initial-exec ELF TLS) ---"
           for f in out/libhello.so out/libsyscall_test.so; do echo "$f:"; "$TC/llvm-readelf" -rW "$f" | grep -E "TPOFF|TLS|DTPMOD" || echo "  none"; done
@@ -106,6 +110,9 @@ jobs:
       - name: Run G1 syscall-patching tests on Windows
         shell: cmd
         run: out\afw-loader.exe out\libsyscall_test.so
+      - name: "C++ exceptions: every landing pad found, nothing unproven (static)"
+        shell: cmd
+        run: out\afw-loader.exe out\libcxx_exception_test.so --patch-report --strict --min-landing-pads=1
       - name: "Negative test: red zone sites must be refused"
         shell: cmd
         run: out\afw-loader.exe out\libredzone_test.so
