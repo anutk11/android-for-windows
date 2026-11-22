@@ -89,6 +89,26 @@ static unsigned char *read_file(const char *path, size_t *out_size) {
     return buf;
 }
 
+/* A defined, exported symbol of an already loaded library other than self
+ * (load order = dependency order, as the global scope of a dynamic linker). */
+void *afw_sym(const afw_lib *lib, const char *name);
+static void *global_lookup(const char *name, const afw_lib *self) {
+    int k;
+    for (k = 0; k < g_nlibs; k++) {
+        void *p;
+        if (g_libs[k] == self) continue;
+        p = afw_sym(g_libs[k], name);
+        if (p) return p;
+    }
+    return NULL;
+}
+
+/* Symbols the loader itself must provide even when a loaded library exports
+ * them too (G1-TLS: __tls_get_addr until bionic's DTV exists). */
+static int loader_override(const char *name) {
+    return strcmp(name, "__tls_get_addr") == 0;
+}
+
 static const char *machine_name(uint16_t m) {
     switch (m) {
     case EM_X86_64: return "x86_64";
@@ -464,7 +484,12 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
         if (!name[0]) continue;
         {
             void *shim = afw_shim_lookup(name);
-            if (shim) {
+            void *glob = loader_override(name) ? NULL : global_lookup(name, lib);
+            if (glob) {                                 /* another loaded library defines it */
+                symaddr[i] = (uint64_t)(uintptr_t)glob;
+                lib->nimports_linked++;
+                if (verbose > 1) printf("  library  %s\n", name);
+            } else if (shim) {
                 symaddr[i] = (uint64_t)(uintptr_t)shim;
                 lib->nimports_shimmed++;
                 if (verbose > 1) printf("  linked   %s\n", name);
@@ -636,6 +661,102 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
 /* A failed load leaves nothing behind (reviewer 4, #8): no entry in the
  * library list (main's lib is on its stack), no mapping, no TLS module. */
 int afw_loaded_count(void) { return g_nlibs; }
+
+/* DT_NEEDED names of an ELF file on disk (without mapping it). Returns the
+ * count (<= max), or -1. names point into *buf, which the caller frees. */
+static int file_needed(const char *path, unsigned char **buf, const char **names, int max) {
+    size_t n = 0;
+    unsigned char *f = read_file(path, &n);
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)f;
+    const Elf64_Phdr *ph;
+    uint64_t dyn_off = 0, dyn_sz = 0, strtab_va = 0, strtab_off = 0;
+    int i, c = 0;
+    size_t k;
+    *buf = f;
+    if (!f || n < sizeof *eh || memcmp(f, "\x7f" "ELF", 4) != 0 || eh->e_phoff > n ||
+        (size_t)eh->e_phnum * sizeof *ph > n - eh->e_phoff)
+        return -1;
+    ph = (const Elf64_Phdr *)(f + eh->e_phoff);
+    for (i = 0; i < eh->e_phnum; i++)
+        if (ph[i].p_type == PT_DYNAMIC) { dyn_off = ph[i].p_offset; dyn_sz = ph[i].p_filesz; }
+    if (!dyn_off || dyn_off > n || dyn_sz > n - dyn_off) return 0;
+    for (k = 0; k + sizeof(Elf64_Dyn) <= dyn_sz; k += sizeof(Elf64_Dyn)) {
+        const Elf64_Dyn *d = (const Elf64_Dyn *)(f + dyn_off + k);
+        if (d->d_tag == DT_STRTAB) strtab_va = d->d_val;
+    }
+    for (i = 0; i < eh->e_phnum; i++)                    /* vaddr -> file offset */
+        if (ph[i].p_type == PT_LOAD && strtab_va >= ph[i].p_vaddr && strtab_va < ph[i].p_vaddr + ph[i].p_filesz)
+            strtab_off = strtab_va - ph[i].p_vaddr + ph[i].p_offset;
+    if (!strtab_off || strtab_off >= n) return 0;
+    for (k = 0; k + sizeof(Elf64_Dyn) <= dyn_sz && c < max; k += sizeof(Elf64_Dyn)) {
+        const Elf64_Dyn *d = (const Elf64_Dyn *)(f + dyn_off + k);
+        if (d->d_tag == DT_NEEDED && strtab_off + d->d_val < n &&
+            memchr(f + strtab_off + d->d_val, 0, n - strtab_off - d->d_val))
+            names[c++] = (const char *)(f + strtab_off + d->d_val);
+    }
+    return c;
+}
+
+static int already_loaded(const char *name) {
+    int k;
+    const char *base;
+    for (k = 0; k < g_nlibs; k++) {
+        if (g_libs[k]->soname && strcmp(g_libs[k]->soname, name) == 0) return 1;
+        base = strrchr(g_libs[k]->path, '/');
+        if (!base) base = strrchr(g_libs[k]->path, '\\');
+        base = base ? base + 1 : g_libs[k]->path;
+        if (strcmp(base, name) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Find name in the search path: the directories in AFW_LIB_PATH (';' or ':'
+ * separated), then dir. */
+static int find_lib(const char *name, const char *dir, char *out, size_t outsz) {
+    const char *env = getenv("AFW_LIB_PATH");
+    char d[1024];
+    FILE *t;
+    while (env && *env) {
+        size_t l = strcspn(env, ";:");
+        if (l && l < sizeof d) {
+            memcpy(d, env, l); d[l] = 0;
+            snprintf(out, outsz, "%s/%s", d, name);
+            if ((t = fopen(out, "rb")) != NULL) { fclose(t); return 1; }
+        }
+        env += l + (env[l] ? 1 : 0);
+    }
+    snprintf(out, outsz, "%s/%s", dir, name);
+    if ((t = fopen(out, "rb")) != NULL) { fclose(t); return 1; }
+    return 0;
+}
+
+int afw_load_with_deps(const char *path, afw_lib *lib, afw_lib *deps, int maxdeps, int *ndeps, int verbose) {
+    const char *names[AFW_MAX_NEEDED];
+    unsigned char *buf = NULL;
+    char dir[1024], found[1200];
+    const char *slash = strrchr(path, '/');
+    const char *bslash = strrchr(path, '\\');
+    int n, i;
+    if (bslash && (!slash || bslash > slash)) slash = bslash;
+    snprintf(dir, sizeof dir, "%.*s", slash ? (int)(slash - path) : 1, slash ? path : ".");
+    n = file_needed(path, &buf, names, AFW_MAX_NEEDED);
+    for (i = 0; i < n; i++) {                            /* dependencies first (post-order) */
+        if (already_loaded(names[i])) continue;
+        if (!find_lib(names[i], dir, found, sizeof found)) {
+            if (verbose) printf("dependency %s: not found, its symbols come from bionic-win\n", names[i]);
+            continue;
+        }
+        if (*ndeps >= maxdeps) { fprintf(stderr, "error: too many libraries\n"); free(buf); return -1; }
+        if (verbose) printf("\n== dependency %s (of %s)\n", found, path);
+        if (afw_load_with_deps(found, &deps[(*ndeps)++], deps, maxdeps, ndeps, verbose) != 0) {
+            fprintf(stderr, "error: dependency %s failed to load\n", found);
+            free(buf); return -1;
+        }
+    }
+    free(buf);
+    if (verbose && n > 0) printf("\n== %s\n", path);
+    return afw_load(path, lib, verbose);
+}
 
 int afw_load(const char *path, afw_lib *lib, int verbose) {
     int k, rc = load_inner(path, lib, verbose);

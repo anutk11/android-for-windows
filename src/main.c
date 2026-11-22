@@ -445,6 +445,9 @@ int main(int argc, char **argv) {
     afw_lib lib;
     int verbose = 1, rc = 0, strict = 0, min_pads = 0, call_trap = 0;
     const char *preload_fail = NULL;
+    int with_deps = 0;
+    static afw_lib deps[32];
+    int ndeps = 0;
 
     setvbuf(stdout, NULL, _IONBF, 0); /* never lose output on a crash */
     afw_crash_init();
@@ -465,6 +468,7 @@ int main(int argc, char **argv) {
             else if (strcmp(argv[a], "--call-trap") == 0) call_trap = 1;
             else if (strncmp(argv[a], "--min-landing-pads=", 19) == 0) min_pads = atoi(argv[a] + 19);
             else if (strncmp(argv[a], "--preload-fail=", 15) == 0) preload_fail = argv[a] + 15;
+            else if (strcmp(argv[a], "--with-deps") == 0) with_deps = 1;
         }
     }
     if (afw_check_security() != 0) return 1;
@@ -483,7 +487,8 @@ int main(int argc, char **argv) {
         printf("  [ OK ] refused, and nothing left behind (libraries registered: %d)\n", afw_loaded_count());
     }
 
-    if (afw_load(argv[1], &lib, verbose) != 0) {
+    if ((with_deps ? afw_load_with_deps(argv[1], &lib, deps, 32, &ndeps, verbose)
+                   : afw_load(argv[1], &lib, verbose)) != 0) {
         printf("\nLoad failed.\n");
         return 1;
     }
@@ -491,7 +496,7 @@ int main(int argc, char **argv) {
     printf("\nLoaded at %p (%zu KB)\n", (void *)lib.base, lib.size / 1024);
     printf("  relocations applied: %d\n", lib.nrelocs);
     printf("  exports:             %d\n", lib.nexports);
-    printf("  imports linked:      %d\n", lib.nimports_shimmed);
+    printf("  imports linked:      %d (to bionic-win), %d (to other loaded libraries)\n", lib.nimports_shimmed, lib.nimports_linked);
     printf("  imports missing:     %d\n", lib.nimports_missing);
     printf("  weak imports empty:  %d\n", lib.nimports_weak_null);
 
@@ -546,6 +551,14 @@ int main(int argc, char **argv) {
     if (afw_sym(&lib, "afw_rz_safe")) rc |= run_redzone_tests(&lib);
     if (afw_sym(&lib, "afw_tls_worker")) rc |= run_tls_tests(&lib);
     if (afw_sym(&lib, "afw_ie_read_b")) rc |= run_ie_tests(&lib);
+    if (afw_sym(&lib, "afw_deps_check")) {
+        typedef int (SYSV *dfn)(void);
+        printf("\nDependency test (--with-deps):\n");
+        check("the import resolves to the loaded dependency", ((dfn)afw_sym(&lib, "afw_deps_check"))() == 42);
+        check("it was linked to a library, not to bionic-win", lib.nimports_linked >= 1);
+        printf("%s\n", g_failed ? "DEPS TEST FAILED" : "DEPS TEST PASSED");
+        rc |= g_failed;
+    }
     if (afw_sym(&lib, "afw_ifunc_call")) {
         typedef int (SYSV *ifn)(void);
         printf("\nIFUNC test (resolver runs after patching, reads the stack guard):\n");

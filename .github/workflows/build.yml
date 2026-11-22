@@ -37,6 +37,10 @@ jobs:
             -Wl,--pack-dyn-relocs=none -o out/libtls_ie_test.so test/tls_ie_test.c
           "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 -fstack-protector-all \
             -Wl,--pack-dyn-relocs=none -o out/libifunc_test.so test/ifunc_test.c
+          "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 -nostdlib -Wl,-soname,libdeps_base.so \
+            -o out/libdeps_base.so test/deps_base.c
+          "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 -nostdlib -Lout -ldeps_base \
+            -o out/libdeps_user.so test/deps_user.c
           "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 \
             -Wl,--pack-dyn-relocs=none -o out/libflow_test.so test/flow_test.c
           echo "--- fs:[reg] forms in libtls_ie_test.so"
@@ -161,6 +165,7 @@ jobs:
           out/afw-asan out/libredzone_test.so
           out/afw-asan out/libtls_test.so
           out/afw-asan out/libifunc_test.so
+          out/afw-asan out/libdeps_user.so --with-deps
           # a refused library (PT_TLS + fs:[reg], refused on Linux) leaves nothing behind
           out/afw-asan out/libtls_test.so --preload-fail=out/libtls_ie_test.so | tee out/preload.txt
           grep -q "refused, and nothing left behind" out/preload.txt
@@ -199,6 +204,19 @@ jobs:
       - name: Run G1 syscall-patching tests on Windows
         shell: cmd
         run: out\afw-loader.exe out\libsyscall_test.so
+      - name: "Dependencies: a library's import resolves to its loaded DT_NEEDED library"
+        shell: cmd
+        run: out\afw-loader.exe out\libdeps_user.so --with-deps
+      - name: "G1: extract the real bionic on this Windows runner (never uploaded)"
+        shell: bash
+        run: python -I tools/fetch_bionic.py out/bionic
+      - name: "G1 probe: load the real libc.so for real (constructors run) - informational"
+        continue-on-error: true
+        shell: cmd
+        run: |
+          out\afw-loader.exe out\bionic\libc.so --with-deps > out\libc-run.txt 2>&1
+          echo exit code %errorlevel% >> out\libc-run.txt
+          type out\libc-run.txt
       - name: "VMA layer: mmap / munmap / mprotect / madvise on Windows"
         shell: cmd
         run: |

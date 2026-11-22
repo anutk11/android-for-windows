@@ -47,6 +47,7 @@ typedef struct afw_lib_s {
     /* report */
     int nrelocs;
     int nimports_shimmed;
+    int nimports_linked;        /* resolved against another loaded library */
     int nimports_missing;
     int nimports_weak_null;
     int nexports;
@@ -73,6 +74,11 @@ int afw_gate_ok(const afw_lib *lib);
 /* Load, relocate, link against bionic-win and run constructors.
  * Returns 0 on success; prints the reason on failure. */
 int afw_load(const char *path, afw_lib *lib, int verbose);
+/* Load path after its DT_NEEDED libraries (found next to it or in
+ * AFW_LIB_PATH), dependencies first; each one's imports resolve against the
+ * libraries loaded before it, then bionic-win. deps[] receives the loaded
+ * dependencies (*ndeps counts them). */
+int afw_load_with_deps(const char *path, afw_lib *lib, afw_lib *deps, int maxdeps, int *ndeps, int verbose);
 
 /* Find an exported symbol (like dlsym). */
 void *afw_sym(const afw_lib *lib, const char *name);
