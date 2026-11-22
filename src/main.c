@@ -332,6 +332,17 @@ static int run_tls_tests(const afw_lib *lib) {
     check("aligned(64) variable is 64-byte aligned", (aligned() & 63) == 0);
     check("aligned variable has its initial value", first() == 7);
     check("general-dynamic address lies below tp", (uintptr_t)gd() < (uintptr_t)afw_tls_block());
+    {   /* what bionic's __errno does (measured): [[tp] + 8] + 0x300; gettid reads +0x10 */
+        uintptr_t *tp = afw_tls_block();
+        unsigned char *pti = (unsigned char *)tp[TLS_SLOT_THREAD_ID];
+        int32_t tid;
+        check("tp[1] points at this thread's pthread_internal_t, inside its allocation",
+              pti && (uintptr_t)pti > (uintptr_t)tp && tp[TLS_SLOT_BIONIC_TLS] == (uintptr_t)(pti + AFW_BIONIC_TLS_OFF));
+        memcpy(&tid, pti + AFW_PTI_TID, 4);
+        check("pthread_internal_t holds the thread id where gettid reads it", tid != 0);
+        *(volatile int *)(pti + 0x300) = 34;
+        check("errno, written the way bionic writes it, reads back", *(volatile int *)(pti + 0x300) == 34);
+    }
 #if defined(_WIN32)
     check("initial-exec (fs:[0] + TPOFF64) == general-dynamic", ie() == gd());
     check("two threads, initial-exec: private copies", run_tls_threads(worker, 1, 0));
@@ -358,6 +369,13 @@ static int run_tls_tests(const afw_lib *lib) {
         check("... the same through afw_tls_init(): fails, then a retry really sets the thread up",
               run_fail_init_thread(1));
         check("a rebuild that succeeds still works afterwards", afw_tls_thread_rebuild() == 0 && *gd() == before);
+        {   /* the old allocation is freed by now: slots 1 and 9 must name the new one */
+            uintptr_t *tp = afw_tls_block();
+            unsigned char *pti = (unsigned char *)tp[TLS_SLOT_THREAD_ID];
+            check("... tp[1] moved with the block (not into the freed one) and errno carried over",
+                  (uintptr_t)pti > (uintptr_t)tp && *(volatile int *)(pti + 0x300) == 34 &&
+                  afw_tls_published_slot(TLS_SLOT_THREAD_ID) == (uintptr_t)pti);
+        }
     }
     {
         afw_tls_index bad;

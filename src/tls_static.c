@@ -50,24 +50,30 @@ uint64_t afw_tls_static_off(int mod) {
     return (mod >= 1 && mod <= g_layout.nmod) ? g_layout.off[mod - 1] : 0;
 }
 
-uintptr_t *afw_tls_static_alloc(void **out) {
+uintptr_t *afw_tls_static_alloc(void **out, unsigned char **area) {
     unsigned char *block, *tp;
-    *out = NULL;
+    size_t total;
     int m;
+    *out = NULL; *area = NULL;
     if (!g_finished && afw_tls_layout_finish(&g_layout) != 0) return NULL;
+    /* the bionic thread area (pthread_internal_t, bionic_tls) shares the
+     * allocation: it is released with the block, by the same FLS/key callback */
+    if (g_layout.alloc_size > SIZE_MAX - AFW_THREAD_AREA_SIZE) return NULL;
+    total = (size_t)g_layout.alloc_size + AFW_THREAD_AREA_SIZE;
 #if defined(_WIN32)
-    block = (unsigned char *)VirtualAlloc(NULL, (SIZE_T)g_layout.alloc_size, MEM_RESERVE | MEM_COMMIT,
+    block = (unsigned char *)VirtualAlloc(NULL, (SIZE_T)total, MEM_RESERVE | MEM_COMMIT,
                                           PAGE_READWRITE);   /* 64KB aligned, zeroed */
 #else
     {
         void *p = NULL;
-        if (posix_memalign(&p, AFW_TLS_MAX_ALIGN, (size_t)g_layout.alloc_size) != 0) p = NULL;
-        if (p) memset(p, 0, (size_t)g_layout.alloc_size);
+        if (posix_memalign(&p, AFW_TLS_MAX_ALIGN, total) != 0) p = NULL;
+        if (p) memset(p, 0, total);
         block = (unsigned char *)p;
     }
 #endif
     if (!block) return NULL;
     *out = block;
+    *area = block + g_layout.alloc_size;       /* alloc_size is page-aligned */
     tp = block + g_layout.tp_off;
     for (m = 0; m < g_layout.nmod; m++)   /* .tdata copied, .tbss already zero */
         if (g_seg[m].p_filesz) memcpy(tp - g_layout.off[m], g_image[m], (size_t)g_seg[m].p_filesz);

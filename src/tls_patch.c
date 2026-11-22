@@ -19,6 +19,7 @@
 
 static _Thread_local uintptr_t *t_block;   /* tp: bionic slots, module TLS below it */
 static _Thread_local void *t_alloc;       /* the allocation that holds t_block */
+static _Thread_local unsigned char *t_area; /* bionic thread area, inside t_alloc */
 static uintptr_t g_guard = 0x5afe5afe5afe5afeULL;
 
 uintptr_t *afw_tls_block(void) { return t_block; }
@@ -186,7 +187,9 @@ static int publish(uintptr_t *blk, void *alloc) {   /* one step only: nothing to
     return pthread_setspecific(g_key, alloc) == 0 ? 0 : -1;
 }
 uintptr_t afw_tls_published_slot(int i) { return t_block ? t_block[i] : 0; }   /* fs: is native here */
-static uintptr_t thread_id(void) { return 0; }
+#include <sys/syscall.h>
+#include <unistd.h>
+static uintptr_t thread_id(void) { return (uintptr_t)syscall(SYS_gettid); }
 static int g_key_ready;
 int afw_tls_init(void) {   /* the key once; the thread's block until it succeeds */
     if (!g_key_ready) {
@@ -199,21 +202,32 @@ int afw_tls_init(void) {   /* the key once; the thread's block until it succeeds
 
 /* The thread's state changes only after publishing succeeded (reviewer 2,
  * PR #6 A1): on failure the new block is freed and nothing else moves. */
+/* Slots that point into the thread area: bionic dereferences them in memory
+ * (__errno: [[tp] + 8] + 0x300, measured), so they hold pointers, never ids. */
+static void point_into_area(uintptr_t *blk, unsigned char *area) {
+    blk[TLS_SLOT_THREAD_ID] = (uintptr_t)(area + AFW_PTHREAD_INTERNAL_OFF);
+    blk[TLS_SLOT_BIONIC_TLS] = (uintptr_t)(area + AFW_BIONIC_TLS_OFF);
+}
+
 int afw_tls_thread_init(void) {
     void *alloc;
+    unsigned char *area;
     uintptr_t *blk;
+    int32_t tid;
     if (t_block) return 0;
-    blk = afw_tls_static_alloc(&alloc);
+    blk = afw_tls_static_alloc(&alloc, &area);
     if (!blk) { fprintf(stderr, "[tls] cannot allocate the thread's TLS block\n"); return -1; }
     blk[TLS_SLOT_SELF] = (uintptr_t)blk;
-    blk[TLS_SLOT_THREAD_ID] = thread_id();
+    point_into_area(blk, area);
+    tid = (int32_t)thread_id();
+    memcpy(area + AFW_PTHREAD_INTERNAL_OFF + AFW_PTI_TID, &tid, 4);
     blk[TLS_SLOT_STACK_GUARD] = g_guard;
     if (publish(blk, alloc) != 0) {
         fprintf(stderr, "[tls] cannot publish the thread's TLS block\n");
         afw_tls_static_free(alloc);
         return -1;
     }
-    t_block = blk; t_alloc = alloc;
+    t_block = blk; t_alloc = alloc; t_area = area;
     return 0;
 }
 
@@ -221,17 +235,25 @@ int afw_tls_thread_init(void) {
  * module data is taken fresh from the .tdata images, only the slots carry over. */
 int afw_tls_thread_rebuild(void) {
     void *new_alloc;
-    uintptr_t *nb = afw_tls_static_alloc(&new_alloc);
+    unsigned char *new_area;
+    uintptr_t *nb = afw_tls_static_alloc(&new_alloc, &new_area);
     if (!nb) return -1;
-    if (t_block) memcpy(nb, t_block, BIONIC_TLS_SLOTS * sizeof *nb);
-    else { nb[TLS_SLOT_THREAD_ID] = thread_id(); nb[TLS_SLOT_STACK_GUARD] = g_guard; }
+    if (t_block) {
+        memcpy(nb, t_block, BIONIC_TLS_SLOTS * sizeof *nb);
+        memcpy(new_area, t_area, AFW_THREAD_AREA_SIZE);     /* errno, tid... carry over */
+    } else {
+        int32_t tid = (int32_t)thread_id();
+        memcpy(new_area + AFW_PTHREAD_INTERNAL_OFF + AFW_PTI_TID, &tid, 4);
+        nb[TLS_SLOT_STACK_GUARD] = g_guard;
+    }
     nb[TLS_SLOT_SELF] = (uintptr_t)nb;
+    point_into_area(nb, new_area);    /* never into the old allocation, which is freed below */
     if (publish(nb, new_alloc) != 0) {   /* undone completely: the old block is still the published one */
         afw_tls_static_free(new_alloc);
         fprintf(stderr, "[tls] cannot publish the rebuilt TLS block; the old one stays\n");
         return -1;
     }
     afw_tls_static_free(t_alloc);    /* only now: nothing names the old block any more */
-    t_block = nb; t_alloc = new_alloc;
+    t_block = nb; t_alloc = new_alloc; t_area = new_area;
     return 0;
 }
