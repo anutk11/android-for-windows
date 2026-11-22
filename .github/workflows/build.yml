@@ -147,13 +147,14 @@ jobs:
       - name: Build loader and VMA tests with ASan + UBSan
         run: |
           OUTBIN=out/afw-asan EXTRA_CFLAGS="-g -fsanitize=address,undefined -fno-sanitize-recover=undefined" bash tools/build_linux.sh
-          cc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall \
+          cc -g -O1 -DAFW_TEST -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall \
              -o out/vma_test tools/vma_test.c src/vma.c src/syscall.c src/platform.c
           cc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall -Wextra \
              -o out/tls_layout_test tools/tls_layout_test.c src/tls_layout.c
       - name: Run all tests under ASan
         run: |
           set -e
+          if nm out/afw-asan | grep -q afw_vma_test_fail_os; then echo "fault injection present in non-test loader"; exit 1; fi
           out/vma_test
           out/tls_layout_test
           out/afw-asan out/libhello.so
@@ -202,7 +203,7 @@ jobs:
       - name: "VMA layer: mmap / munmap / mprotect / madvise on Windows"
         shell: cmd
         run: |
-          clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Fe:out\vma_test.exe /Foout\ tools\vma_test.c src\vma.c src\syscall.c src\platform.c
+          clang-cl /nologo /O2 /W3 /DAFW_TEST /D_CRT_SECURE_NO_WARNINGS /Fe:out\vma_test.exe /Foout\ tools\vma_test.c src\vma.c src\syscall.c src\platform.c
           out\vma_test.exe
       - name: "C++ exceptions: every landing pad found, nothing unproven (static)"
         shell: cmd
