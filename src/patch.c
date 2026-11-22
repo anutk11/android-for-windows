@@ -71,6 +71,7 @@ static int function_uses_red_zone(ZydisDecoder *dec, uint64_t s, uint64_t e) {
     ZydisDecodedInstruction ins;
     ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
     ZydisRegister copies[16];
+    int64_t max_sub = 0;
     int ncopies = 0, pass;
     for (pass = 0; pass < 2; pass++) {
         uint64_t a = s;
@@ -87,12 +88,17 @@ static int function_uses_red_zone(ZydisDecoder *dec, uint64_t s, uint64_t e) {
                      (ins.mnemonic == ZYDIS_MNEMONIC_LEA && ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
                       ops[1].mem.base == ZYDIS_REGISTER_RSP)) && ncopies < 16)
                     copies[ncopies++] = reg64(ops[0].reg.value);
+                /* frame allocation: sub rsp, imm */
+                if (ins.mnemonic == ZYDIS_MNEMONIC_SUB && ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                    ops[0].reg.value == ZYDIS_REGISTER_RSP && ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+                    (int64_t)ops[1].imm.value.s > max_sub)
+                    max_sub = (int64_t)ops[1].imm.value.s;
             } else {
                 for (i = 0; i < ins.operand_count_visible; i++) {
                     if (ops[i].type != ZYDIS_OPERAND_TYPE_MEMORY || ops[i].mem.disp.value >= 0) continue;
                     if (ops[i].mem.base == ZYDIS_REGISTER_RSP) return 1;
                     for (k = 0; k < ncopies; k++)
-                        if (ops[i].mem.base == copies[k]) return 1;
+                        if (ops[i].mem.base == copies[k] && -ops[i].mem.disp.value > max_sub) return 2;
                 }
             }
             a += ins.length;
@@ -119,6 +125,72 @@ static void dump_ins(const unsigned char *p, const ZydisDecodedInstruction *ins,
     fprintf(stderr, "\n             decoded: %s\n", text);
 }
 
+/*
+ * Control-flow reachability inside one function: 1 marks an instruction
+ * start that some path from the entry reaches. Direct branches are followed;
+ * if the function has an indirect jump (switch tables), the bytes still
+ * unvisited are swept linearly as well, so no real code is missed.
+ */
+static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t size) {
+    ZydisDecodedInstruction ins;
+    ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+    unsigned char *map = (unsigned char *)calloc(size ? size : 1, 1);
+    size_t *work = NULL, nwork = 0, capwork = 0, off;
+    int indirect = 0;
+    VEC_PUSH(work, nwork, capwork, (size_t)0);
+    while (nwork) {
+        off = work[--nwork];
+        while (off < size && map[off] != 1) {
+            int k, stop = 0;
+            if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, base + off, (ZyanUSize)(size - off), &ins, ops))) break;
+            map[off] = 1;
+            if (ins.meta.category == ZYDIS_CATEGORY_COND_BR || ins.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
+                for (k = 0; k < ins.operand_count_visible; k++) {
+                    ZyanU64 t;
+                    if (ops[k].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && ops[k].imm.is_relative &&
+                        ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&ins, &ops[k], (ZyanU64)(uintptr_t)(base + off), &t)) &&
+                        t >= (ZyanU64)(uintptr_t)base && t < (ZyanU64)(uintptr_t)(base + size))
+                        VEC_PUSH(work, nwork, capwork, (size_t)(t - (ZyanU64)(uintptr_t)base));
+                    else if (ops[k].type != ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+                             ins.meta.category == ZYDIS_CATEGORY_UNCOND_BR)
+                        indirect = 1;
+                }
+                if (ins.meta.category == ZYDIS_CATEGORY_UNCOND_BR) stop = 1;
+            }
+            if (ins.meta.category == ZYDIS_CATEGORY_RET || ins.mnemonic == ZYDIS_MNEMONIC_INT3 ||
+                ins.mnemonic == ZYDIS_MNEMONIC_UD2 || ins.mnemonic == ZYDIS_MNEMONIC_HLT)
+                stop = 1;
+            off += ins.length;
+            if (stop) break;
+        }
+    }
+    if (indirect) {
+        /* linear sweep of the gaps: code reached only through a jump table */
+        off = 0;
+        while (off < size) {
+            if (map[off] == 1) {
+                if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, base + off, (ZyanUSize)(size - off), &ins, ops)))
+                    off += ins.length;
+                else off++;
+                continue;
+            }
+            if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, base + off, (ZyanUSize)(size - off), &ins, ops))) {
+                map[off] = 1;
+                off += ins.length;
+            } else off++;
+        }
+    }
+    free(work);
+    return map;
+}
+
+static int has_fs_operand(const ZydisDecodedInstruction *ins, const ZydisDecodedOperand *ops) {
+    int k;
+    for (k = 0; k < ins->operand_count_visible; k++)
+        if (ops[k].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[k].mem.segment == ZYDIS_REGISTER_FS) return 1;
+    return 0;
+}
+
 int afw_patch_code(const afw_code_range *ranges, int nranges,
                    unsigned char *stub_area, size_t stub_size,
                    const afw_patch_ctx *c, afw_patch_report *rep, int verbose) {
@@ -134,6 +206,7 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
     uint64_t entry = (uint64_t)(uintptr_t)afw_syscall_entry;
     int r, fatal = 0;
     char where[160];
+    unsigned char **maps = (unsigned char **)calloc(nranges ? (size_t)nranges : 1, sizeof *maps);
 
     memset(rep, 0, sizeof *rep);
     ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
@@ -145,9 +218,15 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
         hist h[3] = {{0}};
         int prev_mov_eax = 0;
         uint32_t prev_imm = 0;
+        unsigned char *map = NULL;
+        if (c && c->ranges_are_functions) map = maps[r] = reach_map(&dec, p, ranges[r].size);
         while (p < end) {
             uint64_t ip = (uint64_t)(uintptr_t)p;
             int k, movable;
+            if (map && map[p - ranges[r].addr] != 1) {   /* not reachable: never decode as code */
+                p++; prev_mov_eax = 0; memset(h, 0, sizeof h);
+                continue;
+            }
             if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, p, (ZyanUSize)(end - p), &ins, ops))) {
                 p++; prev_mov_eax = 0; memset(h, 0, sizeof h);
                 continue;
@@ -254,8 +333,9 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
             fprintf(stderr, "  [patch] REFUSED syscall at %s: function boundaries unknown\n", where);
             continue;
         }
-        if (function_uses_red_zone(&dec, fs_, fe_)) {
+        if ((r = function_uses_red_zone(&dec, fs_, fe_)) != 0) {
             rep->sys_refused_redzone++;
+            if (r == 1) rep->redzone_direct++; else rep->redzone_via_copy++;
             fprintf(stderr, "  [patch] REFUSED syscall at %s: its function may use the red zone\n", where);
             continue;
         }
@@ -300,6 +380,47 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
         if (s->form == 'A') rep->sys_patched++; else rep->sys_patched_moved++;
         if (verbose > 1) printf("  [patch] syscall at %s: form %c\n", where, s->form);
     }
+
+    /* Audit: a plain linear sweep of the executable segments finds every
+     * byte pattern that LOOKS like a syscall or an fs: access. Each one must
+     * be either handled above, unreachable (left alone), or reported. */
+    if (c && c->ranges_are_functions) {
+        int g;
+        for (g = 0; g < c->nsegs; g++) {
+            unsigned char *p = c->segs[g].addr, *end = p + c->segs[g].size;
+            while (p < end) {
+                int is_sys, is_fs;
+                if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, p, (ZyanUSize)(end - p), &ins, ops))) { p++; continue; }
+                is_sys = ins.mnemonic == ZYDIS_MNEMONIC_SYSCALL;
+                is_fs = has_fs_operand(&ins, ops);
+                if (is_sys || is_fs) {
+                    int lo = 0, hi = nranges, found = -1;
+                    while (lo < hi) {   /* ranges are sorted by address (.eh_frame_hdr order) */
+                        int m = (lo + hi) / 2;
+                        if (ranges[m].addr > p) hi = m;
+                        else if (ranges[m].addr + ranges[m].size <= p) lo = m + 1;
+                        else { found = m; break; }
+                    }
+                    if (found < 0) {
+                        if (is_sys) {
+                            rep->sys_outside_functions++;
+                            describe(c, p, where, sizeof where);
+                            fprintf(stderr, "  [audit] WARNING: syscall bytes at %s, outside every .eh_frame function "
+                                            "(data, or code without unwind info): not touched\n", where);
+                        } else rep->fs_outside_functions++;
+                    } else if (maps[found] && maps[found][p - ranges[found].addr] != 1) {
+                        rep->unreachable_ignored++;
+                        describe(c, p, where, sizeof where);
+                        fprintf(stderr, "  [audit] %s-looking bytes at %s are inside a function but never executed: "
+                                        "left untouched\n", is_sys ? "syscall" : "fs:", where);
+                    }
+                }
+                p += ins.length;
+            }
+        }
+    }
+    for (r = 0; r < nranges; r++) free(maps[r]);
+    free(maps);
 
     free(targets); free(sites);
     if (fatal) return -1;

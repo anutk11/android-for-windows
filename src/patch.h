@@ -16,13 +16,19 @@
  * Stubs live in a reserve right after the library (one allocation), so every
  * call rel32 reaches; running out of room or range is a load error.
  *
+ * Only instructions that control flow can reach from a function's entry are
+ * considered (direct branches followed; functions with indirect jumps get
+ * their remaining bytes swept linearly). Bytes that merely look like a
+ * syscall or an fs: access but are never executed are left untouched.
+ *
  * A site is REFUSED (left untouched, reported loudly) unless it is provably
  * safe:
  *   - no branch may land inside the bytes being replaced;
  *   - its function must be known (from .eh_frame, else sized symbols);
  *   - nothing in the whole function may touch memory below rsp: no [rsp-N],
- *     and no [reg-N] through a register that was given a copy of rsp. The
- *     stub's call writes at [rsp-8], i.e. into the System V red zone.
+ *     and no [reg-N] through a register holding a copy of rsp (frame
+ *     pointer) unless N is within what "sub rsp, K" allocated (N <= K).
+ *     The stub's call writes at [rsp-8], i.e. into the System V red zone.
  *
  * fs: accesses: "fs:[disp32]" bionic TLS slots -> "gs:[TEB TlsSlot]"
  * (Windows only). "fs:[reg]" forms (ELF TLS) are reported with their bytes,
@@ -47,6 +53,12 @@ typedef struct {
     int sys_refused_redzone;
     int sys_refused_unknown;   /* function bounds unknown, or nothing movable */
     int stubs;
+    /* audit: candidate bytes found by a plain linear sweep of the segments */
+    int unreachable_ignored;   /* inside a function, but no path reaches them */
+    int sys_outside_functions; /* syscall in executable bytes with no .eh_frame entry */
+    int fs_outside_functions;
+    int redzone_direct;        /* refusals by reason: [rsp-N] */
+    int redzone_via_copy;      /* [reg-N] beyond what sub rsp allocated */
 } afw_patch_report;
 
 typedef struct { unsigned char *addr; size_t size; } afw_code_range;
@@ -58,6 +70,8 @@ typedef struct {
     const void *ctx;
     intptr_t bias;          /* to print library-relative offsets */
     const char *name;       /* library name for messages */
+    int ranges_are_functions; /* ranges come from .eh_frame: follow control flow */
+    const afw_code_range *segs; int nsegs; /* executable segments, for the audit */
 } afw_patch_ctx;
 
 /* Returns 0 on success, 1 if some sites were refused, -1 on a fatal error

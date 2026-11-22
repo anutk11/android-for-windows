@@ -128,10 +128,20 @@ int64_t afw_syscall_dispatch(int64_t nr, int64_t *a) {
     switch (nr) {
     case 1:   return sys_write(a[0], (const void *)(uintptr_t)a[1], (uint64_t)a[2]);
     case 39:  return sys_getpid();
-    case 60:  /* exit */
-    case 231: /* exit_group */
+    case 60:  /* exit: ends only the calling thread */
         fflush(stdout);
+#if defined(_WIN32)
+        ExitThread((DWORD)a[0]);
+#else
+        _exit((int)a[0]);   /* host test builds have no emulated threads yet */
+#endif
+    case 231: /* exit_group: ends the whole process */
+        fflush(stdout);
+#if defined(_WIN32)
+        ExitProcess((UINT)a[0]);
+#else
         exit((int)a[0]);
+#endif
     default:
         if (nr >= 0 && nr < AFW_MAX_SYSCALL && g_unimplemented[nr]++ == 0)
             fprintf(stderr, "[syscall] %lld not implemented, returning -ENOSYS\n", (long long)nr);

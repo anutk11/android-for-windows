@@ -143,6 +143,16 @@ static int run_syscall_tests(const afw_lib *lib) {
         }
     }
 
+    {
+        static const unsigned char want[16] = {0xb8, 0x27, 0, 0, 0, 0x0f, 0x05,
+                                               0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0, 0, 0};
+        const unsigned char *b = (const unsigned char *)afw_sym(lib, "afw_fake_site_bytes");
+        getpid_fn fake = (getpid_fn)afw_sym(lib, "afw_fake_site");
+        check("never-executed syscall/fs: look-alikes left byte for byte", b && memcmp(b, want, 16) == 0);
+        check("...and counted by the audit as unreachable", lib->patch.unreachable_ignored >= 2);
+        check("the function around them still works", fake && fake() == 7);
+    }
+
     printf("\n");
     afw_syscall_report();
     printf("\n%s\n", g_failed ? "G1 SYSCALL TESTS FAILED" : "G1 SYSCALL TESTS PASSED");
@@ -173,6 +183,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     if (argc > 2 && strcmp(argv[2], "-v") == 0) verbose = 2;
+    if (argc > 2 && strcmp(argv[2], "--patch-report") == 0) afw_load_patch_only = 1;
     if (afw_check_security() != 0) return 1;
     if (afw_tls_init() != 0) return 1;
 
@@ -193,6 +204,22 @@ int main(int argc, char **argv) {
            lib.patch.sys_refused_redzone, lib.patch.sys_refused_unknown);
     printf("  fs: accesses patched:  %d (fs:[reg]: %d real, %d data)\n", lib.patch.fs_patched,
            lib.patch.fs_reg_in_func, lib.patch.fs_reg_outside);
+
+    printf("  audit: %d unreachable look-alikes left alone; outside .eh_frame: %d syscall, %d fs:\n",
+           lib.patch.unreachable_ignored, lib.patch.sys_outside_functions, lib.patch.fs_outside_functions);
+    if (lib.patch.sys_refused_redzone)
+        printf("  red zone refusals: %d [rsp-N], %d [frame reg - N] beyond sub rsp\n",
+               lib.patch.redzone_direct, lib.patch.redzone_via_copy);
+    if (afw_load_patch_only) {
+        int total = lib.patch.sys_patched + lib.patch.sys_patched_moved + lib.patch.sys_refused_branch +
+                    lib.patch.sys_refused_redzone + lib.patch.sys_refused_unknown;
+        printf("\nPATCH REPORT %s: %d syscall sites: %d patched (A), %d patched (B), refused %d "
+               "(branch %d, red zone %d, unknown %d); fs:[disp32] %d patched\n",
+               lib.soname ? lib.soname : argv[1], total, lib.patch.sys_patched, lib.patch.sys_patched_moved,
+               total - lib.patch.sys_patched - lib.patch.sys_patched_moved, lib.patch.sys_refused_branch,
+               lib.patch.sys_refused_redzone, lib.patch.sys_refused_unknown, lib.patch.fs_patched);
+        return 0;
+    }
 
     if (afw_sym(&lib, "afw_add")) rc = run_m0_tests(&lib);
     if (afw_sym(&lib, "afw_sys_getpid")) rc |= run_syscall_tests(&lib);

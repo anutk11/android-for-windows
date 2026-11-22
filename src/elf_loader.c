@@ -24,6 +24,8 @@
 
 typedef SYSV void (*init_fn)(void);
 
+int afw_load_patch_only;
+
 #define MAX_LIBS 64
 static afw_lib *g_libs[MAX_LIBS];
 static int g_nlibs;
@@ -167,6 +169,7 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
     uint64_t lo = UINT64_MAX, hi = 0;
     Elf64_Phdr dyn_copy, relro_copy;     /* copies: the file buffer is freed early */
     uint64_t eh_hdr_vaddr = 0;
+    int skip_relocs = 0;
     Elf64_Phdr *dyn_ph = NULL, *relro_ph = NULL;
     const uint32_t *hash = NULL, *gnu_hash = NULL;
     const Elf64_Rela *rela = NULL, *jmprel = NULL;
@@ -224,8 +227,11 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
             relro_copy = ph[i];
             relro_ph = &relro_copy;
         } else if (ph[i].p_type == PT_TLS) {
-            fprintf(stderr, "error: thread-local storage (PT_TLS) not supported yet\n");
-            free(file); return -1;
+            if (!afw_load_patch_only) {
+                fprintf(stderr, "error: thread-local storage (PT_TLS) not supported yet\n");
+                free(file); return -1;
+            }
+            fprintf(stderr, "note: PT_TLS present (ignored in measurement mode)\n");
         }
     }
     if (lo == UINT64_MAX || !dyn_ph) {
@@ -303,6 +309,7 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
                 free(pageprot); return -1;
             case DT_ANDROID_REL:
             case DT_ANDROID_RELA:
+                if (afw_load_patch_only) { skip_relocs = 1; break; }
                 fprintf(stderr, "error: Android packed relocations (APS2) not supported yet.\n"
                                 "       Rebuild with -Wl,--pack-dyn-relocs=none\n");
                 free(pageprot); return -1;
@@ -363,6 +370,10 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
     }
 
     /* 5. Relocate ---------------------------------------------------- */
+    if (skip_relocs) {
+        fprintf(stderr, "note: packed relocations present: relocation skipped (measurement mode)\n");
+        relr = NULL; rela = NULL; jmprel = NULL;
+    }
     if (relr) apply_relr(lib, relr, relrsz / 8);
     if (rela && apply_rela(lib, rela, relasz / sizeof(Elf64_Rela), symaddr) != 0) {
         free(symaddr); free(pageprot); return -1;
@@ -379,10 +390,12 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
          * fs: access or a syscall and be "patched" into garbage. Fallback,
          * when there is no .eh_frame_hdr: whole executable segments, where
          * patch.c still requires known function bounds before changing bytes. */
-        afw_code_range *cr;
+        afw_code_range *cr, segs[8];
+        int nsegs = 0, have_funcs;
         unsigned char **fstart;
         size_t *fsize;
         int ncr = afw_func_list(lib, &fstart, &fsize), k;
+        have_funcs = ncr > 0;
         if (ncr > 0) {
             cr = (afw_code_range *)malloc((size_t)ncr * sizeof *cr);
             for (k = 0; k < ncr; k++) { cr[k].addr = fstart[k]; cr[k].size = fsize[k]; }
@@ -399,9 +412,23 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
             }
         }
         free(fstart); free(fsize);
+        {
+            int nseg = 0;
+            for (i = 0; i < npages && nseg < 8;) {
+                size_t j = i;
+                if (!(pageprot[i] & PF_X)) { i++; continue; }
+                while (j < npages && (pageprot[j] & PF_X)) j++;
+                segs[nseg].addr = lib->base + i * AFW_PAGE_SIZE;
+                segs[nseg].size = (j - i) * AFW_PAGE_SIZE;
+                nseg++;
+                i = j;
+            }
+            nsegs = nseg;
+        }
         if (verbose) printf("Code:       %d %s decoded\n", ncr, lib->eh_frame_hdr ? "functions (.eh_frame)" : "segments (no .eh_frame_hdr)");
         afw_patch_ctx pc;
         pc.bounds = patch_bounds; pc.ctx = lib; pc.bias = lib->bias; pc.name = lib->soname ? lib->soname : path;
+        pc.ranges_are_functions = have_funcs; pc.segs = segs; pc.nsegs = nsegs;
         if (afw_patch_code(cr, ncr, lib->stub_area, AFW_STUB_RESERVE, &pc, &lib->patch, verbose) < 0) {
             fprintf(stderr, "error: could not patch %s safely; refusing to run it\n", path);
             free(cr); free(pageprot); return -1;
@@ -431,6 +458,8 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
     }
     free(pageprot);
     afw_flush_icache(lib->base, lib->size);
+
+    if (afw_load_patch_only) return 0;
 
     /* 7. Constructors ------------------------------------------------ */
     if (verbose) printf("Running %zu constructor(s)...\n",

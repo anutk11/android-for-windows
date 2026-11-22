@@ -76,3 +76,20 @@ long afw_sys_getpid_rax(void) {
     __asm__ volatile("mov $39, %%rax\n\tsyscall" : "=a"(r) : : "rcx", "r11", "memory");
     return r;
 }
+
+/*
+ * NEGATIVE test (reviewer 2): inside this function's .eh_frame range are
+ * bytes that look exactly like "mov eax, 39; syscall" and an fs:[0x28] load,
+ * but a jmp skips them: they are never executed. The loader must leave them
+ * byte for byte unchanged.
+ */
+__attribute__((naked)) long afw_fake_site(void) {
+    __asm__ volatile(
+        "jmp 1f\n\t"
+        ".globl afw_fake_site_bytes\n"
+        "afw_fake_site_bytes:\n\t"
+        ".byte 0xb8, 0x27, 0x00, 0x00, 0x00, 0x0f, 0x05\n\t"                   /* mov eax,39; syscall */
+        ".byte 0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00\n"          /* mov rax, fs:[0x28] */
+        "1:\tmov $7, %eax\n\t"
+        "ret");
+}

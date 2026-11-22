@@ -45,6 +45,11 @@ typedef struct afw_lib_s {
     int nexports;
 } afw_lib;
 
+/* Measurement mode: map, link and patch a library but never run it
+ * (no constructors; relocation formats we do not support yet are skipped
+ * with a warning). Used to measure patching on real Android libraries. */
+extern int afw_load_patch_only;
+
 /* Load, relocate, link against bionic-win and run constructors.
  * Returns 0 on success; prints the reason on failure. */
 int afw_load(const char *path, afw_lib *lib, int verbose);
