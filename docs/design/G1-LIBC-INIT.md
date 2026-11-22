@@ -63,15 +63,35 @@ linker's `constexpr` constructor leaves. On top of that:
 NT_GNU_BUILD_ID is the pinned one, and refuses any other. A different build would read
 and write the wrong fields.
 
+## Where it stands now
+
+With the TCB fixed (below) and `writev` in place, the constructors no longer crash. libc
+aborts on purpose and says why:
+
+```
+libc: WriteProtected mprotect 1 failed: Out of memory
+```
+
+`afw_mprotect` does not know the pages of a library the loader mapped (issue #12,
+VMA extents, reviewer 4). This is the only blocker left before the constructors finish.
+
+### The TCB (done, measured)
+
+`__errno` is `[[fs:0] + 8] + 0x300`: libc reads slot 1 **through memory** and expects
+a pointer. Slot 1 used to hold the Windows thread id (0x230c), so errno was written to
+0x260c. Each thread's TLS allocation now also holds a zeroed bionic thread area:
+
+- pthread_internal_t at `tp[1]`, with the tid at +0x10 (read by `gettid`);
+- bionic_tls at `tp[9]`.
+
+The area is freed together with the block. When the TLS layout closes, both slots are
+re-pointed into the new allocation. libc uses only three fs: displacements: `fs:0` (129
+times), `fs:0x28` (843) and `fs:0x4` (12, not yet explained).
+
 ## Next (hypothesis, to be measured the same way)
 
-- **The main thread's bionic TCB.** libc reaches its per-thread state through the thread
-  pointer slots: `fs:[8]` is `TLS_SLOT_THREAD_ID` (pthread_internal_t, holding errno),
-  `fs:[0x48]` is `TLS_SLOT_BIONIC_TLS`, and `fs:[0x28]` is the stack guard. After
-  patching these are TEB slots, and they are still zero. `__errno()` is expected to
-  dereference slot 1 first. The sizes and offsets of `pthread_internal_t` and
-  `bionic_tls` will be measured from `__errno`, `pthread_self` and
-  `__libc_init_main_thread_*` before anything is written.
+- The real sizes of `pthread_internal_t` and `bionic_tls` (now 64KB upper bounds each).
+- `fs:0x4` (12 sites): what it is, and whether it is reached.
 - `__loader_add_thread_local_dtor` / `remove` (weak): needed for C++ `thread_local`
   destructors.
 - `__loader_android_get_exported_namespace` (weak): returning NULL is correct with no
