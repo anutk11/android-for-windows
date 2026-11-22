@@ -399,6 +399,18 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                     continue;
                 }
                 rep->fs_disp_seen++;
+                {
+                    int64_t d0 = ops[k].mem.disp.value;
+                    int w = (ops[k].actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) != 0, q;
+                    for (q = 0; q < rep->nfs_kind; q++)
+                        if (rep->fs_kind[q].disp == d0 && rep->fs_kind[q].mnemonic == (int)ins.mnemonic &&
+                            rep->fs_kind[q].write == w) break;
+                    if (q == rep->nfs_kind && q < (int)(sizeof rep->fs_kind / sizeof rep->fs_kind[0])) {
+                        rep->fs_kind[q].disp = d0; rep->fs_kind[q].mnemonic = (int)ins.mnemonic;
+                        rep->fs_kind[q].write = w; rep->fs_kind[q].count = 0; rep->nfs_kind++;
+                    }
+                    if (q < rep->nfs_kind) rep->fs_kind[q].count++;
+                }
 #if defined(_WIN32)
                 {
                     int64_t d = ops[k].mem.disp.value;
@@ -584,4 +596,9 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
     free(targets); free(sites);
     if (fatal) return -1;
     return (rep->sys_refused_branch || rep->sys_refused_redzone || rep->sys_refused_unknown) ? 1 : 0;
+}
+
+const char *afw_mnemonic_name(int mnemonic) {
+    const char *n = ZydisMnemonicGetString((ZydisMnemonic)mnemonic);
+    return n ? n : "?";
 }

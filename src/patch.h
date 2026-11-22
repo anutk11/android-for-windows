@@ -70,7 +70,13 @@ typedef struct {
     int fs_outside_functions;
     int redzone_direct;        /* refusals by reason: [rsp-N] */
     int redzone_via_copy;      /* [reg-N] beyond what sub rsp allocated */
+    /* every reachable fs:[disp32] access by (offset, instruction, read/write) */
+    struct { int64_t disp; int mnemonic; int write; int count; } fs_kind[48];
+    int nfs_kind;
 } afw_patch_report;
+
+/* Name of a Zydis mnemonic id (for the fs: histogram). */
+const char *afw_mnemonic_name(int mnemonic);
 
 typedef struct { unsigned char *addr; size_t size; } afw_code_range;
 

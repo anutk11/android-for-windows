@@ -267,6 +267,14 @@ int main(int argc, char **argv) {
                total - lib.patch.sys_patched - lib.patch.sys_patched_moved, lib.patch.sys_refused_branch,
                lib.patch.sys_refused_redzone, lib.patch.sys_refused_unknown, lib.patch.fs_disp_seen,
                lib.patch.fs_patched);
+        {
+            int q;
+            printf("fs:[disp32] by kind (offset, instruction, access, count):\n");
+            for (q = 0; q < lib.patch.nfs_kind; q++)
+                printf("  FSKIND fs:[0x%llx] %-8s %s %d\n", (long long)lib.patch.fs_kind[q].disp,
+                       afw_mnemonic_name(lib.patch.fs_kind[q].mnemonic),
+                       lib.patch.fs_kind[q].write ? "WRITE" : "read ", lib.patch.fs_kind[q].count);
+        }
         return 0;
     }
 
