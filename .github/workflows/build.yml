@@ -37,6 +37,8 @@ jobs:
             -Wl,--pack-dyn-relocs=none -o out/libtls_ie_test.so test/tls_ie_test.c
           "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 -fstack-protector-all \
             -Wl,--pack-dyn-relocs=none -o out/libifunc_test.so test/ifunc_test.c
+          "$TC/clang" --target=x86_64-linux-android34 -shared -fPIC -O2 -Wl,--pack-dyn-relocs=none \
+            -o out/libreal_libc_test.so test/real_libc_test.c
           "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 -nostdlib -Wl,-soname,libdeps_base.so \
             -o out/libdeps_base.so test/deps_base.c
           "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 -nostdlib -Lout -ldeps_base \
@@ -248,6 +250,14 @@ jobs:
       - name: "G1: extract the real bionic on this Windows runner (never uploaded)"
         shell: bash
         run: python -I tools/fetch_bionic.py out/bionic
+      - name: "G1: Android code calling the REAL libc.so on Windows - informational"
+        continue-on-error: true
+        timeout-minutes: 3
+        shell: cmd
+        run: |
+          set AFW_LIB_PATH=out\bionic
+          out\afw-loader.exe out\libreal_libc_test.so --with-deps --watchdog=60 2>&1
+          echo exit code %errorlevel%
       - name: "G1 probe: load the real libc.so for real (constructors run) - informational"
         continue-on-error: true
         timeout-minutes: 3       # a hang is a result too: the output so far is printed live

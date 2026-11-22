@@ -784,6 +784,19 @@ int main(int argc, char **argv) {
         printf("%s\n", g_failed ? "DEPS TEST FAILED" : "DEPS TEST PASSED");
         rc |= g_failed;
     }
+    if (afw_sym(&lib, "afw_real_libc_check")) {
+        typedef int (SYSV *rfn)(void);
+        static const char *what[] = {"snprintf", "malloc/free (scudo)", "qsort", "errno (strtol ERANGE)",
+                                     "pthread_self", "getpid", "clock_gettime", "strdup",
+                                     "malloc 8MB (mmap)", "printf", "strerror"};
+        int bits, k;
+        printf("\nReal bionic libc test (Android code calling the real libc.so):\n");
+        fflush(stdout);
+        bits = ((rfn)afw_sym(&lib, "afw_real_libc_check"))();
+        for (k = 0; k < 11; k++) check(what[k], (bits >> k) & 1);
+        printf("%s\n", g_failed ? "REAL LIBC TEST FAILED" : "REAL LIBC TEST PASSED");
+        rc |= g_failed;
+    }
     if (afw_sym(&lib, "afw_ifunc_call")) {
         typedef int (SYSV *ifn)(void);
         printf("\nIFUNC test (resolver runs after patching, reads the stack guard):\n");
