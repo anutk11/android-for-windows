@@ -60,6 +60,7 @@ static unsigned char *find_fs_disp(unsigned char *ip, unsigned char **disp, int 
 }
 
 static SRWLOCK g_patch_lock = SRWLOCK_INIT;
+static _Thread_local int t_in_fs_handler;   /* never take g_patch_lock twice on one thread */
 
 /* Rewrites one faulting fs:[disp32] read, in place, to gs:[TEB slot].
  * Order (reviewer 1, issue #2): the new disp32 first, then the prefix.
@@ -74,8 +75,19 @@ static LONG CALLBACK fs_handler(EXCEPTION_POINTERS *ep) {
     DWORD old, tmp;
     LONG rc = EXCEPTION_CONTINUE_SEARCH;
 
-    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+    /* Only what an fs: read looks like on Windows (fs base 0): a READ fault
+     * at a low address. Everything else - executing a bad pointer, a write,
+     * a fault anywhere else - goes on to the crash report untouched. Measured
+     * on the real libc (PR #11): an execute fault reached this handler, which
+     * read the bytes at RIP under the lock, faulted again there and waited on
+     * its own lock forever - the crash was hidden as a hang. */
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
+        ep->ExceptionRecord->NumberParameters < 2 ||
+        ep->ExceptionRecord->ExceptionInformation[0] != 0 ||        /* 0 = read */
+        ep->ExceptionRecord->ExceptionInformation[1] >= 0x10000)
         return EXCEPTION_CONTINUE_SEARCH;
+    if (t_in_fs_handler) return EXCEPTION_CONTINUE_SEARCH;          /* a fault inside the handler */
+    t_in_fs_handler = 1;
     ip = (unsigned char *)ep->ContextRecord->Rip;
     AcquireSRWLockExclusive(&g_patch_lock);
     /* already rewritten by another thread while we waited: just run it again */
@@ -107,6 +119,7 @@ static LONG CALLBACK fs_handler(EXCEPTION_POINTERS *ep) {
     rc = EXCEPTION_CONTINUE_EXECUTION;
 out:
     ReleaseSRWLockExclusive(&g_patch_lock);
+    t_in_fs_handler = 0;
     return rc;
 }
 

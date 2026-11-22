@@ -225,6 +225,16 @@ jobs:
       - name: Run G1 syscall-patching tests on Windows
         shell: cmd
         run: out\afw-loader.exe out\libsyscall_test.so
+      - name: "A crash is reported, never hidden as a hang (execute fault at a low address)"
+        timeout-minutes: 1
+        shell: cmd
+        run: |
+          out\afw-loader.exe out\libsyscall_test.so --call-bad-ip --watchdog=20 > out\badip.txt 2>&1
+          type out\badip.txt
+          findstr /c:"=== CRASH ===" out\badip.txt >nul || (echo no crash report & exit /b 1)
+          findstr /c:"executing address 0x28" out\badip.txt >nul || (echo wrong report & exit /b 1)
+          findstr /c:"WATCHDOG" out\badip.txt >nul && (echo it hung & exit /b 1)
+          exit /b 0
       - name: "Dependencies: a library's import resolves to its loaded DT_NEEDED library"
         shell: cmd
         run: out\afw-loader.exe out\libdeps_user.so --with-deps

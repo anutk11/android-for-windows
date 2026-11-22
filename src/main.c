@@ -595,6 +595,7 @@ int main(int argc, char **argv) {
     int verbose = 1, rc = 0, strict = 0, min_pads = 0, call_trap = 0;
     const char *preload_fail = NULL;
     int with_deps = 0;
+    int call_bad_ip = 0;   /* test: execute address 0x28 - must be a crash report, never a hang */
     static afw_lib deps[32];
     int ndeps = 0;
 
@@ -618,6 +619,7 @@ int main(int argc, char **argv) {
             else if (strncmp(argv[a], "--min-landing-pads=", 19) == 0) min_pads = atoi(argv[a] + 19);
             else if (strncmp(argv[a], "--preload-fail=", 15) == 0) preload_fail = argv[a] + 15;
             else if (strcmp(argv[a], "--with-deps") == 0) with_deps = 1;
+            else if (strcmp(argv[a], "--call-bad-ip") == 0) call_bad_ip = 1;
             else if (strncmp(argv[a], "--watchdog=", 11) == 0) {
                 int sec = atoi(argv[a] + 11);
                 if (sec <= 0 || afw_watchdog_start((unsigned)sec) != 0) {
@@ -725,6 +727,14 @@ int main(int argc, char **argv) {
               ((ifn)afw_sym(&lib, "afw_ifunc_call_hidden"))() == 42);
         printf("%s\n", g_failed ? "IFUNC TEST FAILED" : "IFUNC TEST PASSED");
         rc |= g_failed;
+    }
+    if (call_bad_ip) {
+        typedef void (*bad_fn)(void);
+        volatile uintptr_t where = 0x28;   /* low, like an fs: fault address - but an EXECUTE fault */
+        printf("\nCalling address 0x28 on purpose (expect a crash report, not a hang)...\n");
+        ((bad_fn)where)();
+        printf("ERROR: executing 0x28 did not crash\n");
+        return 99;
     }
     if (call_trap) {
         typedef long (SYSV *f1)(int);
