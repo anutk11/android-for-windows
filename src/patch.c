@@ -162,6 +162,60 @@ static void reg_clear(flow_state *f, ZydisRegister r) {
     f->lea[r] = f->bound[r] = f->ent_tab[r] = f->sum_tab[r] = 0;
 }
 
+/* Full record of one UNPROVEN site, for review (docs/unproven/). Every
+ * line starts with "UNPROVEN-DETAIL" so CI can collect them. Decoding of
+ * the function is linear from its start; "R" marks bytes the control-flow
+ * analysis reached, "-" bytes it did not. */
+static void unproven_detail(ZydisDecoder *dec, const afw_patch_ctx *c, unsigned char *fstart, size_t fsize,
+                            const unsigned char *map, const unsigned char *why, const unsigned char *site,
+                            int is_sys) {
+    ZydisDecodedInstruction ins;
+    ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+    ZydisFormatter f;
+    char text[160];
+    unsigned char *q = fstart, *fend = fstart + fsize;
+    size_t reached = 0, i;
+    const unsigned char *lo = site - 160 < fstart ? fstart : site - 160;
+    const unsigned char *hi = site + 48 > fend ? fend : site + 48;
+    const unsigned char *b0 = site - 16 < fstart ? fstart : site - 16;
+    const unsigned char *b1 = site + 16 > fend ? fend : site + 16;
+    long long bias = (long long)c->bias;
+    const char *nm = c->name ? c->name : "lib";
+
+    ZydisFormatterInit(&f, ZYDIS_FORMATTER_STYLE_INTEL);
+    for (i = 0; map && i < fsize; i++) reached += map[i] == 1;
+    fprintf(stderr, "UNPROVEN-DETAIL ==== %s+0x%llx kind=%s\n", nm, (long long)((intptr_t)site - bias),
+            is_sys ? "syscall" : "fs");
+    fprintf(stderr, "UNPROVEN-DETAIL function=%s+0x%llx..0x%llx size=%llu reached_bytes=%llu\n", nm,
+            (long long)((intptr_t)fstart - bias), (long long)((intptr_t)fend - bias),
+            (unsigned long long)fsize, (unsigned long long)reached);
+    if (why && ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, why, 16, &ins, ops))) {
+        ZydisFormatterFormatInstruction(&f, &ins, ops, ins.operand_count_visible, text, sizeof text,
+                                        (ZyanU64)((intptr_t)why - bias), ZYAN_NULL);
+        fprintf(stderr, "UNPROVEN-DETAIL reason=indirect jump not proven to be a switch table at %s+0x%llx: %s\n",
+                nm, (long long)((intptr_t)why - bias), text);
+    } else {
+        fprintf(stderr, "UNPROVEN-DETAIL reason=function undecided (exception table not decoded, or no jump recorded)\n");
+    }
+    fprintf(stderr, "UNPROVEN-DETAIL bytes %s+0x%llx:", nm, (long long)((intptr_t)b0 - bias));
+    for (; b0 < b1; b0++) fprintf(stderr, b0 == site ? " [%02x" : " %02x", *b0);
+    fprintf(stderr, "   ('[' = site)\n");
+    /* linear decoding from the function start; print the window around the site */
+    while (q < fend) {
+        int ok = ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, q, (ZyanUSize)(fend - q), &ins, ops));
+        size_t len = ok ? ins.length : 1;
+        if (q + len > lo && q < hi) {
+            if (ok) ZydisFormatterFormatInstruction(&f, &ins, ops, ins.operand_count_visible, text, sizeof text,
+                                                    (ZyanU64)((intptr_t)q - bias), ZYAN_NULL);
+            else snprintf(text, sizeof text, "(bad) %02x", *q);
+            fprintf(stderr, "UNPROVEN-DETAIL   %c %s 0x%llx: %s%s\n", map && map[q - fstart] == 1 ? 'R' : '-',
+                    (site >= q && site < q + len) ? ">>" : "  ", (long long)((intptr_t)q - bias), text,
+                    (site > q && site < q + len) ? "   (site is INSIDE this instruction)" : "");
+        }
+        q += len;
+    }
+}
+
 static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t size, int *undecided,
                                 const unsigned char **why, const uint64_t *extra, int nextra,
                                 const afw_patch_ctx *c, uint64_t **tt, size_t *ntt, size_t *captt) {
@@ -317,6 +371,7 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
     char where[160];
     unsigned char **maps = (unsigned char **)calloc(nranges ? (size_t)nranges : 1, sizeof *maps);
     int *undecided = (int *)calloc(nranges ? (size_t)nranges : 1, sizeof *undecided);
+    const unsigned char **whys = (const unsigned char **)calloc(nranges ? (size_t)nranges : 1, sizeof *whys);
 
     memset(rep, 0, sizeof *rep);
     ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
@@ -352,6 +407,7 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                     VEC_PUSH(targets, ntargets, captargets, pads[q]);
             }
             if (lsda_failed && !undecided[r]) { undecided[r] = 1; why = NULL; }
+            if (whys) whys[r] = undecided[r] ? why : NULL;
             if (undecided[r]) {
                 rep->funcs_undecided++;
                 if (verbose && why && ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, why, 16, &ins, ops))) {
@@ -578,6 +634,8 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                             rep->unproven++;
                             fprintf(stderr, "  [audit] UNPROVEN: %s-looking bytes at %s, in a function with an unresolved "
                                             "indirect jump: not touched\n", is_sys ? "syscall" : "fs:", where);
+                            unproven_detail(&dec, c, ranges[found].addr, ranges[found].size, maps[found],
+                                            whys ? whys[found] : NULL, p, is_sys);
                         } else {
                             rep->unreachable_ignored++;
                             if (verbose > 1)
@@ -591,7 +649,7 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
         }
     }
     for (r = 0; r < nranges; r++) free(maps[r]);
-    free(maps); free(undecided);
+    free(maps); free(undecided); free((void *)whys);
 
     free(targets); free(sites);
     if (fatal) return -1;

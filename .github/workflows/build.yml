@@ -87,6 +87,12 @@ jobs:
           grep -q "GATE libc.so: would RUN" out/patch-scan.txt
           grep -q "GATE ld-android.so: would REFUSE" out/patch-scan.txt   # 3 unproven look-alikes, known
           echo "gate results as expected"
+          echo "--- full record of every UNPROVEN site (for docs/unproven/)"
+          grep "^UNPROVEN-DETAIL" out/patch-scan.txt | sed 's/^UNPROVEN-DETAIL //' > out/unproven-scan.txt
+          cat out/unproven-scan.txt
+          n=$(grep -c "^====" out/unproven-scan.txt || true)
+          echo "UNPROVEN sites recorded: $n (expected 9: 3 in linker64, 6 in libc++)"
+          test "$n" -eq 9
       - uses: actions/upload-artifact@v4
         with:
           name: bionic-scan-report
