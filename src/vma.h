@@ -4,30 +4,32 @@
  * Two notions, kept apart (reviewer 3):
  *   - a Windows allocation ("WinAlloc"): one VirtualAlloc reservation; it can
  *     only be released whole, from its base;
- *   - Linux pages inside it: each 4KB page is unmapped or mapped, has Linux
- *     protections, and is committed or only reserved on the Windows side.
+ *   - sorted, non-overlapping extents inside it: each extent [start, end) is
+ *     unmapped or mapped, has Linux protections, and is committed or only
+ *     reserved on the Windows side. Adjacent extents with equal state merge.
  *
  * Semantics (the part that matters for bionic/Scudo):
- *   mmap anonymous   reserve; pages with prot != PROT_NONE are committed
- *                    (zeroed by Windows); PROT_NONE pages stay reserved:
+ *   mmap anonymous   reserve; ranges with prot != PROT_NONE are committed
+ *                    (zeroed by Windows); PROT_NONE ranges stay reserved:
  *                    no commit charge
- *   mmap MAP_FIXED   inside an existing allocation: the pages are
- *                    decommitted (zeroed) and remapped; in free space only at
- *                    a 64KB-aligned address (Windows reservation granularity),
+ *   mmap MAP_FIXED   inside an existing allocation: the range is decommitted
+ *                    (zeroed) and remapped; in free space only at a 64KB-
+ *                    aligned address (Windows reservation granularity),
  *                    otherwise -ENOMEM with a log line (documented limit)
- *   munmap partial   MEM_DECOMMIT of those pages; the allocation is released
- *                    when no page of it is mapped any more
- *   mprotect         committed pages: VirtualProtect (PROT_NONE keeps the
- *                    contents, as on Linux - NOT a decommit); reserved pages
- *                    made accessible are committed then
- *   madvise          MADV_DONTNEED: mapped committed pages read back as zeros
- *                    (decommit + recommit); other advice is accepted as a no-op
+ *   munmap partial   MEM_DECOMMIT of committed extents in that range; the
+ *                    allocation is released when nothing in it is mapped
+ *   mprotect         committed extents: VirtualProtect (PROT_NONE keeps the
+ *                    contents, as on Linux - NOT a decommit); reserved
+ *                    extents made accessible are committed then
+ *   madvise          MADV_DONTNEED: mapped committed extents read back as
+ *                    zeros (decommit + recommit); other advice is a no-op
  * File-backed mappings are not supported yet (-ENODEV).
- * Not thread-safe yet: G1 runs a single thread (one lock comes with G2).
+ * Synchronized with a single lock (SRWLOCK on Windows, pthread mutex on host).
  */
 #ifndef AFW_VMA_H
 #define AFW_VMA_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define LNX_PROT_READ 1
@@ -47,7 +49,14 @@ int64_t afw_munmap(uint64_t addr, uint64_t len);
 int64_t afw_mprotect(uint64_t addr, uint64_t len, int prot);
 int64_t afw_madvise(uint64_t addr, uint64_t len, int advice);
 
-/* For tests: number of live Windows allocations. */
+/* For tests: live Windows allocations, total metadata bytes, total extents,
+ * and total OS memory calls made so far. */
 int afw_vma_alloc_count(void);
+size_t afw_vma_meta_bytes(void);
+size_t afw_vma_extent_count(void);
+uint64_t afw_vma_os_call_count(void);
+
+/* Test hook: fail the nth next OS memory call (1 = very next, 0 = off). */
+void afw_vma_test_fail_os(int nth);
 
 #endif
