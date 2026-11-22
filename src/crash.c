@@ -63,6 +63,38 @@ void afw_crash_init(void) {
  * After `seconds`, the main thread is suspended and sampled 3 times, 200ms
  * apart: the same RIP each time with the syscall counts unchanged means it
  * is blocked; changing RIPs mean it spins. Then the process ends (124). */
+#include <dbghelp.h>
+
+/* name+offset for any address: Android code first, then DbgHelp (the
+ * loader's PDB, Windows DLL exports) */
+static void name_of(uintptr_t a, char *out, size_t n) {
+    static int sym_ready;
+    char buf[sizeof(SYMBOL_INFO) + 256];
+    SYMBOL_INFO *si = (SYMBOL_INFO *)buf;
+    DWORD64 disp = 0;
+    HMODULE mod = NULL;
+    char mpath[MAX_PATH] = "?";
+    const char *mname;
+    if (afw_describe_address(a, out, n)) return;
+    if (!sym_ready) {
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+        sym_ready = SymInitialize(GetCurrentProcess(), NULL, TRUE) ? 1 : -1;
+    }
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)a, &mod))
+        GetModuleFileNameA(mod, mpath, sizeof mpath);
+    mname = strrchr(mpath, '\\') ? strrchr(mpath, '\\') + 1 : mpath;
+    memset(buf, 0, sizeof buf);
+    si->SizeOfStruct = sizeof(SYMBOL_INFO);
+    si->MaxNameLen = 255;
+    if (sym_ready > 0 && SymFromAddr(GetCurrentProcess(), (DWORD64)a, &disp, si))
+        snprintf(out, n, "%s!%s+0x%llx", mname, si->Name, (unsigned long long)disp);
+    else if (mod)
+        snprintf(out, n, "%s+0x%llx", mname, (unsigned long long)(a - (uintptr_t)mod));
+    else
+        snprintf(out, n, "0x%llx (no module: heap, stack or an Android mapping)", (unsigned long long)a);
+}
+
 static HANDLE g_wd_main;
 static DWORD g_wd_seconds;
 
@@ -76,11 +108,29 @@ static void wd_sample(int n) {
     c.ContextFlags = CONTEXT_FULL;
     if (SuspendThread(g_wd_main) == (DWORD)-1) { fprintf(stderr, "  (cannot suspend the main thread)\n"); return; }
     if (!GetThreadContext(g_wd_main, &c)) { ResumeThread(g_wd_main); fprintf(stderr, "  (no context)\n"); return; }
-    fprintf(stderr, "sample %d: rip=%llx ", n, (unsigned long long)c.Rip);
-    if (afw_describe_address((uintptr_t)c.Rip, where, sizeof where)) fprintf(stderr, "(%s)\n", where);
-    else fprintf(stderr, "(outside the Android libraries: the loader or Windows)\n");
+    name_of((uintptr_t)c.Rip, where, sizeof where);
+    fprintf(stderr, "sample %d: rip=%llx (%s)\n", n, (unsigned long long)c.Rip, where);
     fprintf(stderr, "  rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx rsp=%llx\n",
             c.Rax, c.Rbx, c.Rcx, c.Rdx, c.Rsi, c.Rdi, c.Rsp);
+    name_of((uintptr_t)c.Rcx, where, sizeof where);
+    fprintf(stderr, "  rcx is %s\n", where);
+    if (n == 1) {   /* the whole native stack once: loader, CRT and Windows frames by name */
+        STACKFRAME64 f;
+        CONTEXT wc = c;
+        int depth;
+        memset(&f, 0, sizeof f);
+        f.AddrPC.Offset = c.Rip; f.AddrPC.Mode = AddrModeFlat;
+        f.AddrFrame.Offset = c.Rbp; f.AddrFrame.Mode = AddrModeFlat;
+        f.AddrStack.Offset = c.Rsp; f.AddrStack.Mode = AddrModeFlat;
+        fprintf(stderr, "  native stack:\n");
+        for (depth = 0; depth < 40; depth++) {
+            if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, GetCurrentProcess(), g_wd_main, &f, &wc, NULL,
+                             SymFunctionTableAccess64, SymGetModuleBase64, NULL) || !f.AddrPC.Offset)
+                break;
+            name_of((uintptr_t)f.AddrPC.Offset, where, sizeof where);
+            fprintf(stderr, "    #%02d %s\n", depth, where);
+        }
+    }
     if (ReadProcessMemory(GetCurrentProcess(), (void *)(uintptr_t)c.Rsp, sp, sizeof sp, &got)) {
         fprintf(stderr, "  Android frames on the stack:\n");
         for (i = 0; i < (int)(got / 8); i++)
