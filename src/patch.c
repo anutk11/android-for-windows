@@ -418,7 +418,8 @@ static int attest_chain(ZydisDecoder *dec, unsigned char *const *win, int n, con
  * padding. Fills out[] with the k targets and returns k, or -1 + reason. */
 static int attest_verify(ZydisDecoder *dec, const afw_patch_ctx *c, unsigned char *fstart, size_t fsize,
                          const unsigned char *map, const afw_attest *a, uint64_t *out, int max,
-                         const uint64_t *tt, size_t ntt, const char **why) {
+                         const uint64_t *tt, size_t ntt, int und_count, const unsigned char *und_why,
+                         const char **why) {
     ZydisDecodedInstruction ins;
     ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
     unsigned char *fend = fstart + fsize, *J = (unsigned char *)(c->bias + (intptr_t)a->jmp_rva), *q;
@@ -428,6 +429,12 @@ static int attest_verify(ZydisDecoder *dec, const afw_patch_ctx *c, unsigned cha
     if (a->k <= 0 || a->k > max) { *why = "entry count out of range"; return -1; }
     if (J < fstart || J >= fend) { *why = "jump not inside this function"; return -1; }
     if (!map || map[J - fstart] != 1) { *why = "jump not reached by the analysis"; return -1; }
+    /* J must be the ONLY unresolved indirect jump the analysis reached in this
+     * function: another one could land anywhere, inside the chain included
+     * (reviewer 2, PR #7) */
+    if (und_count != 1 || und_why != J) {
+        *why = "the function has another unresolved indirect jump besides the attested one"; return -1;
+    }
     if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, J, (ZyanUSize)(fend - J), &ins, ops)) ||
         ins.mnemonic != ZYDIS_MNEMONIC_JMP || ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) {
         *why = "no indirect jmp reg at the attested address"; return -1;
@@ -463,16 +470,28 @@ static int attest_verify(ZydisDecoder *dec, const afw_patch_ctx *c, unsigned cha
                 int e2;
                 for (ti = 0; ti < ntt && lea_ok; ti++)
                     if (tt[ti] > lo && tt[ti] <= hi) lea_ok = 0;
-                for (q = fstart; q < fend && lea_ok;) {
-                    int ok = ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, q, (ZyanUSize)(fend - q), &ins, ops));
-                    if (ok && is_branch(&ins) && ins.operand_count_visible >= 1 &&
-                        ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-                        ZyanU64 t;
-                        if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&ins, &ops[0], (ZyanU64)(uintptr_t)q, &t)) &&
-                            (uint64_t)t > lo && (uint64_t)t <= hi)
-                            lea_ok = 0;
+                /* direct branches and calls anywhere in the library's executable
+                 * code, not only this function and not only those the analysis has
+                 * seen so far (reviewer 2): a linear sweep of every executable
+                 * segment. Data decoded as code can only add false targets, which
+                 * only rejects more. */
+                {
+                    int g, nsweep = c->nsegs;
+                    for (g = 0; g < (nsweep ? nsweep : 1) && lea_ok; g++) {
+                        unsigned char *s0 = nsweep ? c->segs[g].addr : fstart;
+                        unsigned char *s1 = nsweep ? s0 + c->segs[g].size : fend;
+                        for (q = s0; q < s1 && lea_ok;) {
+                            int ok = ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, q, (ZyanUSize)(s1 - q), &ins, ops));
+                            if (ok && is_branch(&ins) && ins.operand_count_visible >= 1 &&
+                                ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                                ZyanU64 t;
+                                if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&ins, &ops[0], (ZyanU64)(uintptr_t)q, &t)) &&
+                                    (uint64_t)t > lo && (uint64_t)t <= hi)
+                                    lea_ok = 0;
+                            }
+                            q += ok ? ins.length : 1;
+                        }
                     }
-                    q += ok ? ins.length : 1;
                 }
                 for (e2 = 0; e2 < a->k && lea_ok; e2++) {
                     int32_t v;
@@ -708,14 +727,14 @@ static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t s
                                 uint64_t t2 = tab + (uint64_t)(int64_t)ent[e];
                                 if (t2 < lo || t2 >= hi) bad = 1;
                             }
-                            if (bad) { *undecided = 1; *why = base + off; }
+                            if (bad) { (*undecided)++; *why = base + off; }   /* counts unresolved jumps */
                             else for (e = 0; e < n; e++) {
                                 uint64_t t2 = tab + (uint64_t)(int64_t)ent[e];
                                 VEC_PUSH(work, nwork, capwork, (size_t)(t2 - lo));
                                 VEC_PUSH(*tt, *ntt, *captt, t2);   /* also a branch target */
                             }
                         } else {
-                            *undecided = 1; *why = base + off;
+                            (*undecided)++; *why = base + off;
                         }
                     }
                 }
@@ -983,7 +1002,7 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
             /* attestations for jumps inside this function: verify, then re-run the
              * analysis with the attested table targets as extra entry points */
             if (undecided[r] && c->nattest) {
-                int a, added = 0;
+                int a, added = 0, last_a = 0;
                 for (a = 0; a < c->nattest; a++) {
                     const char *awhy = "";
                     unsigned char *J = (unsigned char *)(c->bias + (intptr_t)c->attest[a].jmp_rva);
@@ -992,7 +1011,7 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                     if (a < 64) attest_used[a] = 1;
                     if (c->attest_dump) attest_dump(&dec, c, p, ranges[r].size, map, &c->attest[a]);
                     k = attest_verify(&dec, c, p, ranges[r].size, map, &c->attest[a], pads + npads, 1024 - npads,
-                                      targets, ntargets, &awhy);
+                                      targets, ntargets, undecided[r], why, &awhy);
                     describe(c, J, where, sizeof where);
                     if (k < 0) {
                         rep->attest_rejected++;
@@ -1003,7 +1022,7 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                     rep->attest_applied++;
                     fprintf(stderr, "  [attest] applied for the jump at %s: %d table entries verified (%s)\n", where, k,
                             c->attest[a].note ? c->attest[a].note : "");
-                    npads += k; added += k;
+                    npads += k; added += k; last_a = a;
                 }
                 if (added) {
                     int und2 = 0;
@@ -1014,7 +1033,16 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                     for (q2 = npads - added; q2 < npads; q2++)   /* the jump lands there: branch targets */
                         VEC_PUSH(targets, ntargets, captargets, pads[q2]);
                     if (!m2) { fprintf(stderr, "  [attest] FATAL: out of memory re-running the analysis\n"); fatal = 1; }
-                    else { maps0[r] = map; map = maps[r] = m2; undecided[r] = und2; why = why2; }
+                    else if (und2 != 1 || why2 == NULL ||
+                             (uint64_t)(uintptr_t)why2 != (uint64_t)(c->bias + (intptr_t)c->attest[last_a].jmp_rva)) {
+                        /* code reached through the attested entries has ANOTHER unresolved
+                         * indirect jump: it could land in the chain - the attestation fails */
+                        free(m2);
+                        rep->attest_applied--; rep->attest_rejected++;
+                        describe(c, p, where, sizeof where);
+                        fprintf(stderr, "  [attest] REJECTED in the function at %s: code reached through the attested "
+                                        "entries has another unresolved indirect jump - not used\n", where);
+                    } else { maps0[r] = map; map = maps[r] = m2; undecided[r] = und2; why = why2; }
                 }
             }
             if (lsda_failed && !undecided[r]) { undecided[r] = 1; why = NULL; }

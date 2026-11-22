@@ -8,6 +8,8 @@
  *   VARIANT 3 writable   the table is in .data: REJECTED (not read-only)
  *   VARIANT 4 padding    an entry lands on int3 padding: REJECTED
  *   VARIANT 5 bypass     a second path jumps straight to the jmp, around the chain: REJECTED
+ *   VARIANT 6 second     another unresolved jmp reg in the same function could land in the chain: REJECTED
+ *   VARIANT 7 behind     an unresolved jmp reg reachable only through the attested entries: REJECTED
  */
 #ifndef VARIANT
 #define VARIANT 1
@@ -21,7 +23,15 @@
 
 __attribute__((naked)) int afw_at_dispatch(int i) {
     __asm__(
-#if VARIANT == 5
+#if VARIANT == 6
+        "cmp $100, %edi\n\t"                     /* i == 100: jump through rsi (unknown target) */
+        "jne 2f\n\t"
+        "jmp *%rsi\n"
+        "2:\n\t"
+        "lea afw_at_tbl(%rip), %rcx\n\t"
+        "movslq (%rcx,%rdi,4), %rax\n\t"
+        "add %rcx, %rax\n\t"
+#elif VARIANT == 5
         "cmp $100, %edi\n\t"                     /* i == 100: rax = c1, straight to the jmp */
         "jne 2f\n\t"
         "lea c1(%rip), %rax\n\t"
@@ -49,6 +59,9 @@ __attribute__((naked)) int afw_at_dispatch(int i) {
         "mov $7, %eax\n\t"
         "ret\n"
         "c1:\n\t"
+#if VARIANT == 7
+        "jmp *%rsi\n\t"                          /* unresolved, behind the attested entries */
+#endif
         "mov $1, %eax\n\t"
         "ret\n"
         "pad:\n\t"

@@ -35,7 +35,7 @@ jobs:
             -Wl,--pack-dyn-relocs=none -o out/libfs_gate_test.so test/fs_gate_test.c
           "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 \
             -Wl,--pack-dyn-relocs=none -o out/libtls_ie_test.so test/tls_ie_test.c
-          for v in 1 2 3 4 5; do
+          for v in 1 2 3 4 5 6 7; do
             "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 -DVARIANT=$v \
               -Wl,--pack-dyn-relocs=none -o out/libattest$v.so test/attest_test.c
             "$TC/llvm-nm" out/libattest$v.so | awk '/ afw_at_(jmp|tbl)$/{print $3"="$1}' > out/libattest$v.syms
@@ -182,7 +182,7 @@ jobs:
           set -e
           OUTBIN=out/afw-asan-test EXTRA_CFLAGS="-DAFW_TEST -g -fsanitize=address,undefined -fno-sanitize-recover=undefined" bash tools/build_linux.sh
           run() { f=$1; shift; out/afw-asan-test "$f" --patch-report "$@" 2>&1 | grep -E "\[attest\]|^ATTEST |^GATE" ; }
-          for v in 1 2 3 4 5; do
+          for v in 1 2 3 4 5 6 7; do
             . out/libattest$v.syms
             A="$afw_at_jmp,$afw_at_tbl,2"
             echo "== variant $v"; run out/libattest$v.so --attest-add=$A | tee out/at$v.txt
@@ -194,6 +194,8 @@ jobs:
           grep -q "not in memory the file maps read-only" out/at3.txt && grep -q "would REFUSE" out/at3.txt
           grep -q "non-padding instruction" out/at4.txt && grep -q "would REFUSE" out/at4.txt
           grep -q "a branch lands inside the dispatch chain" out/at5.txt && grep -q "would REFUSE" out/at5.txt
+          grep -q "another unresolved indirect jump besides the attested one" out/at6.txt && grep -q "would REFUSE" out/at6.txt
+          grep -q "code reached through the attested entries has another unresolved indirect jump" out/at7.txt && grep -q "would REFUSE" out/at7.txt
           . out/libattest1.syms
           echo "== stale: an attestation for a jump that is not undecided"
           run out/libattest1.so --attest-add=$afw_at_jmp,$afw_at_tbl,2 --attest-add=10,$afw_at_tbl,2 | tee out/at5.txt
