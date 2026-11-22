@@ -7,7 +7,11 @@ not be redistributed: the extracted files are NEVER uploaded or committed
 (docs/COLLABORATION.md, rule 5). The run fails if libc.so is not the binary
 every measurement in this project was made on (pinned ELF Build ID).
 
-usage: fetch_bionic.py [outdir]          (default: out/bionic)
+usage: fetch_bionic.py [outdir] [--art]  (default: out/bionic)
+
+--art also extracts, for measurement only (G3 planning, issue #15):
+  libart.so from the ART APEX, and every boot image .oat file (the ART
+  APEX's javalib/x86_64 and the system partition's framework/x86_64).
 """
 import io
 import os
@@ -51,8 +55,58 @@ def build_id(data):
     return None
 
 
+def open_apex(system, names):
+    """The payload filesystem image bytes of the first APEX found, or None."""
+    for name in names:
+        try:
+            apex = system.data(system.lookup("/system/apex/" + name))
+        except FileNotFoundError:
+            continue
+        print("== found", name)
+        z = zipfile.ZipFile(io.BytesIO(apex))
+        if "original_apex" in z.namelist():           # compressed APEX
+            z = zipfile.ZipFile(io.BytesIO(z.read("original_apex")))
+        return z.read("apex_payload.img")
+    return None
+
+
+def save(out, name, data):
+    with open(os.path.join(out, name), "wb") as f:
+        f.write(data)
+    print("== %-28s %9d bytes  build id %s" % (name, len(data), build_id(data)))
+
+
+def extract_art(system, out):
+    """libart.so and the boot image .oat files, for the %gs: scan."""
+    art_dir = os.path.join(out, "art")
+    os.makedirs(art_dir, exist_ok=True)
+    payload = open_apex(system, ("com.android.art.apex", "com.android.art.capex"))
+    if payload is None:
+        sys.exit("no ART APEX in the image")
+    path = os.path.join(out, "art_payload.img")
+    with open(path, "wb") as f:
+        f.write(payload)
+    with Ext4(path) as fs:
+        save(art_dir, "libart.so", fs.data(fs.lookup("/lib64/libart.so")))
+        try:
+            for n, ino in fs.listdir(fs.lookup("/javalib/x86_64")):
+                if n.endswith(".oat"):
+                    save(art_dir, "apex-" + n, fs.data(ino))
+        except FileNotFoundError:
+            print("== no /javalib/x86_64 in the ART APEX")
+    os.remove(path)
+    try:
+        for n, ino in system.listdir(system.lookup("/system/framework/x86_64")):
+            if n.endswith(".oat"):
+                save(art_dir, "system-" + n, system.data(ino))
+    except FileNotFoundError:
+        print("== no /system/framework/x86_64 in the system partition")
+
+
 def main():
-    out = sys.argv[1] if len(sys.argv) > 1 else os.path.join("out", "bionic")
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    want_art = "--art" in sys.argv[1:]
+    out = args[0] if args else os.path.join("out", "bionic")
     os.makedirs(out, exist_ok=True)
     sdk = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
     if not sdk:
@@ -67,23 +121,15 @@ def main():
     subprocess.run([sys.executable, "-I", os.path.join(os.path.dirname(__file__), "extract_image.py"),
                     os.path.join(img_dir, "system.img"), parts], check=True)
     system = Ext4(os.path.join(parts, "system.img"))
-    apex = None
-    for name in ("com.android.runtime.apex", "com.android.runtime.capex"):
-        try:
-            apex = system.data(system.lookup("/system/apex/" + name))
-            print("== found", name)
-            break
-        except FileNotFoundError:
-            continue
+    data = open_apex(system, ("com.android.runtime.apex", "com.android.runtime.capex"))
+    if want_art:
+        extract_art(system, out)
     system.close()                                      # Windows cannot delete an open file
-    if apex is None:
+    if data is None:
         sys.exit("no runtime APEX in the image")
-    z = zipfile.ZipFile(io.BytesIO(apex))
-    if "original_apex" in z.namelist():               # compressed APEX
-        z = zipfile.ZipFile(io.BytesIO(z.read("original_apex")))
     payload = os.path.join(out, "apex_payload.img")
     with open(payload, "wb") as f:
-        f.write(z.read("apex_payload.img"))
+        f.write(data)
     with Ext4(payload) as fs:
         for src, dst in WANT.items():
             data = fs.data(fs.lookup(src))
