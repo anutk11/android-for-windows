@@ -275,34 +275,38 @@ static int run_tls_threads(tls_worker_fn fn, int use_ie, int fail_second) {
 /* A new thread whose very first publish fails half way: afterwards it must
  * have no block and nothing published (all its slots still zero). */
 static int g_init_fail_ok;
+/* p != NULL: go through afw_tls_init(), the entry point a new thread uses
+ * first, and retry through it as well */
 #if defined(_WIN32)
 static DWORD WINAPI init_fail_thread(LPVOID p) {
 #else
 static void *init_fail_thread(void *p) {
 #endif
-    int i, clean = 1;
-    (void)p;
+    int i, clean = 1, via_init = p != NULL;
     afw_tls_test_fail_publish(3);
-    if (afw_tls_thread_init() != -1) clean = 0;
+    if ((via_init ? afw_tls_init() : afw_tls_thread_init()) != -1) clean = 0;
     if (afw_tls_block() != NULL) clean = 0;
 #if defined(_WIN32)
     for (i = 0; i < 16; i++) if (afw_tls_published_slot(i) != 0) clean = 0;
 #else
     (void)i;
 #endif
-    if (afw_tls_thread_init() != 0 || afw_tls_published_slot(0) != (uintptr_t)afw_tls_block()) clean = 0;  /* retry works */
+    if ((via_init ? afw_tls_init() : afw_tls_thread_init()) != 0 || afw_tls_block() == NULL ||
+        afw_tls_published_slot(0) != (uintptr_t)afw_tls_block())
+        clean = 0;   /* the retry really sets the thread up, not just reports success */
     g_init_fail_ok = clean;
     return 0;
 }
-static int run_fail_init_thread(void) {
+static int run_fail_init_thread(int via_init) {
     g_init_fail_ok = 0;
 #if defined(_WIN32)
-    HANDLE h = CreateThread(NULL, 0, init_fail_thread, NULL, 0, NULL);
+    HANDLE h = CreateThread(NULL, 0, init_fail_thread, via_init ? (LPVOID)1 : NULL, 0, NULL);
     if (!h || WaitForSingleObject(h, INFINITE) != WAIT_OBJECT_0) return 0;
     CloseHandle(h);
 #else
     pthread_t t;
-    if (pthread_create(&t, NULL, init_fail_thread, NULL) != 0 || pthread_join(t, NULL) != 0) return 0;
+    if (pthread_create(&t, NULL, init_fail_thread, via_init ? (void *)1 : NULL) != 0 || pthread_join(t, NULL) != 0)
+        return 0;
 #endif
     return g_init_fail_ok;
 }
@@ -345,7 +349,9 @@ static int run_tls_tests(const afw_lib *lib) {
         afw_tls_test_fail_publish(16);          /* fails at the very last step (FLS) */
         check("rebuild whose publish fails at the last step returns -1, old block published",
               afw_tls_thread_rebuild() == -1 && afw_tls_published_slot(0) == (uintptr_t)tp_before);
-        check("new thread whose publish fails after 3 slots: nothing left published", run_fail_init_thread());
+        check("new thread whose publish fails after 3 slots: nothing left published", run_fail_init_thread(0));
+        check("... the same through afw_tls_init(): fails, then a retry really sets the thread up",
+              run_fail_init_thread(1));
         check("a rebuild that succeeds still works afterwards", afw_tls_thread_rebuild() == 0 && *gd() == before);
     }
     {

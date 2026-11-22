@@ -113,22 +113,31 @@ out:
  * run this for every live thread (reviewer 3, issue #4). Not called on
  * TerminateThread: one block leaks, accepted. */
 static DWORD g_fls = FLS_OUT_OF_INDEXES;
+static PVOID g_veh;
 static VOID WINAPI fls_release(PVOID p) { afw_tls_static_free(p); }
 
+/* Process-wide setup happens once; the calling thread's block is set up on
+ * every call until it succeeds, so a failed first call can be retried
+ * (reviewer 2, PR #6). */
 int afw_tls_init(void) {
     int i;
-    if (g_ready) return 0;
-    for (i = 0; i < BIONIC_TLS_SLOTS; i++) {
-        g_slot[i] = TlsAlloc();
-        if (g_slot[i] == TLS_OUT_OF_INDEXES || g_slot[i] >= 64) {
-            fprintf(stderr, "[tls] not enough Windows TLS slots\n");
-            return -1;
+    if (!g_ready) {
+        static int nslots;                       /* slots kept from an earlier, failed call */
+        for (i = nslots; i < BIONIC_TLS_SLOTS; i++) {
+            DWORD idx = TlsAlloc();
+            if (idx == TLS_OUT_OF_INDEXES || idx >= 64) {
+                if (idx != TLS_OUT_OF_INDEXES) TlsFree(idx);
+                fprintf(stderr, "[tls] not enough Windows TLS slots\n");
+                return -1;
+            }
+            g_slot[i] = idx; nslots = i + 1;
         }
+        if (g_fls == FLS_OUT_OF_INDEXES) g_fls = FlsAlloc(fls_release);
+        if (g_fls == FLS_OUT_OF_INDEXES) { fprintf(stderr, "[tls] no FLS index\n"); return -1; }
+        if (!g_veh) g_veh = AddVectoredExceptionHandler(1, fs_handler);
+        if (!g_veh) { fprintf(stderr, "[tls] cannot install the fs: handler\n"); return -1; }
+        g_ready = 1;
     }
-    g_fls = FlsAlloc(fls_release);
-    if (g_fls == FLS_OUT_OF_INDEXES) { fprintf(stderr, "[tls] no FLS index\n"); return -1; }
-    if (!AddVectoredExceptionHandler(1, fs_handler)) { fprintf(stderr, "[tls] cannot install the fs: handler\n"); return -1; }
-    g_ready = 1;
     return afw_tls_thread_init();
 }
 
@@ -178,8 +187,12 @@ static int publish(uintptr_t *blk, void *alloc) {   /* one step only: nothing to
 }
 uintptr_t afw_tls_published_slot(int i) { return t_block ? t_block[i] : 0; }   /* fs: is native here */
 static uintptr_t thread_id(void) { return 0; }
-int afw_tls_init(void) {
-    if (pthread_key_create(&g_key, key_release) != 0) return -1;
+static int g_key_ready;
+int afw_tls_init(void) {   /* the key once; the thread's block until it succeeds */
+    if (!g_key_ready) {
+        if (pthread_key_create(&g_key, key_release) != 0) return -1;
+        g_key_ready = 1;
+    }
     return afw_tls_thread_init();
 }
 #endif
