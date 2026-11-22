@@ -36,22 +36,45 @@ static const record g_records[] = {
     {LIBCXX,   {0xd54f2, 0x59450, 6, "libc++ table 0x59450: entries 0-5 (site 0xd5556 = entry 0)"}},
 };
 
+#ifdef AFW_TEST
 static const char *g_tamper = "none";
 void afw_attest_set_tamper(const char *what) { g_tamper = what; }
+static afw_attest g_extra[4];
+static int g_nextra;
+int afw_attest_add_test(const char *spec) {      /* "jmp_rva,table_rva,k" for any binary */
+    unsigned long long j, t;
+    int k;
+    if (g_nextra == 4 || sscanf(spec, "%llx,%llx,%d", &j, &t, &k) != 3) return -1;
+    g_extra[g_nextra].jmp_rva = j; g_extra[g_nextra].table_rva = t; g_extra[g_nextra].k = k;
+    g_extra[g_nextra].note = "test attestation from the command line";
+    g_nextra++;
+    return 0;
+}
+#define TAMPER(x) (!strcmp(g_tamper, x))
+#else
+#define TAMPER(x) 0
+#endif
 
-const afw_attest *afw_attest_for(const char *sha256_hex, int *n) {
-    static afw_attest out[16];
+const afw_attest *afw_attest_for(const char *sha256_hex, afw_attest *buf, int max, int *n) {
     int i, m = 0;
     *n = 0;
-    if (!strcmp(g_tamper, "hash")) return NULL;   /* as if the binary differed by one byte */
-    for (i = 0; i < (int)(sizeof g_records / sizeof g_records[0]) && m < 16; i++) {
+    if (TAMPER("hash")) return NULL;   /* as if the binary differed by one byte */
+    for (i = 0; i < (int)(sizeof g_records / sizeof g_records[0]); i++) {
         if (strcmp(g_records[i].sha256, sha256_hex) != 0) continue;
-        out[m] = g_records[i].a;
-        if (!strcmp(g_tamper, "jmp")) out[m].jmp_rva += 1;
-        else if (!strcmp(g_tamper, "table")) out[m].table_rva += 4;
-        else if (!strcmp(g_tamper, "k")) out[m].k += 1;
+        if (m == max) {
+            fprintf(stderr, "error: more attestations for this binary than the loader holds\n");
+            *n = -1;
+            return NULL;
+        }
+        buf[m] = g_records[i].a;
+        if (TAMPER("jmp")) buf[m].jmp_rva += 1;
+        else if (TAMPER("table")) buf[m].table_rva += 4;
+        else if (TAMPER("k")) buf[m].k += 1;
         m++;
     }
+#ifdef AFW_TEST
+    for (i = 0; i < g_nextra && m < max; i++) buf[m++] = g_extra[i];
+#endif
     *n = m;
-    return m ? out : NULL;
+    return m ? buf : NULL;
 }

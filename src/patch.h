@@ -107,6 +107,9 @@ typedef struct {
     int ranges_are_functions; /* ranges come from .eh_frame: follow control flow */
     /* memory the analysis may read (switch tables) */
     int (*readable)(const void *ctx, uint64_t addr, uint64_t len);
+    /* mapped read-only in the file (PF_R without PF_W): attested tables must be */
+    int (*readonly)(const void *ctx, uint64_t addr, uint64_t len);
+    int attest_dump;        /* print the evidence behind every attestation (ATTEST-DETAIL lines) */
     /* extra entry points of a function (C++ landing pads) */
     int (*entries)(const void *ctx, uint64_t func, uint64_t *out, int max);
     const afw_code_range *segs; int nsegs; /* executable segments, for the audit */

@@ -28,11 +28,12 @@
 typedef SYSV void (*init_fn)(void);
 
 int afw_load_patch_only;
+int afw_attest_dump;
 int afw_load_allow_unproven;
 
 int afw_gate_ok(const afw_lib *lib) {
     const afw_patch_report *r = &lib->patch;
-    return !r->unproven && !r->lsda_failures && !r->sys_untouched && !r->sys_outside_functions &&
+    return !r->unproven && !r->attest_rejected && !r->lsda_failures && !r->sys_untouched && !r->sys_outside_functions &&
            !r->fs_unsupported &&
            /* every fs:[reg] must really be rewritten (Windows); measurement mode
             * reports what Windows would do */
@@ -212,6 +213,20 @@ static int patch_bounds(const void *ctx, uint64_t addr, uint64_t *s, uint64_t *e
 }
 static int patch_entries(const void *ctx, uint64_t func, uint64_t *out, int max) {
     return afw_func_landing_pads((const afw_lib *)ctx, func, out, max);
+}
+/* Every page of [addr, addr+len) is mapped by the file readable and NOT
+ * writable (no overflow, no crossing into a writable or unmapped page). */
+static int patch_readonly(const void *ctx, uint64_t addr, uint64_t len) {
+    const afw_lib *lib = (const afw_lib *)ctx;
+    uint64_t b = (uint64_t)(uintptr_t)lib->base, off, last, pg;
+    if (!lib->load_prot || len == 0 || !afw_lib_readable(lib, addr, len)) return 0;
+    off = addr - b;
+    last = off + len - 1;
+    for (pg = off / AFW_PAGE_SIZE; pg <= last / AFW_PAGE_SIZE; pg++) {
+        if (pg >= lib->load_npages) return 0;
+        if (!(lib->load_prot[pg] & PF_R) || (lib->load_prot[pg] & PF_W)) return 0;
+    }
+    return 1;
 }
 static int patch_readable(const void *ctx, uint64_t addr, uint64_t len) {
     return afw_lib_readable((const afw_lib *)ctx, addr, len);
@@ -521,11 +536,22 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
         pc.bounds = patch_bounds; pc.ctx = lib; pc.bias = lib->bias; pc.name = lib->soname ? lib->soname : path;
         pc.ranges_are_functions = have_funcs; pc.segs = segs; pc.nsegs = nsegs;
         pc.entries = patch_entries;
-        pc.attest = afw_attest_for(lib->sha256, &pc.nattest);
-        pc.readable = patch_readable;
-        if (afw_patch_code(cr, ncr, lib->stub_area, AFW_STUB_RESERVE, &pc, &lib->patch, verbose) < 0) {
-            fprintf(stderr, "error: could not patch %s safely; refusing to run it\n", path);
+        pc.attest = afw_attest_for(lib->sha256, lib->attest_buf, (int)(sizeof lib->attest_buf / sizeof lib->attest_buf[0]), &pc.nattest);
+        pc.readonly = patch_readonly;
+        pc.attest_dump = afw_attest_dump;
+        lib->load_prot = pageprot; lib->load_npages = npages;
+        if (pc.nattest < 0) {
+            fprintf(stderr, "error: attestation table for %s cannot be read; refusing to run it\n", path);
             free(cr); free(pageprot); return -1;
+        }
+        pc.readable = patch_readable;
+        {
+            int prc = afw_patch_code(cr, ncr, lib->stub_area, AFW_STUB_RESERVE, &pc, &lib->patch, verbose);
+            lib->load_prot = NULL; lib->load_npages = 0;   /* pageprot is freed below */
+            if (prc < 0) {
+                fprintf(stderr, "error: could not patch %s safely; refusing to run it\n", path);
+                free(cr); free(pageprot); return -1;
+            }
         }
         free(cr);
         if (!afw_load_patch_only && !afw_load_allow_unproven && !afw_gate_ok(lib)) {

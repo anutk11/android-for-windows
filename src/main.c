@@ -457,7 +457,13 @@ int main(int argc, char **argv) {
         for (a = 2; a < argc; a++) {
             if (strcmp(argv[a], "--strict") == 0) strict = 1;
             else if (strcmp(argv[a], "--allow-unproven") == 0) afw_load_allow_unproven = 1;
-            else if (strncmp(argv[a], "--attest-tamper=", 16) == 0) afw_attest_set_tamper(argv[a] + 16);  /* tests */
+            else if (strcmp(argv[a], "--attest-dump") == 0) afw_attest_dump = 1;
+#ifdef AFW_TEST
+            else if (strncmp(argv[a], "--attest-tamper=", 16) == 0) afw_attest_set_tamper(argv[a] + 16);
+            else if (strncmp(argv[a], "--attest-add=", 13) == 0) {
+                if (afw_attest_add_test(argv[a] + 13) != 0) { fprintf(stderr, "bad --attest-add\n"); return 2; }
+            }
+#endif
             else if (strcmp(argv[a], "--call-trap") == 0) call_trap = 1;
             else if (strncmp(argv[a], "--min-landing-pads=", 19) == 0) min_pads = atoi(argv[a] + 19);
         }

@@ -35,6 +35,11 @@ jobs:
             -Wl,--pack-dyn-relocs=none -o out/libfs_gate_test.so test/fs_gate_test.c
           "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 \
             -Wl,--pack-dyn-relocs=none -o out/libtls_ie_test.so test/tls_ie_test.c
+          for v in 1 2 3 4; do
+            "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 -DVARIANT=$v \
+              -Wl,--pack-dyn-relocs=none -o out/libattest$v.so test/attest_test.c
+            "$TC/llvm-nm" out/libattest$v.so | awk '/ afw_at_(jmp|tbl)$/{print $3"="$1}' > out/libattest$v.syms
+          done
           echo "--- fs:[reg] forms in libtls_ie_test.so"
           "$TC/llvm-objdump" -d out/libtls_ie_test.so | grep -E "%fs" 
           echo "--- G1-TLS: how the NDK compiles thread-local storage (measured, not assumed)"
@@ -57,7 +62,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: libhello
-          path: out/*.so
+          path: |
+            out/*.so
+            out/*.syms
 
   # Gate G1 experiment: static scan of the real bionic libc.so.
   # The extracted Android files are NOT uploaded (licensing): only the report.
@@ -108,9 +115,17 @@ jobs:
           grep -q "GATE libc++_shared.so: would RUN" out/patch-scan.txt
           grep -q "ATTEST libc++_shared.so: 2 applied, 0 rejected, 6 look-alikes reached only through attested entries, 0 unproven left" out/patch-scan.txt
           grep -q "ATTEST ld-android.so: 2 applied, 0 rejected, 3 look-alikes reached only through attested entries, 0 unproven left" out/patch-scan.txt
+          echo "--- the evidence behind every attestation, for the people who sign (attest-scan.txt)"
+          for f in out/bionic/linker64 out/libc++_shared.so; do
+            out/afw-loader "$f" --patch-report --attest-dump 2>&1 | grep "^ATTEST-DETAIL" | sed 's/^ATTEST-DETAIL //'
+          done | tee out/attest-scan.txt
           echo "--- negative: any change to an attestation or to the binary must make the gate refuse"
+          # tampering exists only in a test build (-DAFW_TEST), never in the shipped loader
+          OUTBIN=out/afw-loader-test EXTRA_CFLAGS="-DAFW_TEST" bash tools/build_linux.sh
+          if out/afw-loader out/bionic/linker64 --patch-report --attest-tamper=hash 2>&1 | grep -q "would REFUSE"; then
+            echo "the shipped loader accepts --attest-tamper"; exit 1; fi
           for t in hash jmp table k; do
-            out/afw-loader out/bionic/linker64 --patch-report --attest-tamper=$t > out/tamper-$t.txt 2>&1 || true
+            out/afw-loader-test out/bionic/linker64 --patch-report --attest-tamper=$t > out/tamper-$t.txt 2>&1 || true
             grep -E "^GATE|\[attest\] REJECTED" out/tamper-$t.txt | head -3
             grep -q "GATE ld-android.so: would REFUSE" out/tamper-$t.txt || { echo "tamper=$t did not refuse"; exit 1; }
           done
@@ -162,6 +177,26 @@ jobs:
              -o out/vma_test tools/vma_test.c src/vma.c src/syscall.c src/platform.c
           cc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall -Wextra \
              -o out/tls_layout_test tools/tls_layout_test.c src/tls_layout.c
+      - name: "Attestation checks (PR #7): one good, four that must be rejected"
+        run: |
+          set -e
+          OUTBIN=out/afw-asan-test EXTRA_CFLAGS="-DAFW_TEST -g -fsanitize=address,undefined -fno-sanitize-recover=undefined" bash tools/build_linux.sh
+          run() { out/afw-asan-test "$@" --patch-report 2>&1 | grep -E "\[attest\]|^ATTEST |^GATE" ; }
+          for v in 1 2 3 4; do
+            . out/libattest$v.syms
+            A="$afw_at_jmp,$afw_at_tbl,2"
+            echo "== variant $v"; run out/libattest$v.so --attest-add=$A | tee out/at$v.txt
+            out/afw-asan-test out/libattest$v.so --patch-report 2>&1 | grep -q "would REFUSE"   # no attestation: refused
+          done
+          grep -q "1 applied, 0 rejected, 1 look-alikes reached only through attested entries, 0 unproven left" out/at1.txt
+          grep -q "would RUN" out/at1.txt
+          grep -q "no lea T -> movsxd" out/at2.txt && grep -q "would REFUSE" out/at2.txt
+          grep -q "not in memory the file maps read-only" out/at3.txt && grep -q "would REFUSE" out/at3.txt
+          grep -q "non-padding instruction" out/at4.txt && grep -q "would REFUSE" out/at4.txt
+          . out/libattest1.syms
+          echo "== stale: an attestation for a jump that is not undecided"
+          run out/libattest1.so --attest-add=$afw_at_jmp,$afw_at_tbl,2 --attest-add=10,$afw_at_tbl,2 | tee out/at5.txt
+          grep -q "stale attestation" out/at5.txt && grep -q "would REFUSE" out/at5.txt
       - name: Run all tests under ASan
         run: |
           set -e
