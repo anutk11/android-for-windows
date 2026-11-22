@@ -244,7 +244,8 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                     char w2[160];
                     describe(c, p, where, sizeof where);
                     describe(c, why, w2, sizeof w2);
-                    fprintf(stderr, "  [flow] function at %s: unresolved indirect jump at %s\n", where, w2);
+                    fprintf(stderr, "  [flow] function at %s: indirect jump at %s is not a switch table "
+                                    "(tail call through a pointer?) - unreached bytes stay untouched\n", where, w2);
                     dump_ins(why, &ins, ops);
                 }
             }
