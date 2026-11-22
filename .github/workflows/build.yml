@@ -233,11 +233,11 @@ jobs:
         run: python -I tools/fetch_bionic.py out/bionic
       - name: "G1 probe: load the real libc.so for real (constructors run) - informational"
         continue-on-error: true
+        timeout-minutes: 3       # a hang is a result too: the output so far is printed live
         shell: cmd
         run: |
-          out\afw-loader.exe out\bionic\libc.so --with-deps > out\libc-run.txt 2>&1
-          echo exit code %errorlevel% >> out\libc-run.txt
-          type out\libc-run.txt
+          out\afw-loader.exe out\bionic\libc.so --with-deps 2>&1
+          echo exit code %errorlevel%
       - name: "VMA layer: mmap / munmap / mprotect / madvise on Windows"
         shell: cmd
         run: |
