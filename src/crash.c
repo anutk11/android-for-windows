@@ -1,6 +1,7 @@
 /*
  * crash.c - Turns "exit code -1073741819" into something we can act on.
  */
+#include "patch.h"
 #include "crash.h"
 #include "elf_loader.h"
 
@@ -23,6 +24,14 @@ static LONG WINAPI on_crash(EXCEPTION_POINTERS *ep) {
     afw_describe_address((uintptr_t)c->Rip, where, sizeof where);
     fprintf(stderr, "\n=== CRASH ===\n");
     fprintf(stderr, "exception 0x%08lx at %s\n", er->ExceptionCode, where);
+    {
+        const void *orig = afw_stub_origin(ip);
+        if (orig) {
+            char w2[512];
+            afw_describe_address((uintptr_t)orig, w2, sizeof w2);
+            fprintf(stderr, "  inside the fs:[reg] trampoline that replaces the instruction at %s\n", w2);
+        }
+    }
     if (er->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION && ip[0] == 0x0F && ip[1] == 0x0B)
         fprintf(stderr, "  this is a syscall site the loader REFUSED to patch (it was turned into ud2);\n"
                         "  see the [patch] REFUSED lines printed when the library was loaded\n");
