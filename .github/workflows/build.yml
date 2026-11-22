@@ -112,8 +112,9 @@ jobs:
           # 3 sites are reported as ATTESTED, never as proven
           grep -E "^(SHA256|ATTEST|GATE) |\[attest\]|\[audit\] ATTESTED" out/patch-scan.txt || true
           grep -q "GATE ld-android.so: would RUN" out/patch-scan.txt
-          grep -q "GATE libc++_shared.so: would RUN" out/patch-scan.txt
-          grep -q "ATTEST libc++_shared.so: 2 applied, 0 rejected, 6 look-alikes reached only through attested entries, 0 unproven left" out/patch-scan.txt
+          # libc++: one table (0xd54f2) needs the cross-block analysis; until then 1 UNPROVEN, refused
+          grep -q "GATE libc++_shared.so: would REFUSE" out/patch-scan.txt
+          grep -q "ATTEST libc++_shared.so: 1 applied, 0 rejected, 5 look-alikes reached only through attested entries, 1 unproven left" out/patch-scan.txt
           grep -q "ATTEST ld-android.so: 2 applied, 0 rejected, 3 look-alikes reached only through attested entries, 0 unproven left" out/patch-scan.txt
           echo "--- the evidence behind every attestation, for the people who sign (attest-scan.txt)"
           for f in out/bionic/linker64 out/libc++_shared.so; do
@@ -150,9 +151,9 @@ jobs:
           n=$(grep -c "^====" out/unproven-scan.txt || true)
           # 9 look-alikes were UNPROVEN; all of them are now reached only through attested
           # table entries (src/attest.c) and reported as ATTESTED, never as proven
-          echo "UNPROVEN sites recorded: $n (expected 0)"
-          test "$n" -eq 0
-          test "$(grep -c "\[audit\] ATTESTED: " out/patch-scan.txt)" -eq 9
+          echo "UNPROVEN sites recorded: $n (expected 1: libc++ 0xd5556)"
+          test "$n" -eq 1
+          test "$(grep -c "\[audit\] ATTESTED: " out/patch-scan.txt)" -eq 8
       - uses: actions/upload-artifact@v4
         with:
           name: bionic-scan-report

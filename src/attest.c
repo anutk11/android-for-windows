@@ -37,7 +37,11 @@ static const record g_records[] = {
     {LINKER64, {0x8088c, 0xd940, 6, "linker64 table 0xd940: entries 0-5 (sites 0x808da = entry 3, 0x80914 = entry 5)"}},
     {LINKER64, {0x96c15, 0x105a4, 8, "linker64 table 0x105a4: entries 0-7 (site 0x96c3d = entry 0)"}},
     {LIBCXX,   {0xd4635, 0x593d8, 6, "libc++ table 0x593d8: entries 0-5 (sites 0xd4acd..0xd4b30 via case blocks)"}},
-    {LIBCXX,   {0xd54f2, 0x59450, 6, "libc++ table 0x59450: entries 0-5 (site 0xd5556 = entry 0)"}},
+    /* libc++ 0xd54f2 / 0x59450 / k=6 (site 0xd5556) is NOT here, although signed by
+     * reviewer 3: its second dispatch (0xd5554) reuses r15 = T from a lea far
+     * before, across calls, which the straight-line chain check cannot prove.
+     * Needs the cross-block "register holds T" analysis (planned). Until then
+     * libc++ keeps 1 UNPROVEN site and is refused. */
 };
 
 #ifdef AFW_TEST
