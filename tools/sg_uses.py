@@ -14,10 +14,48 @@ import re
 import sys
 from collections import defaultdict
 
+# GOT slots of __loader_shared_globals (from the relocations, argv): calls
+# through the GOT (-fno-plt) show only the slot's address, not the name.
+got = {a.lower().lstrip("0x").lstrip("0") for a in sys.argv[1:]}
+
+
+def to_sg(text, op):
+    if not text.startswith(op):
+        return False
+    if "__loader_shared_globals" in text:
+        return True
+    m = re.search(r"#\s*0x([0-9a-f]+)", text)
+    return bool(m and m.group(1).lstrip("0") in got)
+
+
+# libc's own __libc_shared_globals() may stay a wrapper that tail-jumps to the
+# loader; libc.so is stripped, so it is found by address: a function whose
+# first instruction is that jump. Calls to it count as calls.
+wrappers = set()
+
+
+def calls_sg(text):
+    if to_sg(text, "call"):
+        return True
+    m = re.match(r"call\w*\s+0x([0-9a-f]+)", text)
+    return bool(m and m.group(1).lstrip("0") in wrappers)
+
+
 func = None
 lines = sys.stdin.read().splitlines()
 uses = defaultdict(set)
 out = []
+prev = ""
+for ln in lines:
+    m = re.match(r"^\s+([0-9a-f]+):\s+(.*)$", ln)
+    if m:
+        if to_sg(m.group(2).strip(), "jmp") and (prev == "" or re.match(r"(ret|int3|nop|jmp)", prev)):
+            wrappers.add(m.group(1).lstrip("0"))
+        prev = m.group(2).strip()
+    elif ln.strip():
+        prev = ""
+print("wrappers (a function that only jumps to __loader_shared_globals): %s"
+      % (", ".join("0x" + w for w in sorted(wrappers)) or "none"))
 i = 0
 hdr = re.compile(r"^[0-9a-f]+ <(.+)>:$")
 ins = re.compile(r"^\s+([0-9a-f]+):\s+(.*)$")
@@ -28,7 +66,7 @@ while i < len(lines):
         i += 1
         continue
     m = ins.match(lines[i])
-    if m and "call" in m.group(2) and "__loader_shared_globals" in m.group(2):
+    if m and calls_sg(m.group(2).strip()):
         out.append("== %s  (call at 0x%s)" % (func, m.group(1)))
         regs = {"rax"}
         for k in range(i + 1, min(i + 25, len(lines))):

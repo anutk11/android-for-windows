@@ -100,9 +100,13 @@ jobs:
       - name: "Measure: which libc_shared_globals fields libc.so uses (G1 libc init)"
         run: |
           NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"; TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          "$TC/llvm-objdump" -d --no-show-raw-insn out/bionic/libc.so | python3 -I tools/sg_uses.py | tee out/shared-globals-scan.txt
+          slots=$("$TC/llvm-readelf" -rW out/bionic/libc.so | awk '/__loader_shared_globals/{print $1}')
+          echo "GOT/PLT slots of __loader_shared_globals: $slots"
+          "$TC/llvm-objdump" -d --no-show-raw-insn out/bionic/libc.so | python3 -I tools/sg_uses.py $slots | tee out/shared-globals-scan.txt
+          echo "--- every instruction that mentions a slot (calls and loads)"
+          for s in $slots; do "$TC/llvm-objdump" -d --no-show-raw-insn out/bionic/libc.so | grep -c "# 0x$(echo $s | sed 's/^0*//')" || true; done
           echo "--- other __loader_* imports of libc.so and libdl.so"
-          "$TC/llvm-readelf" --dyn-syms -W out/bionic/libc.so out/bionic/libdl.so | grep -E "UND .*__loader_|File:" || true
+          "$TC/llvm-readelf" --dyn-syms -W out/bionic/libc.so | grep -E "UND .*__loader_|File:" || true
           echo "--- libc.so constructors (.init_array) and the symbols at their addresses"
           "$TC/llvm-readelf" -x .init_array out/bionic/libc.so | tail -n +3 || true
       - name: "Measure: patch the real libraries (never run them)"
