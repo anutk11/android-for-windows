@@ -22,4 +22,7 @@ void afw_shim_run_atexit(void);
 /* Statistics for the report. */
 int afw_shim_count(void);
 
+/* libc_shared_globals for the pinned libc build (exposed for tests) */
+void *afw_shared_globals(void);
+
 #endif

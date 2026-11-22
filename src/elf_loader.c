@@ -298,6 +298,28 @@ static int patch_readable(const void *ctx, uint64_t addr, uint64_t len) {
     return afw_lib_readable((const afw_lib *)ctx, addr, len);
 }
 
+/* NT_GNU_BUILD_ID of a PT_NOTE, as lowercase hex, bounds-checked. */
+static void read_build_id(const unsigned char *f, size_t n, const Elf64_Phdr *p, char out[AFW_BUILD_ID_HEX]) {
+    uint64_t o = p->p_offset, end;
+    if (o > n || p->p_filesz > n - o) return;
+    end = o + p->p_filesz;
+    while (end - o >= 12) {
+        uint32_t nsz, dsz, type, k;
+        uint64_t name, desc, next;
+        memcpy(&nsz, f + o, 4); memcpy(&dsz, f + o + 4, 4); memcpy(&type, f + o + 8, 4);
+        name = o + 12;
+        desc = name + (((uint64_t)nsz + 3) & ~3ull);
+        next = desc + (((uint64_t)dsz + 3) & ~3ull);
+        if (desc > end || next > end) return;
+        if (type == 3 && nsz == 4 && memcmp(f + name, "GNU", 4) == 0 &&
+            dsz > 0 && (size_t)dsz * 2 < AFW_BUILD_ID_HEX) {
+            for (k = 0; k < dsz; k++) snprintf(out + 2 * k, 3, "%02x", f[desc + k]);
+            return;
+        }
+        o = next;
+    }
+}
+
 static int g_defer_finish;
 static int lib_finish(afw_lib *lib, int verbose);
 static void discard(afw_lib *lib);
@@ -380,6 +402,8 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
         } else if (ph[i].p_type == PT_GNU_RELRO) {
             relro_copy = ph[i];
             relro_ph = &relro_copy;
+        } else if (ph[i].p_type == PT_NOTE) {
+            read_build_id(file, fsize, &ph[i], lib->build_id);
         } else if (ph[i].p_type == PT_TLS) {
             if (afw_load_patch_only) fprintf(stderr, "note: PT_TLS present (ignored in measurement mode)\n");
             else { tls_copy = ph[i]; tls_ph = &tls_copy; }
@@ -534,6 +558,16 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
         if (!name[0]) continue;
         {
             void *shim = afw_shim_lookup(name);
+            /* libc_shared_globals' layout is measured for one libc build only
+             * (docs/design/G1-LIBC-INIT.md): any other build would read and
+             * write the wrong fields. */
+            if (shim && strcmp(name, "__loader_shared_globals") == 0 && !afw_load_patch_only &&
+                strcmp(lib->build_id, AFW_SHARED_GLOBALS_BUILD_ID) != 0) {
+                fprintf(stderr, "error: %s needs libc_shared_globals, whose layout is known only for libc.so\n"
+                                "       Build ID %s; this one is '%s'. Refusing to guess it.\n",
+                        path, AFW_SHARED_GLOBALS_BUILD_ID, lib->build_id);
+                free(symaddr); free(imp_ifunc); free(pageprot); return -1;
+            }
             int gi = 0;
             void *glob = loader_override(name) ? NULL : global_lookup(name, lib, &gi);
             if (glob) {                                 /* another loaded library defines it */

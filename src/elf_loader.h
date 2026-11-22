@@ -12,6 +12,10 @@
 
 #define AFW_MAX_NEEDED 32
 
+#define AFW_BUILD_ID_HEX 65
+/* the only libc.so whose libc_shared_globals layout is measured (tools/fetch_bionic.py pins it) */
+#define AFW_SHARED_GLOBALS_BUILD_ID "fa337969c798946280caa45e2d71a2e7"
+
 typedef struct afw_lib_s {
     const char *path;
     unsigned char *base;        /* where the library lives in memory */
@@ -43,6 +47,8 @@ typedef struct afw_lib_s {
     /* IRELATIVE relocations, run only after the code is patched and executable */
     struct { uint64_t *where; uint64_t resolver; } *irel;
     size_t nirel, capirel;             /* 1-based static TLS module id, 0 = no PT_TLS */
+
+    char build_id[AFW_BUILD_ID_HEX];   /* NT_GNU_BUILD_ID, hex; "" if none */
 
     /* phase A done, phase B (TLS close, IFUNC, RELRO, constructors) not yet */
     int pending;

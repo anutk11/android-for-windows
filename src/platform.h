@@ -48,6 +48,9 @@ int afw_mem_protect(void *addr, size_t size, int prot);
 /* Make sure the CPU sees freshly written code. */
 void afw_flush_icache(void *addr, size_t size);
 
+/* n bytes from the OS's cryptographic random generator; 0 on success */
+int afw_random_bytes(void *buf, size_t n);
+
 /* Check Windows exploit-protection policies that would block the engine
  * (ACG forbids creating or patching executable memory). Can be forced on a
  * program from outside, by an administrator. Returns 0 if we can run. */

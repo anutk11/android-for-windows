@@ -138,6 +138,62 @@ static SYSV int s_android_log_write(int prio, const char *tag, const char *text)
 typedef struct { const char *name; void *addr; } shim_entry;
 
 #define S(n, f) { n, (void *)(f) }
+
+/* ---- libc_shared_globals (G1: the real libc.so's constructors) -------
+ * The struct the Android linker shares with libc.so. Its layout is that of
+ * ONE libc build (Build ID AFW_SHARED_GLOBALS_BUILD_ID; the loader refuses
+ * any other), measured from that build's own code (tools/sg_uses.py) and
+ * matched against the AOSP field order (docs/design/G1-LIBC-INIT.md). Every
+ * field not set here is zero, as the linker's constexpr constructor leaves
+ * it: an empty fd table, an unlocked abort-message mutex, no TLS modules. */
+#define SG_SIZE              0x1000   /* last field measured: 0x680 */
+#define SG_AUXV              0x418
+#define SG_INIT_PROGNAME     0x630
+#define SG_INIT_ENVIRON      0x638
+#define AT_NULL_    0
+#define AT_PAGESZ_  6
+#define AT_UID_     11
+#define AT_EUID_    12
+#define AT_GID_     13
+#define AT_EGID_    14
+#define AT_HWCAP_   16
+#define AT_SECURE_  23
+#define AT_RANDOM_  25
+#define AT_HWCAP2_  26
+
+static uint64_t g_sg_mem[SG_SIZE / 8];
+static uint64_t g_auxv[2 * 12];
+static unsigned char g_at_random[16];
+static char *g_environ[1];
+static int g_sg_ready;
+
+static void put_auxv(int *k, uint64_t type, uint64_t val) { g_auxv[(*k)++] = type; g_auxv[(*k)++] = val; }
+
+void *afw_shared_globals(void) {
+    unsigned char *sg = (unsigned char *)g_sg_mem;
+    if (!g_sg_ready) {
+        int k = 0;
+        uint64_t p;
+        if (afw_random_bytes(g_at_random, sizeof g_at_random) != 0) {
+            fprintf(stderr, "[bionic-win] no random bytes for AT_RANDOM (the stack guard's seed)\n");
+            exit(3);
+        }
+        put_auxv(&k, AT_PAGESZ_, 4096);
+        put_auxv(&k, AT_UID_, 10000); put_auxv(&k, AT_EUID_, 10000);   /* an app's uid range */
+        put_auxv(&k, AT_GID_, 10000); put_auxv(&k, AT_EGID_, 10000);
+        put_auxv(&k, AT_HWCAP_, 0); put_auxv(&k, AT_HWCAP2_, 0);
+        put_auxv(&k, AT_SECURE_, 0);
+        put_auxv(&k, AT_RANDOM_, (uint64_t)(uintptr_t)g_at_random);
+        put_auxv(&k, AT_NULL_, 0);
+        p = (uint64_t)(uintptr_t)g_auxv;           memcpy(sg + SG_AUXV, &p, 8);
+        p = (uint64_t)(uintptr_t)g_environ;        memcpy(sg + SG_INIT_ENVIRON, &p, 8);
+        p = (uint64_t)(uintptr_t)"android-for-windows"; memcpy(sg + SG_INIT_PROGNAME, &p, 8);
+        g_sg_ready = 1;
+    }
+    return sg;
+}
+static SYSV void *s_loader_shared_globals(void) { return afw_shared_globals(); }
+
 static const shim_entry g_shims[] = {
     S("strlen", s_strlen), S("strcmp", s_strcmp), S("strncmp", s_strncmp),
     S("strcpy", s_strcpy), S("strncpy", s_strncpy), S("strcat", s_strcat),
@@ -160,6 +216,7 @@ static const shim_entry g_shims[] = {
     S("__android_log_write", s_android_log_write),
     /* TEMPORARY for G1: ahead of libc's own, until bionic's DTV is built (G2) */
     S("__tls_get_addr", afw_tls_get_addr),
+    S("__loader_shared_globals", s_loader_shared_globals),
 };
 #undef S
 
