@@ -1042,6 +1042,15 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                         describe(c, p, where, sizeof where);
                         fprintf(stderr, "  [attest] REJECTED in the function at %s: code reached through the attested "
                                         "entries has another unresolved indirect jump - not used\n", where);
+                        if (why2 && ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, why2, 16, &ins, ops))) {
+                            ZydisFormatter fm;
+                            char tx[128];
+                            ZydisFormatterInit(&fm, ZYDIS_FORMATTER_STYLE_INTEL);
+                            ZydisFormatterFormatInstruction(&fm, &ins, ops, ins.operand_count_visible, tx, sizeof tx,
+                                                            (ZyanU64)((intptr_t)why2 - c->bias), ZYAN_NULL);
+                            fprintf(stderr, "           unresolved jumps after the re-run: %d, last at +0x%llx: %s\n",
+                                    und2, (long long)((intptr_t)why2 - c->bias), tx);
+                        }
                     } else { maps0[r] = map; map = maps[r] = m2; undecided[r] = und2; why = why2; }
                 }
             }
