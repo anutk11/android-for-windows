@@ -107,6 +107,12 @@ jobs:
           for s in $slots; do "$TC/llvm-objdump" -d --no-show-raw-insn out/bionic/libc.so | grep -c "# 0x$(echo $s | sed 's/^0*//')" || true; done
           echo "--- other __loader_* imports of libc.so and libdl.so"
           "$TC/llvm-readelf" --dyn-syms -W out/bionic/libc.so | grep -E "UND .*__loader_|File:" || true
+          echo "--- G1 TCB: how libc reaches its per-thread state (thread pointer slots, errno, pthread_internal_t)"
+          "$TC/llvm-objdump" -d --no-show-raw-insn --disassemble-symbols=__errno,pthread_self,gettid,__get_thread,__set_errno_internal,_Z25__libc_init_main_thread_earlyRK19KernelArgumentBlockP10bionic_tcb,_Z24__libc_init_main_thread_latev,_Z23__libc_init_main_threadP10bionic_tcb out/bionic/libc.so | head -120 || true
+          echo "--- the first Windows crash site (libc.so+0xb7cd8: errno written through an empty slot)"
+          "$TC/llvm-objdump" -d --no-show-raw-insn --start-address=0xb7cb0 --stop-address=0xb7ce8 out/bionic/libc.so | tail -n +6
+          echo "--- every distinct fs: displacement in libc.so (which TCB slots are used, how often)"
+          "$TC/llvm-objdump" -d --no-show-raw-insn out/bionic/libc.so | grep -oE "%fs:0x[0-9a-f]+" | sort | uniq -c
           echo "--- libc.so constructors (.init_array) and the symbols at their addresses"
           "$TC/llvm-readelf" -x .init_array out/bionic/libc.so | tail -n +3 || true
       - name: "Measure: patch the real libraries (never run them)"
