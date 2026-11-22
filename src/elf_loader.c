@@ -124,11 +124,18 @@ static int apply_rela(afw_lib *lib, const Elf64_Rela *rel, size_t count,
         case R_X86_64_RELATIVE: *where = (uint64_t)lib->bias + A; break;
         case R_X86_64_IRELATIVE: {
             typedef SYSV uint64_t (*resolver_fn)(void);
+            if (afw_load_patch_only) break;  /* never run library code when measuring */
             resolver_fn r = (resolver_fn)(uintptr_t)(lib->bias + A);
             *where = r();
             break;
         }
         default:
+            if (afw_load_patch_only) {
+                static int warned[64];
+                if (type < 64 && !warned[type]++)
+                    fprintf(stderr, "note: relocation type %u not supported yet (skipped in measurement mode)\n", type);
+                break;
+            }
             fprintf(stderr, "error: unsupported relocation type %u at 0x%llx\n",
                     type, (unsigned long long)rel[i].r_offset);
             return -1;
