@@ -85,7 +85,7 @@ __attribute__((naked)) void afw_syscall_entry(void) {
         "and $-16, %rsp\n\t"
         "sub $32, %rsp\n\t"
         DISPATCH_ARGS
-        "call afw_syscall_dispatch\n\t"
+        "call afw_syscall_from_entry\n\t"
         "movdqu -304(%rbp), %xmm0\n\t"
         "movdqu -288(%rbp), %xmm1\n\t"
         "movdqu -272(%rbp), %xmm2\n\t"
@@ -291,6 +291,22 @@ static int64_t sys_getpid(void) {
 #else
     return (int64_t)getpid();
 #endif
+}
+
+/* The last syscall the process made (diagnosis: the watchdog). The
+ * entry frame holds the return address into the patched wrapper at
+ * rbp+16, 64 bytes above args (rbp-48). Only set when called through the
+ * entry (afw_syscall_entry_frame), never from tests calling dispatch. */
+volatile int64_t afw_last_syscall_nr = -1;
+volatile int64_t afw_last_syscall_args[6];
+volatile uint64_t afw_last_syscall_ret;
+
+int64_t afw_syscall_from_entry(int64_t nr, int64_t *a) {
+    int i;
+    afw_last_syscall_nr = nr;
+    for (i = 0; i < 6; i++) afw_last_syscall_args[i] = a[i];
+    afw_last_syscall_ret = ((uint64_t *)a)[8];
+    return afw_syscall_dispatch(nr, a);
 }
 
 int64_t afw_syscall_dispatch(int64_t nr, int64_t *a) {

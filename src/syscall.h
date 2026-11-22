@@ -31,4 +31,11 @@ int64_t afw_syscall_dispatch(int64_t nr, int64_t *args);
 extern long afw_syscall_counts[AFW_MAX_SYSCALL];
 void afw_syscall_report(void);
 
+/* The last syscall made through the entry: number, arguments, and the
+ * return address into the Android code that made it (diagnosis). */
+extern volatile int64_t afw_last_syscall_nr;
+extern volatile int64_t afw_last_syscall_args[6];
+extern volatile uint64_t afw_last_syscall_ret;
+int64_t afw_syscall_from_entry(int64_t nr, int64_t *args);
+
 #endif

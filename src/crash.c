@@ -70,7 +70,7 @@ static void wd_sample(int n) {
     CONTEXT c;
     char where[512];
     int i;
-    uint64_t sp[48];
+    uint64_t sp[512];
     SIZE_T got = 0;
     memset(&c, 0, sizeof c);
     c.ContextFlags = CONTEXT_FULL;
@@ -97,6 +97,18 @@ static DWORD WINAPI wd_thread(LPVOID unused) {
     fflush(stdout);
     fprintf(stderr, "\n=== WATCHDOG: no end after %lu s ===\n", (unsigned long)g_wd_seconds);
     for (k = 1; k <= 3; k++) { wd_sample(k); if (k < 3) Sleep(200); }
+    if (afw_last_syscall_nr >= 0) {
+        char where[512];
+        fprintf(stderr, "last syscall: %lld (%llx, %llx, %llx, %llx, %llx, %llx)\n",
+                (long long)afw_last_syscall_nr,
+                (unsigned long long)afw_last_syscall_args[0], (unsigned long long)afw_last_syscall_args[1],
+                (unsigned long long)afw_last_syscall_args[2], (unsigned long long)afw_last_syscall_args[3],
+                (unsigned long long)afw_last_syscall_args[4], (unsigned long long)afw_last_syscall_args[5]);
+        if (afw_describe_address((uintptr_t)afw_last_syscall_ret, where, sizeof where))
+            fprintf(stderr, "  made from %s\n", where);
+        else
+            fprintf(stderr, "  made from 0x%llx\n", (unsigned long long)afw_last_syscall_ret);
+    }
     fprintf(stderr, "syscalls so far:\n");
     afw_syscall_report();
     fflush(stderr); fflush(stdout);

@@ -177,6 +177,12 @@ static int run_syscall_tests(const afw_lib *lib) {
      * function pointer (afw_apply, crtbegin): undecided, but harmless as long
      * as no syscall/fs: look-alike sits in the bytes nothing reaches. */
     check("no unproven syscall/fs: look-alikes left", lib->patch.unproven == 0);
+    {   /* the watchdog's record of the last syscall points back into the caller */
+        uintptr_t gpa = (uintptr_t)gp;
+        gp();
+        check("last-syscall record: number 39, return address just after the site in afw_sys_getpid",
+              afw_last_syscall_nr == 39 && afw_last_syscall_ret > gpa && afw_last_syscall_ret < gpa + 64);
+    }
     check("both other sites patched by moving instructions (generic syscall, mov rax)",
           lib->patch.sys_patched_moved == 2);
     check("the site with a branch into its middle was REFUSED", lib->patch.sys_refused_branch == 1);
