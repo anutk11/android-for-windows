@@ -224,18 +224,17 @@ static int64_t sys_clock_gettime(int64_t clk, struct lnx_timespec *tp) {
 #define FUTEX_CLOCK_REALTIME 256
 #define FUTEX_BITSET_MATCH_ANY 0xffffffffu
 
-/* Milliseconds to wait, rounded UP (never return before the deadline), or
- * INFINITE; -1 for a malformed timespec. */
 #if defined(_WIN32)
-static int64_t wait_ms(const struct lnx_timespec *t, int absolute, int64_t clk) {
+/* The deadline in ns on clock clk: a relative timeout becomes absolute on
+ * MONOTONIC now. 0 = none (wait forever); -1 = a malformed timespec. */
+static int64_t deadline_ns(const struct lnx_timespec *t, int absolute, int64_t *clk) {
     int64_t ns;
-    if (!t) return INFINITE;
+    if (!t) return 0;
     if (t->tv_sec < 0 || t->tv_nsec < 0 || t->tv_nsec >= 1000000000LL) return -1;
-    if (t->tv_sec > (INT64_MAX - 999999999LL) / 1000000000LL) return INFINITE;
+    if (t->tv_sec > (INT64_MAX / 2) / 1000000000LL) return 0;          /* centuries: forever */
     ns = t->tv_sec * 1000000000LL + t->tv_nsec;
-    if (absolute) { int64_t now = clock_ns(clk); ns = ns > now ? ns - now : 0; }
-    ns = (ns + 999999) / 1000000;
-    return ns >= (int64_t)INFINITE ? (int64_t)INFINITE - 1 : ns;
+    if (!absolute) { *clk = LNX_CLOCK_MONOTONIC; ns += clock_ns(LNX_CLOCK_MONOTONIC); }
+    return ns > 0 ? ns : 1;
 }
 #endif
 
@@ -251,13 +250,24 @@ static int64_t sys_futex(int64_t uaddr, int64_t op_full, int64_t val, int64_t ts
 #if defined(_WIN32)
     if (op == FUTEX_WAIT || op == FUTEX_WAIT_BITSET) {
         int32_t expect = (int32_t)val;
-        int64_t ms = wait_ms((const struct lnx_timespec *)(uintptr_t)ts, op == FUTEX_WAIT_BITSET,
-                             (op_full & FUTEX_CLOCK_REALTIME) ? LNX_CLOCK_REALTIME : LNX_CLOCK_MONOTONIC);
-        if (ms < 0) return -LNX_EINVAL;
+        int64_t clk = (op_full & FUTEX_CLOCK_REALTIME) ? LNX_CLOCK_REALTIME : LNX_CLOCK_MONOTONIC;
+        int64_t dl = deadline_ns((const struct lnx_timespec *)(uintptr_t)ts, op == FUTEX_WAIT_BITSET, &clk);
+        if (dl < 0) return -LNX_EINVAL;
         if (*p != expect) return -LNX_EAGAIN;           /* the value already changed */
-        if (WaitOnAddress((volatile VOID *)p, &expect, sizeof expect, (DWORD)ms)) return 0;
-        return GetLastError() == ERROR_TIMEOUT ? -LNX_ETIMEDOUT : -LNX_EINVAL;
-        /* a return of 0 may be spurious: futex callers re-check, as on Linux */
+        for (;;) {
+            DWORD ms = INFINITE;
+            if (dl) {
+                int64_t left = dl - clock_ns(clk);
+                if (left <= 0) return -LNX_ETIMEDOUT;
+                left = (left + 999999) / 1000000;       /* round up */
+                ms = left >= (int64_t)INFINITE ? INFINITE - 1 : (DWORD)left;
+            }
+            if (WaitOnAddress((volatile VOID *)p, &expect, sizeof expect, ms)) return 0;
+            /* a return of 0 may be spurious: futex callers re-check, as on Linux */
+            if (GetLastError() != ERROR_TIMEOUT) return -LNX_EINVAL;
+            /* Windows timers may fire up to a tick early: never report a
+             * timeout before the deadline (measured: a test failed on CI) */
+        }
     }
     if (op == FUTEX_WAKE || op == FUTEX_WAKE_BITSET) {
         /* WakeByAddress* does not say how many woke; bionic ignores the count.
