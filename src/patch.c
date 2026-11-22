@@ -409,6 +409,17 @@ static int attest_chain(ZydisDecoder *dec, unsigned char *const *win, int n, con
     return 1;
 }
 
+/* Addresses of the unresolved indirect jumps the last reach_map() reached
+ * (distinct, first 16; g_nunres counts all distinct ones). */
+static const unsigned char *g_unres[16];
+static int g_nunres;
+static void note_unresolved(const unsigned char *p) {
+    int i;
+    for (i = 0; i < g_nunres && i < 16; i++) if (g_unres[i] == p) return;
+    if (g_nunres < 16) g_unres[g_nunres] = p;
+    g_nunres++;
+}
+
 /* Re-verify one attestation against the bytes in memory (reviewer 3, #2 and
  * PR #7): the jump is an indirect "jmp reg", decoded at its own address and
  * reached by the analysis, inside this function; a rip-relative lea of the
@@ -432,7 +443,8 @@ static int attest_verify(ZydisDecoder *dec, const afw_patch_ctx *c, unsigned cha
     /* J must be the ONLY unresolved indirect jump the analysis reached in this
      * function: another one could land anywhere, inside the chain included
      * (reviewer 2, PR #7) */
-    if (und_count != 1 || und_why != J) {
+    (void)und_count; (void)und_why;
+    if (g_nunres != 1 || g_unres[0] != J) {     /* distinct unresolved jumps of the last analysis */
         *why = "the function has another unresolved indirect jump besides the attested one"; return -1;
     }
     if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, J, (ZyanUSize)(fend - J), &ins, ops)) ||
@@ -637,6 +649,7 @@ static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t s
     uint64_t lo = (uint64_t)(uintptr_t)base, hi = lo + size;
     flow_state *f = (flow_state *)malloc(sizeof *f);
     *undecided = 0;
+    g_nunres = 0;
     VEC_PUSH(work, nwork, capwork, (size_t)0);
     {
         int e;
@@ -727,14 +740,14 @@ static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t s
                                 uint64_t t2 = tab + (uint64_t)(int64_t)ent[e];
                                 if (t2 < lo || t2 >= hi) bad = 1;
                             }
-                            if (bad) { (*undecided)++; *why = base + off; }   /* counts unresolved jumps */
+                            if (bad) { (*undecided)++; *why = base + off; note_unresolved(base + off); }
                             else for (e = 0; e < n; e++) {
                                 uint64_t t2 = tab + (uint64_t)(int64_t)ent[e];
                                 VEC_PUSH(work, nwork, capwork, (size_t)(t2 - lo));
                                 VEC_PUSH(*tt, *ntt, *captt, t2);   /* also a branch target */
                             }
                         } else {
-                            (*undecided)++; *why = base + off;
+                            (*undecided)++; *why = base + off; note_unresolved(base + off);
                         }
                     }
                 }
@@ -1033,8 +1046,8 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                     for (q2 = npads - added; q2 < npads; q2++)   /* the jump lands there: branch targets */
                         VEC_PUSH(targets, ntargets, captargets, pads[q2]);
                     if (!m2) { fprintf(stderr, "  [attest] FATAL: out of memory re-running the analysis\n"); fatal = 1; }
-                    else if (und2 != 1 || why2 == NULL ||
-                             (uint64_t)(uintptr_t)why2 != (uint64_t)(c->bias + (intptr_t)c->attest[last_a].jmp_rva)) {
+                    else if (g_nunres != 1 ||
+                             (uint64_t)(uintptr_t)g_unres[0] != (uint64_t)(c->bias + (intptr_t)c->attest[last_a].jmp_rva)) {
                         /* code reached through the attested entries has ANOTHER unresolved
                          * indirect jump: it could land in the chain - the attestation fails */
                         free(m2);
@@ -1042,14 +1055,19 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                         describe(c, p, where, sizeof where);
                         fprintf(stderr, "  [attest] REJECTED in the function at %s: code reached through the attested "
                                         "entries has another unresolved indirect jump - not used\n", where);
-                        if (why2 && ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, why2, 16, &ins, ops))) {
+                        {
+                            int u;
                             ZydisFormatter fm;
                             char tx[128];
                             ZydisFormatterInit(&fm, ZYDIS_FORMATTER_STYLE_INTEL);
-                            ZydisFormatterFormatInstruction(&fm, &ins, ops, ins.operand_count_visible, tx, sizeof tx,
-                                                            (ZyanU64)((intptr_t)why2 - c->bias), ZYAN_NULL);
-                            fprintf(stderr, "           unresolved jumps after the re-run: %d, last at +0x%llx: %s\n",
-                                    und2, (long long)((intptr_t)why2 - c->bias), tx);
+                            for (u = 0; u < g_nunres && u < 16; u++)
+                                if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, g_unres[u], 16, &ins, ops))) {
+                                    ZydisFormatterFormatInstruction(&fm, &ins, ops, ins.operand_count_visible, tx,
+                                                                    sizeof tx, (ZyanU64)((intptr_t)g_unres[u] - c->bias),
+                                                                    ZYAN_NULL);
+                                    fprintf(stderr, "           unresolved jump +0x%llx: %s\n",
+                                            (long long)((intptr_t)g_unres[u] - c->bias), tx);
+                                }
                         }
                     } else { maps0[r] = map; map = maps[r] = m2; undecided[r] = und2; why = why2; }
                 }
