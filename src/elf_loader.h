@@ -39,7 +39,10 @@ typedef struct afw_lib_s {
     int nxsec;
     afw_patch_report patch;
 
-    int tls_module;             /* 1-based static TLS module id, 0 = no PT_TLS */
+    int tls_module;
+    /* IRELATIVE relocations, run only after the code is patched and executable */
+    struct { uint64_t *where; uint64_t resolver; } *irel;
+    size_t nirel, capirel;             /* 1-based static TLS module id, 0 = no PT_TLS */
 
     /* report */
     int nrelocs;

@@ -35,6 +35,18 @@ double afw_sys_keeps_xmm(double x) {
     return y;
 }
 
+/* RFLAGS survive a syscall, as on Linux (sysret restores them): set CF and
+ * ZF, call getpid, read them back. Returns 3 if both survived. */
+int afw_sys_keeps_flags(void) {
+    int cf, zf;
+    __asm__ volatile("xor %%ecx, %%ecx\n\t"   /* ZF = 1 */
+                     "stc\n\t"                 /* CF = 1 */
+                     "mov $39, %%eax\n\tsyscall\n\t"
+                     "setc %b0\n\tsetz %b1"
+                     : "=q"(cf), "=q"(zf) : : "rax", "rcx", "r11", "memory");
+    return (cf & 1) | ((zf & 1) << 1);
+}
+
 /*
  * UNSAFE on purpose: a branch lands on the syscall itself, in the middle of
  * the 7-byte site. The loader must refuse to patch it (and say so loudly).

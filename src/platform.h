@@ -41,6 +41,8 @@ int afw_check_security(void);
 
 /* Reserve+commit zeroed read/write memory. Returns NULL on failure. */
 void *afw_mem_alloc(size_t size);
+/* Release memory from afw_mem_alloc. */
+void afw_mem_free(void *addr, size_t size);
 /* Change protection of a page-aligned range. Returns 0 on success. */
 int afw_mem_protect(void *addr, size_t size, int prot);
 /* Make sure the CPU sees freshly written code. */

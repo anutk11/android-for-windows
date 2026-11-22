@@ -184,10 +184,13 @@ typedef struct {
     ZydisRegister ent_base[NREG];
     uint64_t sum_tab[NREG];  /* register = table + entry (proven) */
     uint64_t sum_cnt[NREG];
+    unsigned char zext[NREG]; /* upper 32 bits known to be zero (last write was 32-bit) */
+    uint64_t bound32[NREG];   /* LOW 32 bits known to be < bound32 (from cmp r32), 0 = unknown */
 } flow_state;
 
 static void reg_clear(flow_state *f, ZydisRegister r) {
     f->lea[r] = f->bound[r] = f->ent_tab[r] = f->sum_tab[r] = 0;
+    f->zext[r] = 0; f->bound32[r] = 0;
 }
 
 /* Full record of one UNPROVEN site, for review (docs/unproven/). Every
@@ -346,25 +349,37 @@ static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t s
     while (nwork) {
         ZydisRegister cmp_reg = ZYDIS_REGISTER_NONE;
         uint64_t cmp_imm = 0;
+        int cmp32 = 0;
         off = work[--nwork];
         memset(f, 0, sizeof *f);                  /* register facts hold along one path only */
         while (off < size && map[off] != 1) {
             int k, stop = 0, w;
             uint64_t ip = lo + off;
             ZydisRegister pending_cmp = cmp_reg;
+            int pending32 = cmp32;
             if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, base + off, (ZyanUSize)(size - off), &ins, ops))) break;
             map[off] = 1;
             cmp_reg = ZYDIS_REGISTER_NONE;
 
             /* --- facts produced by this instruction --- */
+            /* a compare bounds the 64-bit register only if it compares all 64 bits, or
+             * 32 bits whose upper half is known zero (reviewer 4, #8) */
             if (ins.mnemonic == ZYDIS_MNEMONIC_CMP && ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && (ops[0].size == 64 || ops[0].size == 32)) {
                 cmp_reg = reg64(ops[0].reg.value);
-                cmp_imm = ops[1].imm.value.u;
+                cmp32 = ops[0].size == 32;
+                cmp_imm = cmp32 ? (ops[1].imm.value.u & 0xFFFFFFFFu) : ops[1].imm.value.u;
             } else if (pending_cmp != ZYDIS_REGISTER_NONE &&
                        (ins.mnemonic == ZYDIS_MNEMONIC_JNBE || ins.mnemonic == ZYDIS_MNEMONIC_JNB)) {
-                /* fall-through of "ja/jae default": unsigned index < bound */
-                f->bound[pending_cmp] = ins.mnemonic == ZYDIS_MNEMONIC_JNBE ? cmp_imm + 1 : cmp_imm;
+                /* fall-through of "ja/jae default": unsigned value < bound (no wrap) */
+                uint64_t b = 0;
+                if (ins.mnemonic == ZYDIS_MNEMONIC_JNB) b = cmp_imm;
+                else if (cmp_imm != UINT64_MAX) b = cmp_imm + 1;
+                if (b && !pending32) f->bound[pending_cmp] = b;
+                if (b && pending32) {
+                    f->bound32[pending_cmp] = b;                       /* the low 32 bits only */
+                    if (f->zext[pending_cmp]) f->bound[pending_cmp] = b;   /* upper half known 0 */
+                }
             }
             {
                 /* new values: clear facts of every register this instruction writes,
@@ -377,9 +392,19 @@ static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t s
                     if (ins.mnemonic == ZYDIS_MNEMONIC_LEA && ops[1].mem.base == ZYDIS_REGISTER_RIP &&
                         ops[1].mem.index == ZYDIS_REGISTER_NONE) {
                         keep_lea = ip + ins.length + (uint64_t)ops[1].mem.disp.value; recognised = 1;
-                    } else if (ins.mnemonic == ZYDIS_MNEMONIC_MOV && ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                        ZydisRegister src = reg64(ops[1].reg.value);   /* copies keep the bound */
+                    } else if (ins.mnemonic == ZYDIS_MNEMONIC_MOV && ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                               ops[0].size == 64) {
+                        ZydisRegister src = reg64(ops[1].reg.value);   /* a full copy keeps every fact */
                         keep_bound = f->bound[src]; keep_lea = f->lea[src]; recognised = 1;
+                    } else if (ins.mnemonic == ZYDIS_MNEMONIC_MOV && ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                               ops[0].size == 32) {
+                        /* mov r32, r32 = the source's LOW 32 bits, zero-extended: a bound on
+                         * those (cmp r32) or a full bound <= 2^32 holds for the whole register */
+                        ZydisRegister src = reg64(ops[1].reg.value);
+                        if (f->bound32[src]) keep_bound = f->bound32[src];
+                        if (f->bound[src] && f->bound[src] <= 0x100000000ull &&
+                            (!keep_bound || f->bound[src] < keep_bound)) keep_bound = f->bound[src];
+                        recognised = 1;
                     } else if (ins.mnemonic == ZYDIS_MNEMONIC_MOVSXD && ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
                                ops[1].mem.scale == 4 && ops[1].mem.disp.value == 0 &&
                                ops[1].mem.base != ZYDIS_REGISTER_NONE && f->lea[ops[1].mem.base] &&
@@ -395,6 +420,11 @@ static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t s
                 for (w = 0; w < ins.operand_count; w++)
                     if (ops[w].type == ZYDIS_OPERAND_TYPE_REGISTER && (ops[w].actions & ZYDIS_OPERAND_ACTION_MASK_WRITE))
                         reg_clear(f, reg64(ops[w].reg.value));
+                /* every write of a 32-bit general register zero-extends it */
+                for (w = 0; w < ins.operand_count; w++)
+                    if (ops[w].type == ZYDIS_OPERAND_TYPE_REGISTER && (ops[w].actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) &&
+                        ops[w].size == 32 && ZydisRegisterGetClass(ops[w].reg.value) == ZYDIS_REGCLASS_GPR32)
+                        f->zext[reg64(ops[w].reg.value)] = 1;
                 if (recognised && dst != ZYDIS_REGISTER_NONE) {
                     f->lea[dst] = keep_lea; f->bound[dst] = keep_bound;
                     f->ent_tab[dst] = keep_tab; f->ent_cnt[dst] = keep_cnt; f->ent_base[dst] = keep_base;
@@ -788,6 +818,16 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                     /* measured: real code only READS tp (fs:[0]) and the stack guard
                      * (fs:[0x28]), both constant per thread, so a per-thread copy in
                      * the TEB is exact. Anything else is not proven: block loading. */
+                    /* the rewrite changes a disp32 in place: any other encoding (disp8,
+                     * moffs64 "mov rax, fs:[imm64]") cannot be rewritten - block (reviewer 4) */
+                    if (!w && (d0 == 0 || d0 == 0x28) && ins.raw.disp.size != 32) {
+                        rep->fs_unsupported++;
+                        describe(c, p, where, sizeof where);
+                        fprintf(stderr, "  [patch] fs: access at %s has no 32-bit displacement (%s): cannot be "
+                                        "rewritten, library will not be run\n", where,
+                                ins.raw.disp.size ? "short displacement" : "moffs or other encoding");
+                        dump_ins(p, &ins, ops);
+                    }
                     if (w || (d0 != 0 && d0 != 0x28)) {
                         rep->fs_unsupported++;
                         describe(c, p, where, sizeof where);
@@ -803,6 +843,7 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                     uint64_t fs0, fe0;
                     if (!c || !c->bounds || !c->bounds(c->ctx, ip, &fs0, &fe0)) {
                         rep->fs_skipped_outside++;   /* never change bytes outside a known function */
+                        rep->fs_unsupported++;       /* ...and never run them unrewritten (reviewer 4) */
                         continue;
                     }
                     int teb = (d >= 0 && (d & 7) == 0) ? afw_tls_teb_offset((int)(d / 8)) : -1;

@@ -27,12 +27,16 @@ static long g_unimplemented[AFW_MAX_SYSCALL];
 
 /*
  * Stack frame built by the entry (offsets from rbp):
- *   rbp+8    return address into the patched wrapper
+ *   rbp+16   return address into the patched wrapper
+ *   rbp+8    the caller's RFLAGS (restored on return, like sysret)
  *   rbp-48   args[6] = rdi, rsi, rdx, r10, r8, r9
  *   rbp-304  xmm0..xmm15 (16 x 16 bytes)
  * then rsp is aligned to 16 and 32 bytes of shadow space are reserved
  * (required by the Windows ABI, harmless elsewhere).
  */
+/* Only the low 32 bits of rax are the syscall number: Linux treats it as an
+ * int since 5.13 ("x86/entry: Use int everywhere for system call numbers"),
+ * so 0x100000001 is write(), as here (checked for reviewer 4, #8). */
 #if defined(_WIN32)
 #  define DISPATCH_ARGS "mov %eax, %ecx\n\t lea -48(%rbp), %rdx\n\t"
 #else
@@ -41,6 +45,7 @@ static long g_unimplemented[AFW_MAX_SYSCALL];
 
 __attribute__((naked)) void afw_syscall_entry(void) {
     __asm__ volatile(
+        "pushfq\n\t"                 /* Linux returns from syscall with the caller's RFLAGS (reviewer 4) */
         "push %rbp\n\t"
         "mov %rsp, %rbp\n\t"
         "sub $304, %rsp\n\t"
@@ -94,6 +99,7 @@ __attribute__((naked)) void afw_syscall_entry(void) {
         "mov  -8(%rbp), %r9\n\t"
         "mov %rbp, %rsp\n\t"
         "pop %rbp\n\t"
+        "popfq\n\t"
         "ret\n\t");
 }
 

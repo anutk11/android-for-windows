@@ -36,6 +36,16 @@ int afw_tls_static_register(const void *image, const afw_tls_segment *seg, const
     return m + 1;
 }
 
+int afw_tls_static_unregister(int mod) {
+    if (g_finished || mod < 1 || mod != g_layout.nmod) return -1;
+    g_layout.nmod--;
+    g_layout.off[mod - 1] = 0;
+    g_image[mod - 1] = NULL;
+    memset(&g_seg[mod - 1], 0, sizeof g_seg[mod - 1]);
+    /* max_align may stay larger than needed: only wastes a little padding */
+    return 0;
+}
+
 uint64_t afw_tls_static_off(int mod) {
     return (mod >= 1 && mod <= g_layout.nmod) ? g_layout.off[mod - 1] : 0;
 }
