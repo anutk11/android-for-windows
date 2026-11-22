@@ -6,6 +6,9 @@
  *
  * If the library is test/hello.c (libhello.so), the M0 tests run as well.
  */
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE   /* pthread_timedjoin_np: a bounded join in the futex test */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +27,8 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#include <time.h>
+#include <unistd.h>
 #endif
 
 #define AFW_VERSION "0.2.0-M1-dev"
@@ -104,6 +109,56 @@ typedef double (SYSV *xmm_fn)(double);
 #include <unistd.h>
 #define host_pid() ((long)getpid())
 #endif
+
+/* A second thread waits on *w (futex WAIT, no timeout) until it is 1; this
+ * thread sets it and wakes. The join is bounded: a lost wake fails, never hangs. */
+static volatile int32_t *g_fw;
+static volatile int g_fw_done;
+static void futex_waiter(void) {
+    int64_t g[6];
+    while (*g_fw == 0) {
+        g[0] = (int64_t)(uintptr_t)g_fw; g[1] = 128; g[2] = 0; g[3] = 0; g[4] = 0; g[5] = 0;
+        afw_syscall_dispatch(202, g);
+    }
+    g_fw_done = 1;
+}
+#if defined(_WIN32)
+static DWORD WINAPI futex_waiter_w(LPVOID p) { (void)p; futex_waiter(); return 0; }
+#else
+static void *futex_waiter_p(void *p) { (void)p; futex_waiter(); return NULL; }
+#endif
+static int run_futex_threads(volatile int32_t *w) {
+    int64_t g[6] = {0};
+    int ok;
+    *w = 0; g_fw = w; g_fw_done = 0;
+#if defined(_WIN32)
+    {
+        HANDLE h = CreateThread(NULL, 0, futex_waiter_w, NULL, 0, NULL);
+        if (!h) return 0;
+        Sleep(50);                                   /* let it block */
+        *w = 1;
+        g[0] = (int64_t)(uintptr_t)w; g[1] = 128 | 1; g[2] = 1;
+        afw_syscall_dispatch(202, g);
+        ok = WaitForSingleObject(h, 5000) == WAIT_OBJECT_0 && g_fw_done;
+        if (!ok) TerminateThread(h, 1);
+        CloseHandle(h);
+    }
+#else
+    {
+        pthread_t t;
+        struct timespec dl;
+        if (pthread_create(&t, NULL, futex_waiter_p, NULL) != 0) return 0;
+        usleep(50000);
+        *w = 1;
+        g[0] = (int64_t)(uintptr_t)w; g[1] = 128 | 1; g[2] = 1;
+        afw_syscall_dispatch(202, g);
+        clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += 5;
+        ok = pthread_timedjoin_np(t, NULL, &dl) == 0 && g_fw_done;
+        if (!ok) pthread_cancel(t);
+    }
+#endif
+    return ok;
+}
 
 static int run_syscall_tests(const afw_lib *lib) {
     getpid_fn gp = (getpid_fn)afw_sym(lib, "afw_sys_getpid");
@@ -218,6 +273,45 @@ static int run_syscall_tests(const afw_lib *lib) {
               afw_syscall_dispatch(20, a) == (int64_t)(sizeof p1 - 1 + sizeof p2 - 1));
         check("writev: more than IOV_MAX iovecs -> -EINVAL", afw_syscall_dispatch(20, bad) == -22);
         check("writev: unknown fd -> -EBADF", afw_syscall_dispatch(20, badfd) == -9)   /* EBADF */;
+    }
+
+    {   /* futex, clock_gettime, getrandom, uid: where the real libc stopped (PR #11) */
+        static volatile int32_t word;
+        int64_t ts[2], t0, t1, now[2];
+        int64_t g[6] = {0};
+        unsigned char rnd[32] = {0};
+        int k, nz = 0;
+#define SC(nr, A0, A1, A2, A3, A4, A5) (g[0] = (int64_t)(A0), g[1] = (int64_t)(A1), g[2] = (int64_t)(A2), \
+                                        g[3] = (int64_t)(A3), g[4] = (int64_t)(A4), g[5] = (int64_t)(A5), \
+                                        afw_syscall_dispatch(nr, g))
+        word = 0;
+        check("futex WAIT on a changed value -> -EAGAIN at once", SC(202, &word, 128, 1, 0, 0, 0) == -11);
+        ts[0] = 0; ts[1] = 20000000;    /* 20ms, relative */
+        SC(228, 1, now, 0, 0, 0, 0); t0 = now[0] * 1000000000LL + now[1];
+        check("futex WAIT, nobody wakes, 20ms -> -ETIMEDOUT", SC(202, &word, 128, 0, ts, 0, 0) == -110);
+        SC(228, 1, now, 0, 0, 0, 0); t1 = now[0] * 1000000000LL + now[1];
+        check("... and it waited at least 20ms (never returns early)", t1 - t0 >= 20000000);
+        ts[0] = now[0]; ts[1] = now[1] + 20000000;
+        if (ts[1] >= 1000000000) { ts[0]++; ts[1] -= 1000000000; }
+        check("futex WAIT_BITSET with an absolute MONOTONIC deadline -> -ETIMEDOUT",
+              SC(202, &word, 128 | 9, 0, ts, 0, 0xffffffffu) == -110);
+        SC(228, 1, now, 0, 0, 0, 0);
+        check("... not before the deadline",
+              now[0] > ts[0] || (now[0] == ts[0] && now[1] >= ts[1]));
+        ts[0] = 0; ts[1] = 1000000000;
+        check("futex WAIT with tv_nsec = 1e9 -> -EINVAL", SC(202, &word, 128, 0, ts, 0, 0) == -22);
+        check("futex WAKE with nobody waiting -> 0", SC(202, &word, 128 | 1, 1, 0, 0, 0) == 0);
+        check("futex wait/wake between two threads", run_futex_threads(&word));
+        check("clock_gettime(REALTIME) is after 2020", SC(228, 0, now, 0, 0, 0, 0) == 0 && now[0] > 1577836800);
+        check("clock_gettime: unknown clock -> -EINVAL", SC(228, 99, now, 0, 0, 0, 0) == -22);
+        check("getrandom fills the buffer", SC(318, rnd, sizeof rnd, 0, 0, 0, 0) == (int64_t)sizeof rnd);
+        for (k = 0; k < (int)sizeof rnd; k++) nz |= rnd[k];
+        check("... with not-all-zero bytes", nz != 0);
+#if defined(_WIN32)
+        check("getuid / geteuid: the app uid 10000, as AT_UID says",
+              SC(102, 0, 0, 0, 0, 0, 0) == 10000 && SC(107, 0, 0, 0, 0, 0, 0) == 10000);
+#endif
+#undef SC
     }
 
     printf("\n");

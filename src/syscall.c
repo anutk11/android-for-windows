@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -18,10 +19,19 @@
 #else
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <time.h>
 #endif
 
 #define LNX_ENOSYS 38
 #define LNX_EBADF 9
+#define LNX_EAGAIN 11
+#define LNX_EINVAL 22
+#define LNX_EFAULT 14
+#define LNX_ETIMEDOUT 110
+
+#if defined(_WIN32)
+#pragma comment(lib, "synchronization.lib")   /* WaitOnAddress / WakeByAddress* */
+#endif
 
 long afw_syscall_counts[AFW_MAX_SYSCALL];
 static long g_unimplemented[AFW_MAX_SYSCALL];
@@ -148,6 +158,133 @@ static int64_t sys_gettid(void) {   /* the same id the thread area holds (tls_pa
 #endif
 }
 
+/* ---- time --------------------------------------------------------------- */
+struct lnx_timespec { int64_t tv_sec, tv_nsec; };
+#define LNX_CLOCK_REALTIME 0
+#define LNX_CLOCK_MONOTONIC 1
+#define LNX_CLOCK_PROCESS_CPUTIME_ID 2
+#define LNX_CLOCK_THREAD_CPUTIME_ID 3
+#define LNX_CLOCK_MONOTONIC_RAW 4
+#define LNX_CLOCK_REALTIME_COARSE 5
+#define LNX_CLOCK_MONOTONIC_COARSE 6
+#define LNX_CLOCK_BOOTTIME 7
+
+/* Nanoseconds on one clock; -1 for a clock we do not have. */
+static int64_t clock_ns(int64_t clk) {
+#if defined(_WIN32)
+    switch (clk) {
+    case LNX_CLOCK_REALTIME: case LNX_CLOCK_REALTIME_COARSE: {
+        FILETIME ft;   /* 100ns since 1601 */
+        uint64_t t;
+        GetSystemTimePreciseAsFileTime(&ft);
+        t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+        return (int64_t)(t - 116444736000000000ULL) * 100;
+    }
+    case LNX_CLOCK_MONOTONIC: case LNX_CLOCK_MONOTONIC_RAW:
+    case LNX_CLOCK_MONOTONIC_COARSE: case LNX_CLOCK_BOOTTIME: {
+        static LARGE_INTEGER f;
+        LARGE_INTEGER c;
+        if (!f.QuadPart) QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&c);
+        return (int64_t)(c.QuadPart / f.QuadPart) * 1000000000LL +
+               (int64_t)(c.QuadPart % f.QuadPart) * 1000000000LL / f.QuadPart;
+    }
+    case LNX_CLOCK_PROCESS_CPUTIME_ID: case LNX_CLOCK_THREAD_CPUTIME_ID: {
+        FILETIME c, e, k, u;
+        BOOL ok = clk == LNX_CLOCK_PROCESS_CPUTIME_ID ? GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)
+                                                      : GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u);
+        if (!ok) return -1;
+        return (int64_t)((((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime) +
+                         (((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime)) * 100;
+    }
+    default: return -1;
+    }
+#else
+    struct timespec ts;
+    if (clock_gettime((clockid_t)clk, &ts) != 0) return -1;
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+#endif
+}
+
+static int64_t sys_clock_gettime(int64_t clk, struct lnx_timespec *tp) {
+    int64_t ns = clock_ns(clk);
+    if (ns < 0) return -LNX_EINVAL;
+    if (!tp) return -LNX_EFAULT;
+    tp->tv_sec = ns / 1000000000LL;
+    tp->tv_nsec = ns % 1000000000LL;
+    return 0;
+}
+
+/* ---- futex (one process: WaitOnAddress / WakeByAddress*) ---------------- */
+#define FUTEX_WAIT 0
+#define FUTEX_WAKE 1
+#define FUTEX_WAIT_BITSET 9
+#define FUTEX_WAKE_BITSET 10
+#define FUTEX_PRIVATE_FLAG 128
+#define FUTEX_CLOCK_REALTIME 256
+#define FUTEX_BITSET_MATCH_ANY 0xffffffffu
+
+/* Milliseconds to wait, rounded UP (never return before the deadline), or
+ * INFINITE; -1 for a malformed timespec. */
+#if defined(_WIN32)
+static int64_t wait_ms(const struct lnx_timespec *t, int absolute, int64_t clk) {
+    int64_t ns;
+    if (!t) return INFINITE;
+    if (t->tv_sec < 0 || t->tv_nsec < 0 || t->tv_nsec >= 1000000000LL) return -1;
+    if (t->tv_sec > (INT64_MAX - 999999999LL) / 1000000000LL) return INFINITE;
+    ns = t->tv_sec * 1000000000LL + t->tv_nsec;
+    if (absolute) { int64_t now = clock_ns(clk); ns = ns > now ? ns - now : 0; }
+    ns = (ns + 999999) / 1000000;
+    return ns >= (int64_t)INFINITE ? (int64_t)INFINITE - 1 : ns;
+}
+#endif
+
+static int64_t sys_futex(int64_t uaddr, int64_t op_full, int64_t val, int64_t ts, int64_t uaddr2, int64_t val3) {
+    int op = (int)(op_full & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME));
+    volatile int32_t *p = (volatile int32_t *)(uintptr_t)uaddr;
+    (void)uaddr2;
+    if (!p || (uaddr & 3)) return -LNX_EINVAL;
+    if ((op == FUTEX_WAIT_BITSET || op == FUTEX_WAKE_BITSET) && (uint32_t)val3 != FUTEX_BITSET_MATCH_ANY) {
+        if ((uint32_t)val3 == 0) return -LNX_EINVAL;
+        return -LNX_ENOSYS;      /* partial bitsets: not used by bionic; refused loudly */
+    }
+#if defined(_WIN32)
+    if (op == FUTEX_WAIT || op == FUTEX_WAIT_BITSET) {
+        int32_t expect = (int32_t)val;
+        int64_t ms = wait_ms((const struct lnx_timespec *)(uintptr_t)ts, op == FUTEX_WAIT_BITSET,
+                             (op_full & FUTEX_CLOCK_REALTIME) ? LNX_CLOCK_REALTIME : LNX_CLOCK_MONOTONIC);
+        if (ms < 0) return -LNX_EINVAL;
+        if (*p != expect) return -LNX_EAGAIN;           /* the value already changed */
+        if (WaitOnAddress((volatile VOID *)p, &expect, sizeof expect, (DWORD)ms)) return 0;
+        return GetLastError() == ERROR_TIMEOUT ? -LNX_ETIMEDOUT : -LNX_EINVAL;
+        /* a return of 0 may be spurious: futex callers re-check, as on Linux */
+    }
+    if (op == FUTEX_WAKE || op == FUTEX_WAKE_BITSET) {
+        /* WakeByAddress* does not say how many woke; bionic ignores the count.
+         * Report 0, never more than were asked. */
+        if (val <= 0) return 0;
+        if (val == 1) WakeByAddressSingle((PVOID)p);
+        else WakeByAddressAll((PVOID)p);
+        return 0;
+    }
+    return -LNX_ENOSYS;
+#else
+    if (op != FUTEX_WAIT && op != FUTEX_WAKE && op != FUTEX_WAIT_BITSET && op != FUTEX_WAKE_BITSET)
+        return -LNX_ENOSYS;
+    {   /* host build: the real futex, same semantics */
+        long r = syscall(SYS_futex, p, (int)op_full, (int)val, (void *)(uintptr_t)ts, (void *)(uintptr_t)uaddr2, (int)val3);
+        return r < 0 ? -(int64_t)errno : r;
+    }
+#endif
+}
+
+static int64_t sys_getrandom(void *buf, uint64_t len, int64_t flags) {
+    (void)flags;   /* GRND_NONBLOCK / GRND_RANDOM: the OS generator never blocks */
+    if (!buf) return -LNX_EFAULT;
+    if (len > 33554431) len = 33554431;      /* Linux caps one call at 32MB-1 */
+    return afw_random_bytes(buf, (size_t)len) == 0 ? (int64_t)len : -LNX_EAGAIN;
+}
+
 static int64_t sys_getpid(void) {
 #if defined(_WIN32)
     return (int64_t)GetCurrentProcessId();
@@ -162,6 +299,11 @@ int64_t afw_syscall_dispatch(int64_t nr, int64_t *a) {
     case 1:   return sys_write(a[0], (const void *)(uintptr_t)a[1], (uint64_t)a[2]);
     case 39:  return sys_getpid();
     case 20:  return sys_writev(a[0], (const uint64_t *)(uintptr_t)a[1], a[2]);
+    case 202: return sys_futex(a[0], a[1], a[2], a[3], a[4], a[5]);
+    case 228: return sys_clock_gettime(a[0], (struct lnx_timespec *)(uintptr_t)a[1]);
+    case 318: return sys_getrandom((void *)(uintptr_t)a[0], (uint64_t)a[1], a[2]);
+    /* one app user, as AT_UID/AT_GID say (bionic_shim.c): uid 10000 */
+    case 102: case 104: case 107: case 108: return 10000;   /* getuid getgid geteuid getegid */
     case 186: return sys_gettid();
     case 9:   return afw_mmap((uint64_t)a[0], (uint64_t)a[1], (int)a[2], (int)a[3], (int)a[4], a[5]);
     case 10:  return afw_mprotect((uint64_t)a[0], (uint64_t)a[1], (int)a[2]);
