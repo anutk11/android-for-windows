@@ -197,10 +197,93 @@ static void unproven_detail(ZydisDecoder *dec, const afw_patch_ctx *c, unsigned 
     } else {
         fprintf(stderr, "UNPROVEN-DETAIL reason=function undecided (exception table not decoded, or no jump recorded)\n");
     }
+    /* Function-level facts, printed once per function (several sites can share one). */
+    {
+        static const unsigned char *last_func;
+        if (last_func != fstart) {
+            unsigned char *st = (unsigned char *)calloc(fsize ? fsize : 1, 1);   /* instruction starts */
+            const unsigned char *hist[12];
+            int nh = 0, h, norph = 0;
+            last_func = fstart;
+            for (q = fstart; st && q < fend;) {
+                int ok = ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, q, (ZyanUSize)(fend - q), &ins, ops));
+                size_t len = ok ? ins.length : 1;
+                st[q - fstart] = 1;
+                if (q == why) break;
+                if (ok) { if (nh == 12) { memmove(hist, hist + 1, 11 * sizeof *hist); nh = 11; } hist[nh++] = q; }
+                q += len;
+            }
+            if (why && why >= fstart && why < fend) {
+                uint64_t table = 0;
+                fprintf(stderr, "UNPROVEN-DETAIL pre-jump (up to 12 instructions before the undecided jump):\n");
+                for (h = 0; h <= nh; h++) {
+                    const unsigned char *a = h < nh ? hist[h] : why;
+                    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, a, (ZyanUSize)(fend - a), &ins, ops))) continue;
+                    ZydisFormatterFormatInstruction(&f, &ins, ops, ins.operand_count_visible, text, sizeof text,
+                                                    (ZyanU64)((intptr_t)a - bias), ZYAN_NULL);
+                    fprintf(stderr, "UNPROVEN-DETAIL   %c %s 0x%llx: %s\n", map && map[a - fstart] == 1 ? 'R' : '-',
+                            a == why ? ">>" : "  ", (long long)((intptr_t)a - bias), text);
+                    if (a != why && ins.mnemonic == ZYDIS_MNEMONIC_LEA && ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                        ops[1].mem.base == ZYDIS_REGISTER_RIP) {
+                        ZyanU64 t;
+                        if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&ins, &ops[1], (ZyanU64)(uintptr_t)a, &t)))
+                            table = (uint64_t)t;   /* the last rip-relative lea before the jump */
+                    }
+                }
+                /* rest of the function's instruction starts, for boundary checks */
+                for (; st && q < fend;) {
+                    int ok = ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, q, (ZyanUSize)(fend - q), &ins, ops));
+                    st[q - fstart] = 1; q += ok ? ins.length : 1;
+                }
+                if (table) {
+                    int e;
+                    fprintf(stderr, "UNPROVEN-DETAIL table at %s+0x%llx (from the last rip-relative lea; "
+                                    "entries are int32 relative to the table):\n", nm, (long long)(table - bias));
+                    for (e = 0; e < 64; e++) {
+                        int32_t v;
+                        uint64_t tgt;
+                        const char *where2, *bound;
+                        if (!c->readable || !c->readable(c->ctx, table + 4u * (unsigned)e, 4)) {
+                            fprintf(stderr, "UNPROVEN-DETAIL   [%2d] not readable - stop\n", e); break;
+                        }
+                        memcpy(&v, (const void *)(uintptr_t)(table + 4u * (unsigned)e), 4);
+                        tgt = table + (uint64_t)(int64_t)v;
+                        if (tgt < (uint64_t)(uintptr_t)fstart || tgt >= (uint64_t)(uintptr_t)fend) {
+                            where2 = "OUTSIDE function"; bound = "-";
+                        } else {
+                            where2 = "inside";
+                            bound = st && st[tgt - (uint64_t)(uintptr_t)fstart] ? "on boundary" : "MID-INSTRUCTION";
+                        }
+                        fprintf(stderr, "UNPROVEN-DETAIL   [%2d] entry=%d -> 0x%llx  %s, %s, %s\n", e, v,
+                                (long long)((intptr_t)tgt - bias), where2, bound,
+                                (tgt >= (uint64_t)(uintptr_t)fstart && tgt < (uint64_t)(uintptr_t)fend && map &&
+                                 map[tgt - (uint64_t)(uintptr_t)fstart] == 1) ? "reached" : "not reached");
+                    }
+                } else fprintf(stderr, "UNPROVEN-DETAIL table: no rip-relative lea in the 12 instructions before the jump\n");
+            }
+            /* orphan blocks: start right after an unconditional jmp / ret / ud2 / hlt, never reached */
+            for (q = fstart; q < fend;) {
+                int ok = ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, q, (ZyanUSize)(fend - q), &ins, ops));
+                size_t len = ok ? ins.length : 1;
+                if (ok && (ins.meta.category == ZYDIS_CATEGORY_UNCOND_BR || ins.meta.category == ZYDIS_CATEGORY_RET ||
+                           ins.mnemonic == ZYDIS_MNEMONIC_UD2 || ins.mnemonic == ZYDIS_MNEMONIC_HLT) &&
+                    q + len < fend && map && map[q + len - fstart] != 1) {
+                    if (norph < 64)
+                        fprintf(stderr, "UNPROVEN-DETAIL orphan block at %s+0x%llx (after the instruction at 0x%llx)\n",
+                                nm, (long long)((intptr_t)(q + len) - bias), (long long)((intptr_t)q - bias));
+                    norph++;
+                }
+                q += len;
+            }
+            fprintf(stderr, "UNPROVEN-DETAIL orphan blocks in function: %d\n", norph);
+            free(st);
+        }
+    }
     fprintf(stderr, "UNPROVEN-DETAIL bytes %s+0x%llx:", nm, (long long)((intptr_t)b0 - bias));
     for (; b0 < b1; b0++) fprintf(stderr, b0 == site ? " [%02x" : " %02x", *b0);
     fprintf(stderr, "   ('[' = site)\n");
     /* linear decoding from the function start; print the window around the site */
+    q = fstart;
     while (q < fend) {
         int ok = ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, q, (ZyanUSize)(fend - q), &ins, ops));
         size_t len = ok ? ins.length : 1;
