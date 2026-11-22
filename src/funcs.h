@@ -21,4 +21,9 @@ int afw_func_bounds(const struct afw_lib_s *lib, uint64_t addr, uint64_t *start,
  * caller frees). Returns the count; 0 if the library has no such table. */
 int afw_func_list(const struct afw_lib_s *lib, unsigned char ***starts, size_t **sizes);
 
+/* C++ exception landing pads of the function starting at func (from its
+ * LSDA in .gcc_except_table). The unwinder jumps there, no branch does, so
+ * control-flow analysis must treat them as extra entry points. */
+int afw_func_landing_pads(const struct afw_lib_s *lib, uint64_t func, uint64_t *out, int max);
+
 #endif

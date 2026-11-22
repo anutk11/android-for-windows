@@ -167,6 +167,9 @@ static void apply_relr(afw_lib *lib, const uint64_t *relr, size_t count) {
 static int patch_bounds(const void *ctx, uint64_t addr, uint64_t *s, uint64_t *e) {
     return afw_func_bounds((const afw_lib *)ctx, addr, s, e);
 }
+static int patch_entries(const void *ctx, uint64_t func, uint64_t *out, int max) {
+    return afw_func_landing_pads((const afw_lib *)ctx, func, out, max);
+}
 
 int afw_load(const char *path, afw_lib *lib, int verbose) {
     size_t fsize = 0, i;
@@ -454,6 +457,7 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
         afw_patch_ctx pc;
         pc.bounds = patch_bounds; pc.ctx = lib; pc.bias = lib->bias; pc.name = lib->soname ? lib->soname : path;
         pc.ranges_are_functions = have_funcs; pc.segs = segs; pc.nsegs = nsegs;
+        pc.entries = patch_entries;
         if (afw_patch_code(cr, ncr, lib->stub_area, AFW_STUB_RESERVE, &pc, &lib->patch, verbose) < 0) {
             fprintf(stderr, "error: could not patch %s safely; refusing to run it\n", path);
             free(cr); free(pageprot); return -1;

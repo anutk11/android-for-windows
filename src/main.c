@@ -219,6 +219,7 @@ int main(int argc, char **argv) {
     printf("  fs: accesses patched:  %d (fs:[reg]: %d real, %d data)\n", lib.patch.fs_patched,
            lib.patch.fs_reg_in_func, lib.patch.fs_reg_outside);
 
+    printf("  C++ landing pads followed: %d\n", lib.patch.landing_pads);
     printf("  audit: %d unreachable look-alikes left alone, %d UNPROVEN (in %d functions with unresolved "
            "indirect jumps); outside .eh_frame: %d syscall, %d fs:\n",
            lib.patch.unreachable_ignored, lib.patch.unproven, lib.patch.funcs_undecided,

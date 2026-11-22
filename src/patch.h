@@ -59,6 +59,7 @@ typedef struct {
     int unproven;              /* unreached, in a function with an unresolved indirect jump */
     int funcs_undecided;       /* functions with an unresolved indirect jump */
     int fs_disp_seen;          /* reachable fs:[disp32] accesses (any platform) */
+    int landing_pads;          /* C++ landing pads used as entry points */
     int sys_outside_functions; /* syscall in executable bytes with no .eh_frame entry */
     int fs_outside_functions;
     int redzone_direct;        /* refusals by reason: [rsp-N] */
@@ -75,6 +76,8 @@ typedef struct {
     intptr_t bias;          /* to print library-relative offsets */
     const char *name;       /* library name for messages */
     int ranges_are_functions; /* ranges come from .eh_frame: follow control flow */
+    /* extra entry points of a function (C++ landing pads) */
+    int (*entries)(const void *ctx, uint64_t func, uint64_t *out, int max);
     const afw_code_range *segs; int nsegs; /* executable segments, for the audit */
 } afw_patch_ctx;
 

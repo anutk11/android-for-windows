@@ -136,7 +136,7 @@ static void dump_ins(const unsigned char *p, const ZydisDecodedInstruction *ins,
  * syscall/fs: look-alike among them is reported as unproven (not "never runs").
  */
 static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t size, int *undecided,
-                                const unsigned char **why) {
+                                const unsigned char **why, const uint64_t *extra, int nextra) {
     ZydisDecodedInstruction ins;
     ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
     unsigned char *map = (unsigned char *)calloc(size ? size : 1, 1);
@@ -146,6 +146,11 @@ static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t s
     memset(lea_val, 0, sizeof lea_val);
     *undecided = 0;
     VEC_PUSH(work, nwork, capwork, (size_t)0);
+    {
+        int e;
+        for (e = 0; e < nextra; e++)
+            if (extra[e] >= lo && extra[e] < hi) VEC_PUSH(work, nwork, capwork, (size_t)(extra[e] - lo));
+    }
     while (nwork) {
         off = work[--nwork];
         while (off < size && map[off] != 1) {
@@ -237,7 +242,10 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
         unsigned char *map = NULL;
         if (c && c->ranges_are_functions) {
             const unsigned char *why = NULL;
-            map = maps[r] = reach_map(&dec, p, ranges[r].size, &undecided[r], &why);
+            uint64_t pads[256];
+            int npads = c->entries ? c->entries(c->ctx, (uint64_t)(uintptr_t)p, pads, 256) : 0;
+            rep->landing_pads += npads;
+            map = maps[r] = reach_map(&dec, p, ranges[r].size, &undecided[r], &why, pads, npads);
             if (undecided[r]) {
                 rep->funcs_undecided++;
                 if (verbose && why && ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, why, 16, &ins, ops))) {

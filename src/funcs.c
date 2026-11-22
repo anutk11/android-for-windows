@@ -59,12 +59,15 @@ static int read_enc(const unsigned char **pp, unsigned char enc, uint64_t datare
     return 1;
 }
 
-/* FDE -> [start, end) */
-static int fde_range(const unsigned char *fde, uint64_t *start, uint64_t *end) {
+/* FDE -> [start, end), and its LSDA (C++ exception table) if any */
+static int fde_parse(const unsigned char *fde, uint64_t *start, uint64_t *end, uint64_t *lsda) {
     const unsigned char *p = fde, *cie, *q;
     uint32_t len, cie_off;
     unsigned char fde_enc = 0; /* absptr */
+    unsigned char lsda_enc = PE_OMIT;
+    int has_z = 0;
     uint64_t range;
+    if (lsda) *lsda = 0;
     memcpy(&len, p, 4); p += 4;
     if (len == 0 || len == 0xffffffffu) return 0;
     memcpy(&cie_off, p, 4);
@@ -81,10 +84,11 @@ static int fde_range(const unsigned char *fde, uint64_t *start, uint64_t *end) {
         if (version == 1) q++; else uleb(&q);     /* return address register */
         if (aug[0] == 'z') {
             const char *a;
+            has_z = 1;
             uleb(&q);                             /* augmentation length */
             for (a = aug + 1; *a; a++) {
                 if (*a == 'R') fde_enc = *q++;
-                else if (*a == 'L') q++;
+                else if (*a == 'L') lsda_enc = *q++;
                 else if (*a == 'P') { unsigned char e = *q++; uint64_t dummy; if (!read_enc(&q, e & 0x7f, 0, &dummy)) return 0; }
                 else if (*a == 'S' || *a == 'B') continue;
                 else break;
@@ -94,7 +98,60 @@ static int fde_range(const unsigned char *fde, uint64_t *start, uint64_t *end) {
     if (!read_enc(&p, fde_enc, 0, start)) return 0;
     if (!read_enc(&p, fde_enc & 0x0f, 0, &range)) return 0;
     *end = *start + range;
+    if (has_z && lsda && lsda_enc != PE_OMIT) {
+        uint64_t v;
+        uleb(&p);                                 /* FDE augmentation length */
+        if (read_enc(&p, lsda_enc, 0, &v)) *lsda = v;
+    }
     return 1;
+}
+
+static int fde_range(const unsigned char *fde, uint64_t *start, uint64_t *end) {
+    return fde_parse(fde, start, end, NULL);
+}
+
+/* Find the FDE for a function start through .eh_frame_hdr. */
+static const unsigned char *find_fde(const afw_lib *lib, uint64_t addr) {
+    const unsigned char *h = lib->eh_frame_hdr, *p;
+    uint64_t eh_frame, count, hdr;
+    const int32_t *tab;
+    size_t lo, hi;
+    if (!h) return NULL;
+    p = h + 4; hdr = (uint64_t)(uintptr_t)h;
+    if (h[0] != 1 || !read_enc(&p, h[1], hdr, &eh_frame) || !read_enc(&p, h[2], hdr, &count) ||
+        h[3] != (PE_DATAREL | PE_SDATA4) || !count)
+        return NULL;
+    tab = (const int32_t *)p; lo = 0; hi = (size_t)count;
+    while (hi - lo > 1) {
+        size_t mid = (lo + hi) / 2;
+        if (hdr + (int64_t)tab[2 * mid] <= addr) lo = mid; else hi = mid;
+    }
+    return (const unsigned char *)(uintptr_t)(hdr + (int64_t)tab[2 * lo + 1]);
+}
+
+int afw_func_landing_pads(const afw_lib *lib, uint64_t func, uint64_t *out, int max) {
+    const unsigned char *fde = find_fde(lib, func), *p, *cs_end;
+    uint64_t s0, e0, lsda, lpstart, cs_len;
+    unsigned char lp_enc, tt_enc, cs_enc;
+    int n = 0;
+    if (!fde || !fde_parse(fde, &s0, &e0, &lsda) || s0 != func || !lsda) return 0;
+    p = (const unsigned char *)(uintptr_t)lsda;
+    lp_enc = *p++;
+    lpstart = func;
+    if (lp_enc != PE_OMIT && !read_enc(&p, lp_enc, 0, &lpstart)) return 0;
+    tt_enc = *p++;
+    if (tt_enc != PE_OMIT) uleb(&p);
+    cs_enc = *p++;
+    cs_len = uleb(&p);
+    cs_end = p + cs_len;
+    while (p < cs_end && n < max) {
+        uint64_t start, len, lp;
+        if (!read_enc(&p, cs_enc, 0, &start) || !read_enc(&p, cs_enc, 0, &len) ||
+            !read_enc(&p, cs_enc, 0, &lp)) break;
+        uleb(&p);                                  /* action */
+        if (lp && lpstart + lp >= s0 && lpstart + lp < e0) out[n++] = lpstart + lp;
+    }
+    return n;
 }
 
 int afw_func_bounds(const afw_lib *lib, uint64_t addr, uint64_t *start, uint64_t *end) {
