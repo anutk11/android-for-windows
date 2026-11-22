@@ -16,6 +16,7 @@
 #include "tls_patch.h"
 #include "crash.h"
 #include "syscall.h"
+#include "attest.h"
 #include "tls_static.h"
 
 #if defined(_WIN32)
@@ -456,6 +457,7 @@ int main(int argc, char **argv) {
         for (a = 2; a < argc; a++) {
             if (strcmp(argv[a], "--strict") == 0) strict = 1;
             else if (strcmp(argv[a], "--allow-unproven") == 0) afw_load_allow_unproven = 1;
+            else if (strncmp(argv[a], "--attest-tamper=", 16) == 0) afw_attest_set_tamper(argv[a] + 16);  /* tests */
             else if (strcmp(argv[a], "--call-trap") == 0) call_trap = 1;
             else if (strncmp(argv[a], "--min-landing-pads=", 19) == 0) min_pads = atoi(argv[a] + 19);
         }
@@ -490,9 +492,14 @@ int main(int argc, char **argv) {
     if (lib.patch.sys_refused_redzone)
         printf("  red zone refusals: %d [rsp-N], %d [frame reg - N] beyond sub rsp\n",
                lib.patch.redzone_direct, lib.patch.redzone_via_copy);
-    if (afw_load_patch_only)
+    if (afw_load_patch_only) {
+        printf("SHA256 %s: %s\n", lib.soname ? lib.soname : argv[1], lib.sha256);
+        printf("ATTEST %s: %d applied, %d rejected, %d look-alikes reached only through attested entries, "
+               "%d unproven left\n", lib.soname ? lib.soname : argv[1], lib.patch.attest_applied,
+               lib.patch.attest_rejected, lib.patch.via_attestation, lib.patch.unproven);
         printf("GATE %s: %s\n", lib.soname ? lib.soname : argv[1],
                afw_gate_ok(&lib) ? "would RUN" : "would REFUSE");
+    }
     if (afw_load_patch_only && strict) {
         int bad = lib.patch.unproven || lib.patch.lsda_failures ||
                   lib.patch.landing_pads < min_pads;

@@ -327,6 +327,58 @@ static void unproven_detail(ZydisDecoder *dec, const afw_patch_ctx *c, unsigned 
     }
 }
 
+/* Re-verify one attestation against the bytes in memory (reviewer 3, #2):
+ * the jump is an indirect "jmp reg", reached by the analysis, inside this
+ * function; a rip-relative lea of the same table precedes it in the same
+ * function; each of entries [0, k) is readable and lands inside the
+ * function on an instruction boundary. Fills out[] with the k targets and
+ * returns k, or -1 with a reason. */
+static int attest_verify(ZydisDecoder *dec, const afw_patch_ctx *c, unsigned char *fstart, size_t fsize,
+                         const unsigned char *map, const afw_attest *a, uint64_t *out, int max,
+                         const char **why) {
+    ZydisDecodedInstruction ins;
+    ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+    unsigned char *fend = fstart + fsize, *J = (unsigned char *)(c->bias + (intptr_t)a->jmp_rva), *q;
+    uint64_t T = (uint64_t)(c->bias + (intptr_t)a->table_rva);
+    unsigned char *starts;
+    int lea_ok = 0, at_j = 0, e;
+    if (a->k <= 0 || a->k > max) { *why = "entry count out of range"; return -1; }
+    if (J < fstart || J >= fend) { *why = "jump not inside this function"; return -1; }
+    if (!map || map[J - fstart] != 1) { *why = "jump not reached by the analysis"; return -1; }
+    starts = (unsigned char *)calloc(fsize, 1);
+    if (!starts) { *why = "out of memory"; return -1; }
+    for (q = fstart; q < fend;) {
+        int ok = ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, q, (ZyanUSize)(fend - q), &ins, ops));
+        starts[q - fstart] = 1;
+        if (ok && q < J && ins.mnemonic == ZYDIS_MNEMONIC_LEA && ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+            ops[1].mem.base == ZYDIS_REGISTER_RIP) {
+            ZyanU64 t;
+            if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&ins, &ops[1], (ZyanU64)(uintptr_t)q, &t)))
+                lea_ok = lea_ok || (uint64_t)t == T;
+        }
+        if (q == J) at_j = ok && ins.mnemonic == ZYDIS_MNEMONIC_JMP && ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER;
+        q += ok ? ins.length : 1;
+    }
+    if (!starts[J - fstart] || !at_j) { free(starts); *why = "no indirect jmp reg at the attested address"; return -1; }
+    if (!lea_ok) { free(starts); *why = "no rip-relative lea of the attested table in this function"; return -1; }
+    for (e = 0; e < a->k; e++) {
+        int32_t v;
+        uint64_t tgt;
+        if (!c->readable || !c->readable(c->ctx, T + 4u * (unsigned)e, 4)) {
+            free(starts); *why = "table entry not inside readable memory"; return -1;
+        }
+        memcpy(&v, (const void *)(uintptr_t)(T + 4u * (unsigned)e), 4);
+        tgt = T + (uint64_t)(int64_t)v;
+        if (tgt < (uint64_t)(uintptr_t)fstart || tgt >= (uint64_t)(uintptr_t)fend ||
+            !starts[tgt - (uint64_t)(uintptr_t)fstart]) {
+            free(starts); *why = "a table entry does not land on an instruction of this function"; return -1;
+        }
+        out[e] = tgt;
+    }
+    free(starts);
+    return a->k;
+}
+
 static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t size, int *undecided,
                                 const unsigned char **why, const uint64_t *extra, int nextra,
                                 const afw_patch_ctx *c, uint64_t **tt, size_t *ntt, size_t *captt) {
@@ -663,6 +715,7 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
     unsigned char **maps = (unsigned char **)calloc(nranges ? (size_t)nranges : 1, sizeof *maps);
     int *undecided = (int *)calloc(nranges ? (size_t)nranges : 1, sizeof *undecided);
     const unsigned char **whys = (const unsigned char **)calloc(nranges ? (size_t)nranges : 1, sizeof *whys);
+    unsigned char **maps0 = (unsigned char **)calloc(nranges ? (size_t)nranges : 1, sizeof *maps0);  /* before attestations */
 
     memset(rep, 0, sizeof *rep);
     ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
@@ -694,8 +747,41 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                                       c, &targets, &ntargets, &captargets);
             {
                 int q;
-                for (q = 0; q < npads; q++)       /* the unwinder jumps to landing pads: targets too */
+                for (q = 0; q < npads; q++)       /* landing pads and attested targets are targets too */
                     VEC_PUSH(targets, ntargets, captargets, pads[q]);
+            }
+            /* attestations for jumps inside this function: verify, then re-run the
+             * analysis with the attested table targets as extra entry points */
+            if (undecided[r] && c->nattest) {
+                int a, added = 0;
+                for (a = 0; a < c->nattest; a++) {
+                    const char *awhy = "";
+                    unsigned char *J = (unsigned char *)(c->bias + (intptr_t)c->attest[a].jmp_rva);
+                    int k;
+                    if (J < p || J >= end) continue;
+                    k = attest_verify(&dec, c, p, ranges[r].size, map, &c->attest[a], pads + npads, 1024 - npads, &awhy);
+                    describe(c, J, where, sizeof where);
+                    if (k < 0) {
+                        rep->attest_rejected++;
+                        fprintf(stderr, "  [attest] REJECTED for the jump at %s: %s (%s) - not used\n", where, awhy,
+                                c->attest[a].note ? c->attest[a].note : "");
+                        continue;
+                    }
+                    rep->attest_applied++;
+                    fprintf(stderr, "  [attest] applied for the jump at %s: %d table entries verified (%s)\n", where, k,
+                            c->attest[a].note ? c->attest[a].note : "");
+                    npads += k; added += k;
+                }
+                if (added) {
+                    int und2 = 0;
+                    const unsigned char *why2 = NULL;
+                    unsigned char *m2 = reach_map(&dec, p, ranges[r].size, &und2, &why2, pads, npads,
+                                                  c, &targets, &ntargets, &captargets);
+                    int q2;
+                    for (q2 = npads - added; q2 < npads; q2++)   /* the jump lands there: branch targets */
+                        VEC_PUSH(targets, ntargets, captargets, pads[q2]);
+                    if (m2) { maps0[r] = map; map = maps[r] = m2; undecided[r] = und2; why = why2; }
+                }
             }
             if (lsda_failed && !undecided[r]) { undecided[r] = 1; why = NULL; }
             if (whys) whys[r] = undecided[r] ? why : NULL;
@@ -1034,6 +1120,14 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                             fprintf(stderr, "  [audit] WARNING: syscall bytes at %s, outside every .eh_frame function "
                                             "(data, or code without unwind info): not touched\n", where);
                         } else rep->fs_outside_functions++;
+                    } else if (maps0[found] && maps[found] && maps[found][p - ranges[found].addr] == 1 &&
+                               maps0[found][p - ranges[found].addr] != 1) {
+                        /* reached only because of an attestation: handled, but say so every time (reviewer 2) */
+                        rep->via_attestation++;
+                        describe(c, p, where, sizeof where);
+                        fprintf(stderr, "  [audit] ATTESTED: %s-looking bytes at %s are reached only through attested "
+                                        "table entries (not proven; handled like any reached site)\n",
+                                is_sys ? "syscall" : "fs:", where);
                     } else if (maps[found] && maps[found][p - ranges[found].addr] != 1) {
                         describe(c, p, where, sizeof where);
                         if (undecided[found]) {
@@ -1054,7 +1148,8 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
             }
         }
     }
-    for (r = 0; r < nranges; r++) free(maps[r]);
+    for (r = 0; r < nranges; r++) { free(maps[r]); free(maps0[r]); }
+    free(maps0);
     free(maps); free(undecided); free((void *)whys);
 
     free(targets); free(sites);

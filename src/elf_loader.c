@@ -15,6 +15,8 @@
 #include "funcs.h"
 #include "platform.h"
 #include "tls_static.h"
+#include "sha256.h"
+#include "attest.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -240,6 +242,11 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
 
     /* 1. Read and validate ------------------------------------------ */
     file = read_file(path, &fsize);
+    if (file) {                         /* identity of exactly these bytes (attestations, reports) */
+        uint8_t h[32];
+        afw_sha256(file, fsize, h);
+        afw_sha256_hex(h, lib->sha256);
+    }
     if (!file) { fprintf(stderr, "error: cannot read '%s'\n", path); return -1; }
     eh = (Elf64_Ehdr *)file;
 
@@ -514,6 +521,7 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
         pc.bounds = patch_bounds; pc.ctx = lib; pc.bias = lib->bias; pc.name = lib->soname ? lib->soname : path;
         pc.ranges_are_functions = have_funcs; pc.segs = segs; pc.nsegs = nsegs;
         pc.entries = patch_entries;
+        pc.attest = afw_attest_for(lib->sha256, &pc.nattest);
         pc.readable = patch_readable;
         if (afw_patch_code(cr, ncr, lib->stub_area, AFW_STUB_RESERVE, &pc, &lib->patch, verbose) < 0) {
             fprintf(stderr, "error: could not patch %s safely; refusing to run it\n", path);
