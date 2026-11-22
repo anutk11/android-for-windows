@@ -130,6 +130,7 @@ jobs:
           copy out\afw-loader.exe pkg\
           copy out\libhello.so pkg\
           copy tools\run-test.bat pkg\
+          copy out\fsbase_probe.exe pkg\
       - uses: actions/upload-artifact@v4
         with:
           name: afw-windows
