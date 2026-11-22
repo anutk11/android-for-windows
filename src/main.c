@@ -265,6 +265,51 @@ static int run_tls_tests(const afw_lib *lib) {
     return g_failed ? 1 : 0;
 }
 
+/* fs:[reg] ELF TLS through trampolines (G1-TLS design, section 6) */
+typedef int (SYSV *ie_int_fn)(void);
+typedef void (SYSV *ie_set_fn)(int);
+typedef int (SYSV *ie_and_fn)(int);
+typedef int *(SYSV *ie_ptr_fn)(void);
+static ie_int_fn g_ie_read_b;
+#if defined(_WIN32)
+static DWORD WINAPI ie_thread(LPVOID p) {
+    int *out = (int *)p;
+    if (afw_tls_thread_init() != 0) { *out = -2; return 0; }
+    *out = g_ie_read_b();                    /* this thread's own copy: initial value */
+    return 0;
+}
+#endif
+static int run_ie_tests(const afw_lib *lib) {
+    ie_int_fn read_b = (ie_int_fn)afw_sym(lib, "afw_ie_read_b");
+    ie_set_fn write_a = (ie_set_fn)afw_sym(lib, "afw_ie_write_a");
+    ie_and_fn and_b = (ie_and_fn)afw_sym(lib, "afw_ie_and_b");
+    ie_ptr_fn addr = (ie_ptr_fn)afw_sym(lib, "afw_ie_addr");
+    ie_set_fn store_ret = (ie_set_fn)afw_sym(lib, "afw_ie_store_ret");
+    ie_int_fn test_flags = (ie_int_fn)afw_sym(lib, "afw_ie_test_flags");
+    g_ie_read_b = read_b;
+    printf("\nG1-TLS fs:[reg] tests (%d accesses rewritten through trampolines):\n", lib->patch.fs_reg_trampolined);
+    check("all 5 fs:[reg] accesses rewritten", lib->patch.fs_reg_trampolined == 5);
+    check("read fs:[reg+4] (initial value)", read_b() == 22);
+    write_a(5);
+    check("write fs:[reg] lands where tp + TPOFF points", addr()[0] == 5);
+    check("and eax, fs:[reg+4]", and_b(0xF0) == (22 & 0xF0));
+    store_ret(77);
+    check("store right before ret (moved rip-relative mov re-based)", addr()[0] == 77);
+    check("flags from test after the stub (b=22: bit 0 clear)", test_flags() == 1);
+    addr()[1] = 23;
+    check("flags change with the value (b=23)", test_flags() == 0 && read_b() == 23);
+#if defined(_WIN32)
+    {
+        int other = -1;
+        HANDLE t = CreateThread(NULL, 0, ie_thread, &other, 0, NULL);
+        WaitForSingleObject(t, INFINITE); CloseHandle(t);
+        check("another thread reads its own copy (22, not 23)", other == 22);
+    }
+#endif
+    printf("%s\n", g_failed ? "G1-TLS fs:[reg] TESTS FAILED" : "G1-TLS fs:[reg] TESTS PASSED");
+    return g_failed ? 1 : 0;
+}
+
 static int run_redzone_tests(const afw_lib *lib) {
     getpid_fn safe = (getpid_fn)afw_sym(lib, "afw_rz_safe");
     printf("\n=== G1 negative test: red zone ===\n");
@@ -365,6 +410,7 @@ int main(int argc, char **argv) {
     if (afw_sym(&lib, "afw_sys_getpid")) rc |= run_syscall_tests(&lib);
     if (afw_sym(&lib, "afw_rz_safe")) rc |= run_redzone_tests(&lib);
     if (afw_sym(&lib, "afw_tls_worker")) rc |= run_tls_tests(&lib);
+    if (afw_sym(&lib, "afw_ie_read_b")) rc |= run_ie_tests(&lib);
     if (call_trap) {
         typedef long (SYSV *f1)(int);
         f1 f = (f1)afw_sym(&lib, "afw_sys_branch_into_site");

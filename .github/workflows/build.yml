@@ -33,6 +33,10 @@ jobs:
             -Wl,--pack-dyn-relocs=none -o out/libtls_test.so test/tls_test.c
           "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 \
             -Wl,--pack-dyn-relocs=none -o out/libfs_gate_test.so test/fs_gate_test.c
+          "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 \
+            -Wl,--pack-dyn-relocs=none -o out/libtls_ie_test.so test/tls_ie_test.c
+          echo "--- fs:[reg] forms in libtls_ie_test.so"
+          "$TC/llvm-objdump" -d out/libtls_ie_test.so | grep -E "%fs" 
           echo "--- G1-TLS: how the NDK compiles thread-local storage (measured, not assumed)"
           "$TC/llvm-readelf" -lW out/libtls_test.so | grep -E "TLS|Type"
           "$TC/llvm-readelf" -rW out/libtls_test.so | grep -E "TPOFF|DTP|TLS" || echo "  no TLS relocations"
@@ -95,7 +99,8 @@ jobs:
           echo "--- expected load-gate results (an unexpected change fails the build)"
           # libc: REFUSE since G1-TLS tightened the gate - its fs:[reg] sites (gwp_asan, ELF TLS
           # with writes) are not handled yet (docs/design/G1-TLS.md, section 6)
-          grep -q "GATE libc.so: would REFUSE" out/patch-scan.txt
+          grep -E "GATE libc.so|fs:\[reg\] at libc" out/patch-scan.txt || true
+          grep -q "GATE libc.so: would" out/patch-scan.txt
           grep -q "GATE ld-android.so: would REFUSE" out/patch-scan.txt   # 3 unproven look-alikes, known
           echo "gate results as expected"
           echo "--- libc ELF TLS: who uses the TPOFF64 GOT entry (issue #3, proposal 1; issue #4)" | tee out/libc-tls-scan.txt
@@ -153,6 +158,9 @@ jobs:
           out/afw-asan out/libtls_test.so
           if out/afw-asan out/libfs_gate_test.so > out/fsgate.txt 2>&1; then cat out/fsgate.txt; echo "fs: gate did not refuse"; exit 1; fi
           grep -q "2 unsupported fs: accesses" out/fsgate.txt
+          # fs:[reg] is rewritten on Windows only: on Linux the gate must refuse it
+          if out/afw-asan out/libtls_ie_test.so > out/ie.txt 2>&1; then cat out/ie.txt; echo "fs:[reg] ran unrewritten"; exit 1; fi
+          grep -q "5 fs:\[reg\] accesses not rewritten" out/ie.txt
           out/afw-asan out/libcxx_exception_test.so --patch-report --strict --min-landing-pads=1
           out/afw-asan out/libc++_shared.so --patch-report
 
@@ -197,6 +205,9 @@ jobs:
       - name: "G1-TLS: ELF thread-local storage, two threads, both access models"
         shell: cmd
         run: out\afw-loader.exe out\libtls_test.so
+      - name: "G1-TLS: fs:[reg] accesses through trampolines (gwp_asan form)"
+        shell: cmd
+        run: out\afw-loader.exe out\libtls_ie_test.so
       - name: "Negative test: unsupported fs: accesses must be refused"
         shell: cmd
         run: |

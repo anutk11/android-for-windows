@@ -31,7 +31,10 @@ int afw_load_allow_unproven;
 int afw_gate_ok(const afw_lib *lib) {
     const afw_patch_report *r = &lib->patch;
     return !r->unproven && !r->lsda_failures && !r->sys_untouched && !r->sys_outside_functions &&
-           !r->fs_unsupported;
+           !r->fs_unsupported &&
+           /* every fs:[reg] must really be rewritten (Windows); measurement mode
+            * reports what Windows would do */
+           (afw_load_patch_only || r->fs_reg_trampolined == r->fs_reg_feasible);
 }
 
 #define MAX_LIBS 64
@@ -521,11 +524,13 @@ int afw_load(const char *path, afw_lib *lib, int verbose) {
             fprintf(stderr,
                     "error: refusing to run %s: patching left %d unproven syscall/fs: look-alikes,\n"
                     "       %d undecodable exception tables, %d untouched syscall sites and %d syscall\n"
-                    "       bytes outside known functions, %d unsupported fs: accesses.\n"
+                    "       bytes outside known functions, %d unsupported fs: accesses,\n"
+                    "       %d fs:[reg] accesses not rewritten (rewriting exists on Windows only).\n"
                     "       Code we cannot prove safe is not run.\n"
                     "       (--allow-unproven overrides this, for diagnosis only)\n",
                     path, lib->patch.unproven, lib->patch.lsda_failures, lib->patch.sys_untouched,
-                    lib->patch.sys_outside_functions, lib->patch.fs_unsupported);
+                    lib->patch.sys_outside_functions, lib->patch.fs_unsupported,
+                    lib->patch.fs_reg_feasible - lib->patch.fs_reg_trampolined);
             free(pageprot); return -1;
         }
         afw_mem_protect(lib->stub_area, AFW_STUB_RESERVE, AFW_PROT_R | AFW_PROT_X);

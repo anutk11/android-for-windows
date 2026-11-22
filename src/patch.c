@@ -20,6 +20,8 @@ typedef struct {
 } site;
 
 typedef struct { unsigned char *p; int len; int movable; } hist;
+/* fs:[reg] site: the instruction plus the following instructions moved with it */
+typedef struct { unsigned char *start; int pre_len, ins_len, total, ends_ret; } fsite;
 
 #define VEC_PUSH(arr, n, cap, val) do { \
     if ((n) == (cap)) { (cap) = (cap) ? (cap) * 2 : 1024; (arr) = realloc((arr), (cap) * sizeof *(arr)); } \
@@ -437,6 +439,136 @@ static int has_fs_operand(const ZydisDecodedInstruction *ins, const ZydisDecoded
     return 0;
 }
 
+/* An instruction that may be copied into a trampoline: no branch, no r11,
+ * no fs:, no syscall. rip-relative memory operands are allowed (disp32 is
+ * re-based by copy_insn). */
+static int tramp_movable(ZydisDecoder *dec, const unsigned char *q, const unsigned char *end, int *len) {
+    ZydisDecodedInstruction n;
+    ZydisDecodedOperand nops[ZYDIS_MAX_OPERAND_COUNT];
+    int k;
+    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, q, (ZyanUSize)(end - q), &n, nops))) return 0;
+    *len = n.length;
+    if (is_branch(&n) || uses_r11(&n, nops) || has_fs_operand(&n, nops) || n.mnemonic == ZYDIS_MNEMONIC_SYSCALL)
+        return 0;
+    if (n.attributes & ZYDIS_ATTRIB_IS_RELATIVE) {
+        for (k = 0; k < n.operand_count; k++)
+            if (nops[k].type == ZYDIS_OPERAND_TYPE_MEMORY && nops[k].mem.base == ZYDIS_REGISTER_RIP) break;
+        if (k == n.operand_count || n.raw.disp.size != 32) return 0;
+    }
+    return 1;
+}
+
+/* Copy one instruction from src to dst, re-basing a rip-relative disp32.
+ * Returns 0, or -1 if the target is out of rel32 range. */
+static int copy_insn(ZydisDecoder *dec, unsigned char *dst, const unsigned char *src) {
+    ZydisDecodedInstruction n;
+    ZydisDecodedOperand nops[ZYDIS_MAX_OPERAND_COUNT];
+    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, src, ZYDIS_MAX_INSTRUCTION_LENGTH, &n, nops))) return -1;
+    memcpy(dst, src, n.length);
+    if ((n.attributes & ZYDIS_ATTRIB_IS_RELATIVE) && n.raw.disp.size == 32) {
+        int32_t d;
+        int64_t nd;
+        memcpy(&d, src + n.raw.disp.offset, 4);
+        nd = (int64_t)d + (int64_t)(src - dst);         /* same target from the new place */
+        if (nd > INT32_MAX || nd < INT32_MIN) return -1;
+        d = (int32_t)nd;
+        memcpy(dst + n.raw.disp.offset, &d, 4);
+    }
+    return 0;
+}
+
+/* Can the fs:[reg] instruction at p be moved into a trampoline (design
+ * section 6)? Takes the following instructions (and a final ret), then if
+ * needed the preceding ones, until there are >= 5 bytes for "jmp rel32".
+ * prev[]: up to 3 preceding instruction starts, nearest first (NULL ends).
+ * Returns 1 and fills *f, or 0 with a reason. */
+static int fs_reg_site(ZydisDecoder *dec, unsigned char *p, unsigned char *fstart, unsigned char *end,
+                       unsigned char *const prev[3], const ZydisDecodedInstruction *ins,
+                       const ZydisDecodedOperand *ops, fsite *f, const char **why) {
+    int k, total = ins->length, cnt = 0, len;
+    unsigned char *q = p + ins->length, *start = p;
+    for (k = 0; k < ins->operand_count_visible; k++)
+        if (ops[k].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[k].mem.segment == ZYDIS_REGISTER_FS) break;
+    if (k == ins->operand_count_visible) { *why = "no fs: memory operand"; return 0; }
+    if (ops[k].mem.index != ZYDIS_REGISTER_NONE) { *why = "fs:[base+index]: no room for the tp register"; return 0; }
+    if (ops[k].mem.base == ZYDIS_REGISTER_NONE || ops[k].mem.base == ZYDIS_REGISTER_RSP ||
+        ops[k].mem.base == ZYDIS_REGISTER_RIP || ops[k].mem.base == ZYDIS_REGISTER_R11 ||
+        ZydisRegisterGetWidth(ZYDIS_MACHINE_MODE_LONG_64, ops[k].mem.base) != 64) {
+        *why = "fs: base register cannot be an index"; return 0;
+    }
+    if (uses_r11(ins, ops)) { *why = "instruction uses r11"; return 0; }
+    if (ins->attributes & ZYDIS_ATTRIB_IS_RELATIVE) { *why = "instruction is rip-relative"; return 0; }
+    f->ends_ret = 0;
+    while (total < 5 && cnt < 3 && q < end) {
+        if (*q == 0xC3) { total += 1; f->ends_ret = 1; break; }          /* plain ret: the stub returns */
+        if (!tramp_movable(dec, q, end, &len)) break;
+        total += len; q += len; cnt++;
+    }
+    for (k = 0; total < 5 && k < 3 && prev[k] && prev[k] >= fstart; k++) {
+        if (!tramp_movable(dec, prev[k], start, &len) || prev[k] + len != start) break;
+        total += len; start = prev[k];
+    }
+    if (total < 5) { *why = "fewer than 5 movable bytes around it"; return 0; }
+    f->start = start; f->pre_len = (int)(p - start); f->ins_len = ins->length;
+    f->total = total;
+    return 1;
+}
+
+/* Build the trampoline for one fs:[reg] site at stub; returns its length or
+ * -1. tp comes from gs:[teb] (TEB slot 0). Nothing here changes RFLAGS. */
+static int fs_reg_stub(ZydisDecoder *dec, const fsite *f, int32_t teb, unsigned char *stub, size_t room) {
+    ZydisDecodedInstruction ins;
+    ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+    ZydisEncoderRequest req;
+    unsigned char enc[ZYDIS_MAX_INSTRUCTION_LENGTH];
+    ZyanUSize elen = sizeof enc;
+    const unsigned char *core = f->start + f->pre_len, *q;
+    int k, o = 0;
+    int64_t rel;
+    if (room < 128) return -1;
+    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, core, (ZyanUSize)f->ins_len, &ins, ops))) return -1;
+    if (!ZYAN_SUCCESS(ZydisEncoderDecodedInstructionToEncoderRequest(&ins, ops, ins.operand_count_visible, &req)))
+        return -1;
+    for (k = 0; k < req.operand_count; k++)
+        if (req.operands[k].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            req.operands[k].mem.index = req.operands[k].mem.base;   /* TPOFF register */
+            req.operands[k].mem.scale = 1;
+            req.operands[k].mem.base = ZYDIS_REGISTER_R11;          /* tp */
+        }
+    req.prefixes &= ~(ZydisInstructionAttributes)ZYDIS_ATTRIB_HAS_SEGMENT_FS;
+    if (!ZYAN_SUCCESS(ZydisEncoderEncodeInstruction(&req, enc, &elen))) return -1;
+    for (q = f->start; q < core;) {                                      /* moved predecessors */
+        int len;
+        ZydisDecodedInstruction n;
+        ZydisDecodedOperand nops[ZYDIS_MAX_OPERAND_COUNT];
+        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, q, (ZyanUSize)(core - q), &n, nops))) return -1;
+        len = n.length;
+        if (copy_insn(dec, stub + o, q)) return -1;
+        o += len; q += len;
+    }
+    memcpy(stub + o, "\x48\x8D\x64\x24\x80", 5); o += 5;                 /* lea rsp, [rsp-128] (skip red zone) */
+    stub[o++] = 0x41; stub[o++] = 0x53;                                  /* push r11 */
+    memcpy(stub + o, "\x65\x4C\x8B\x1C\x25", 5); o += 5;                 /* mov r11, gs:[teb] = tp */
+    memcpy(stub + o, &teb, 4); o += 4;
+    memcpy(stub + o, enc, elen); o += (int)elen;                         /* the access, [r11 + reg + disp] */
+    stub[o++] = 0x41; stub[o++] = 0x5B;                                  /* pop r11 */
+    memcpy(stub + o, "\x48\x8D\xA4\x24\x80\x00\x00\x00", 8); o += 8;     /* lea rsp, [rsp+128] */
+    for (q = core + f->ins_len; q < f->start + f->total;) {              /* moved successors */
+        ZydisDecodedInstruction n;
+        ZydisDecodedOperand nops[ZYDIS_MAX_OPERAND_COUNT];
+        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, q, (ZyanUSize)(f->start + f->total - q), &n, nops)))
+            return -1;
+        if (copy_insn(dec, stub + o, q)) return -1;
+        o += n.length; q += n.length;
+    }
+    if (!f->ends_ret) {
+        rel = (int64_t)((f->start + f->total) - (stub + o + 5));
+        if (rel > INT32_MAX || rel < INT32_MIN) return -1;
+        stub[o++] = 0xE9; { int32_t r32 = (int32_t)rel; memcpy(stub + o, &r32, 4); o += 4; }  /* jmp back */
+    }
+    return o;
+}
+
 int afw_patch_code(const afw_code_range *ranges, int nranges,
                    unsigned char *stub_area, size_t stub_size,
                    const afw_patch_ctx *c, afw_patch_report *rep, int verbose) {
@@ -447,6 +579,8 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
     size_t ntargets = 0, captargets = 0;
     site *sites = NULL;
     size_t nsites = 0, capsites = 0, i;
+    fsite *fsites = NULL;
+    size_t nfsites = 0, capfsites = 0;
     unsigned char *stub_for[AFW_MAX_SYSCALL] = {0};
     size_t stub_used = 0;
     uint64_t entry = (uint64_t)(uintptr_t)afw_syscall_entry;
@@ -530,11 +664,29 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                     uint64_t fs_, fe_;
                     int inside = c && c->bounds && c->bounds(c->ctx, ip, &fs_, &fe_);
                     describe(c, p, where, sizeof where);
-                    if (inside) { rep->fs_reg_in_func++; rep->fs_unsupported++; } else rep->fs_reg_outside++;
-                    fprintf(stderr, "  [patch] fs:[reg] at %s: %s\n", where,
-                            inside ? "INSIDE a known function - real ELF TLS access (needs G2)"
-                                   : "outside every known function - data decoded as code, ignored");
-                    dump_ins(p, &ins, ops);
+                    if (inside) {
+                        fsite fx;
+                        const char *why = "";
+                        rep->fs_reg_in_func++;
+                        unsigned char *prev[3] = {h[0].p, h[1].p, h[2].p};
+                        if (fs_reg_site(&dec, p, ranges[r].addr, end, prev, &ins, ops, &fx, &why)) {
+                            rep->fs_reg_feasible++;
+                            VEC_PUSH(fsites, nfsites, capfsites, fx);
+                            if (verbose) fprintf(stderr, "  [patch] fs:[reg] at %s: ELF TLS access, trampoline "
+                                                         "(%d bytes moved%s)\n", where, fx.total,
+                                                 fx.ends_ret ? ", ends with ret" : "");
+                        } else {
+                            rep->fs_unsupported++;
+                            fprintf(stderr, "  [patch] fs:[reg] at %s: REFUSED (%s); library will not be run\n",
+                                    where, why);
+                            dump_ins(p, &ins, ops);
+                        }
+                    } else {
+                        rep->fs_reg_outside++;
+                        fprintf(stderr, "  [patch] fs:[reg] at %s: outside every known function - data decoded "
+                                        "as code, ignored\n", where);
+                        dump_ins(p, &ins, ops);
+                    }
                     continue;
                 }
                 rep->fs_disp_seen++;
@@ -694,6 +846,37 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
         if (s->form == 'A') rep->sys_patched++; else rep->sys_patched_moved++;
         if (verbose > 1) printf("  [patch] syscall at %s: form %c\n", where, s->form);
     }
+
+    /* Pass 2b: fs:[reg] trampolines (design section 6) */
+    for (i = 0; i < nfsites && !fatal; i++) {
+        fsite *f = &fsites[i];
+        int32_t teb = afw_tls_teb_offset(0);
+        int len, k;
+        int64_t rel;
+        describe(c, f->start, where, sizeof where);
+        if (target_inside(targets, ntargets, (uint64_t)(uintptr_t)f->start,
+                          (uint64_t)(uintptr_t)(f->start + f->total))) {
+            rep->fs_reg_feasible--; rep->fs_unsupported++;
+            fprintf(stderr, "  [patch] fs:[reg] at %s: REFUSED (a branch lands inside the moved bytes); "
+                            "library will not be run\n", where);
+            continue;
+        }
+        if (teb < 0) continue;            /* not Windows: counted as feasible, never rewritten */
+        len = fs_reg_stub(&dec, f, teb, stub_area + stub_used, stub_size - stub_used);
+        if (len < 0) {
+            rep->fs_reg_feasible--; rep->fs_unsupported++;
+            fprintf(stderr, "  [patch] fs:[reg] at %s: REFUSED (could not build the trampoline)\n", where);
+            continue;
+        }
+        rel = (int64_t)((stub_area + stub_used) - (f->start + 5));
+        if (rel > INT32_MAX || rel < INT32_MIN) { fatal = 1; break; }
+        f->start[0] = 0xE9; { int32_t r32 = (int32_t)rel; memcpy(f->start + 1, &r32, 4); }  /* jmp stub */
+        for (k = 5; k < f->total; k++) f->start[k] = 0xCC;                                 /* never run */
+        stub_used += ((size_t)len + 15) & ~(size_t)15;
+        rep->stubs++;
+        rep->fs_reg_trampolined++;
+    }
+    free(fsites);
 
     /* Audit: a plain linear sweep of the executable segments finds every
      * byte pattern that LOOKS like a syscall or an fs: access. Each one must
