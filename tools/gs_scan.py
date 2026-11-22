@@ -24,6 +24,8 @@ disps = {"gs": Counter(), "fs": Counter()}
 funcs = {"gs": Counter(), "fs": Counter()}
 insns = 0
 func = "?"
+calls = Counter()          # indirect call forms, numbers normalised
+mnems = Counter()
 
 for line in sys.stdin:
     m = hdr.match(line)
@@ -35,6 +37,9 @@ for line in sys.stdin:
         continue
     insns += 1
     mnem, ops = m.group(1), m.group(2).split("#")[0].strip()
+    mnems[mnem] += 1
+    if mnem.startswith("call") and "*" in ops:
+        calls[re.sub(r"0x[0-9a-f]+|\b\d+\b", "N", ops)] += 1
     for s, d in seg.findall(ops):
         total[s] += 1
         funcs[s][func] += 1
@@ -52,6 +57,11 @@ for line in sys.stdin:
         forms[s][form] += 1
 
 print("=== %s: %d instructions, %d %%gs: accesses, %d %%fs: accesses" % (label, insns, total["gs"], total["fs"]))
+if insns:
+    print("--- indirect call forms (how the code reaches the runtime)")
+    for f, n in calls.most_common(6):
+        print("  %7d  call %s" % (n, f))
+    print("--- top mnemonics: " + ", ".join("%s %d" % (k, v) for k, v in mnems.most_common(8)))
 for s in ("gs", "fs"):
     if not total[s]:
         continue

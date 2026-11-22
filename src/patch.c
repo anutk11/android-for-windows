@@ -497,6 +497,16 @@ static int has_fs_operand(const ZydisDecodedInstruction *ins, const ZydisDecoded
     return 0;
 }
 
+/* gs: on Linux x86_64 is free for programs (ART keeps art::Thread* there);
+ * on Windows x64 it is the TEB. Nothing rewrites gs: accesses yet, so each
+ * one blocks loading (measured: 1557 in libart.so, issue #15). */
+static int has_gs_operand(const ZydisDecodedInstruction *ins, const ZydisDecodedOperand *ops) {
+    int k;
+    for (k = 0; k < ins->operand_count_visible; k++)
+        if (ops[k].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[k].mem.segment == ZYDIS_REGISTER_GS) return 1;
+    return 0;
+}
+
 /* Which original instruction a trampoline stands for (crash reports). */
 #define AFW_MAX_STUB_NOTES 4096
 static struct { const unsigned char *lo, *hi, *site; } g_notes[AFW_MAX_STUB_NOTES];
@@ -761,6 +771,13 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                     if (ops[k].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && ops[k].imm.is_relative &&
                         ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&ins, &ops[k], ip, &t)))
                         VEC_PUSH(targets, ntargets, captargets, (uint64_t)t);
+                }
+            }
+            if (has_gs_operand(&ins, ops)) {
+                if (rep->gs_unsupported++ < 3) {
+                    describe(c, p, where, sizeof where);
+                    fprintf(stderr, "  [patch] gs: access at %s: not supported (gs is the TEB on Windows); "
+                                    "blocks loading\n", where);
                 }
             }
             for (k = 0; k < ins.operand_count_visible; k++) {
@@ -1062,6 +1079,16 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                 if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, p, (ZyanUSize)(end - p), &ins, ops))) { p++; continue; }
                 is_sys = ins.mnemonic == ZYDIS_MNEMONIC_SYSCALL;
                 is_fs = has_fs_operand(&ins, ops);
+                if (has_gs_operand(&ins, ops)) {
+                    int lo = 0, hi = nranges, in = 0;
+                    while (lo < hi) {
+                        int m = (lo + hi) / 2;
+                        if (ranges[m].addr > p) hi = m;
+                        else if (ranges[m].addr + ranges[m].size <= p) lo = m + 1;
+                        else { in = 1; break; }
+                    }
+                    if (!in) rep->gs_outside_functions++;
+                }
                 if (is_sys || is_fs) {
                     int lo = 0, hi = nranges, found = -1;
                     while (lo < hi) {   /* ranges are sorted by address (.eh_frame_hdr order) */

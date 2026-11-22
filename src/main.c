@@ -751,6 +751,13 @@ int main(int argc, char **argv) {
     if (afw_load_patch_only)
         printf("GATE %s: %s\n", lib.soname ? lib.soname : argv[1],
                afw_gate_ok(&lib) ? "would RUN" : "would REFUSE");
+    if (afw_load_patch_only && !afw_gate_ok(&lib))
+            printf("GATE reasons: unproven %d, lsda failures %d, syscall untouched %d, syscall outside %d, "
+                   "fs unsupported %d, fs outside %d, gs unsupported %d, gs outside %d, fs:[reg] %d/%d\n",
+                   lib.patch.unproven, lib.patch.lsda_failures, lib.patch.sys_untouched,
+                   lib.patch.sys_outside_functions, lib.patch.fs_unsupported, lib.patch.fs_outside_functions,
+                   lib.patch.gs_unsupported, lib.patch.gs_outside_functions,
+                   lib.patch.fs_reg_trampolined, lib.patch.fs_reg_feasible);
     if (afw_load_patch_only && strict) {
         int bad = lib.patch.unproven || lib.patch.lsda_failures ||
                   lib.patch.landing_pads < min_pads;

@@ -33,6 +33,7 @@ int afw_gate_ok(const afw_lib *lib) {
     const afw_patch_report *r = &lib->patch;
     return !r->unproven && !r->lsda_failures && !r->sys_untouched && !r->sys_outside_functions &&
            !r->fs_unsupported &&
+           !r->gs_unsupported && !r->gs_outside_functions &&   /* gs: is the TEB on Windows (issue #15) */
            !r->fs_outside_functions &&   /* fs: look-alikes outside .eh_frame (reviewer 4); measured 0 in bionic */
            /* every fs:[reg] must really be rewritten (Windows); measurement mode
             * reports what Windows would do */
@@ -675,12 +676,14 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
                     "error: refusing to run %s: patching left %d unproven syscall/fs: look-alikes,\n"
                     "       %d undecodable exception tables, %d untouched syscall sites and %d syscall\n"
                     "       bytes outside known functions, %d unsupported fs: accesses,\n"
-                    "       %d fs:[reg] accesses not rewritten (rewriting exists on Windows only).\n"
+                    "       %d fs:[reg] accesses not rewritten (rewriting exists on Windows only),\n"
+                    "       %d unsupported gs: accesses (+%d outside known functions).\n"
                     "       Code we cannot prove safe is not run.\n"
                     "       (--allow-unproven overrides this, for diagnosis only)\n",
                     path, lib->patch.unproven, lib->patch.lsda_failures, lib->patch.sys_untouched,
                     lib->patch.sys_outside_functions, lib->patch.fs_unsupported,
-                    lib->patch.fs_reg_feasible - lib->patch.fs_reg_trampolined);
+                    lib->patch.fs_reg_feasible - lib->patch.fs_reg_trampolined,
+                    lib->patch.gs_unsupported, lib->patch.gs_outside_functions);
             free(pageprot); return -1;
         }
         if (afw_mem_protect(lib->stub_area, AFW_STUB_RESERVE, AFW_PROT_R | AFW_PROT_X) != 0) {

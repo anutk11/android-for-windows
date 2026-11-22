@@ -33,6 +33,8 @@ jobs:
             -Wl,--pack-dyn-relocs=none -o out/libtls_test.so test/tls_test.c
           "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 \
             -Wl,--pack-dyn-relocs=none -o out/libfs_gate_test.so test/fs_gate_test.c
+          "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 -nostdlib \
+            -Wl,--pack-dyn-relocs=none -o out/libgs_gate_test.so test/gs_gate_test.c
           "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 \
             -Wl,--pack-dyn-relocs=none -o out/libtls_ie_test.so test/tls_ie_test.c
           "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 -fstack-protector-all \
@@ -219,6 +221,9 @@ jobs:
           grep -q "would REFUSE" out/flow.txt
           if out/afw-asan out/libfs_gate_test.so > out/fsgate.txt 2>&1; then cat out/fsgate.txt; echo "fs: gate did not refuse"; exit 1; fi
           grep -q "6 unsupported fs: accesses" out/fsgate.txt
+          # gs: is the TEB on Windows and nothing rewrites it yet (issue #15)
+          if out/afw-asan out/libgs_gate_test.so > out/gsgate.txt 2>&1; then cat out/gsgate.txt; echo "gs: gate did not refuse"; exit 1; fi
+          grep -q "3 unsupported gs: accesses" out/gsgate.txt
           # fs:[reg] is rewritten on Windows only: on Linux the gate must refuse it
           if out/afw-asan out/libtls_ie_test.so > out/ie.txt 2>&1; then cat out/ie.txt; echo "fs:[reg] ran unrewritten"; exit 1; fi
           grep -q "8 fs:\[reg\] accesses not rewritten" out/ie.txt
@@ -311,6 +316,12 @@ jobs:
           out\afw-loader.exe out\libfs_gate_test.so > out\fsgate.txt 2>&1
           if %errorlevel% equ 0 (type out\fsgate.txt & echo fs: gate did not refuse & exit /b 1)
           findstr /c:"6 unsupported fs: accesses" out\fsgate.txt
+      - name: "Negative test: gs: accesses must be refused (gs is the TEB on Windows)"
+        shell: cmd
+        run: |
+          out\afw-loader.exe out\libgs_gate_test.so > out\gsgate.txt 2>&1
+          if %errorlevel% equ 0 (type out\gsgate.txt & echo gs: gate did not refuse & exit /b 1)
+          findstr /c:"3 unsupported gs: accesses" out\gsgate.txt
       - name: "Negative test: red zone sites must be refused"
         shell: cmd
         run: out\afw-loader.exe out\libredzone_test.so
