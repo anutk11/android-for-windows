@@ -111,6 +111,13 @@ jobs:
           "$TC/llvm-objdump" -d --no-show-raw-insn --disassemble-symbols=__errno,pthread_self,gettid,__get_thread,__set_errno_internal,_Z25__libc_init_main_thread_earlyRK19KernelArgumentBlockP10bionic_tcb,_Z24__libc_init_main_thread_latev,_Z23__libc_init_main_threadP10bionic_tcb out/bionic/libc.so | head -120 || true
           echo "--- the first Windows crash site (libc.so+0xb7cd8: errno written through an empty slot)"
           "$TC/llvm-objdump" -d --no-show-raw-insn --start-address=0xb7cb0 --stop-address=0xb7ce8 out/bionic/libc.so | tail -n +6
+          echo "--- G1: libc.so+0x48350..0x48400 (netdClientInit; the call through NULL at 0x483cf on Windows)"
+          "$TC/llvm-objdump" -d --no-show-raw-insn --start-address=0x48350 --stop-address=0x48400 out/bionic/libc.so | tail -n +6
+          echo "--- libdl.so: what it imports (ld-android is not loaded: weak ones become NULL)"
+          [ -f out/bionic/libdl.so ] || python3 -I tools/fetch_bionic.py out/bionic-py >/dev/null
+          DL=out/bionic/libdl.so; [ -f "$DL" ] || DL=out/bionic-py/libdl.so
+          "$TC/llvm-readelf" --dyn-syms -W "$DL" | grep " UND " || true
+          "$TC/llvm-objdump" -d --no-show-raw-insn --disassemble-symbols=dlopen,dlsym "$DL" | tail -n +6 | head -30
           echo "--- every distinct fs: displacement in libc.so (which TCB slots are used, how often)"
           "$TC/llvm-objdump" -d --no-show-raw-insn out/bionic/libc.so | grep -oE "%fs:0x[0-9a-f]+" | sort | uniq -c
           echo "--- libc.so constructors (.init_array) and the symbols at their addresses"
