@@ -181,7 +181,7 @@ jobs:
         run: |
           set -e
           OUTBIN=out/afw-asan-test EXTRA_CFLAGS="-DAFW_TEST -g -fsanitize=address,undefined -fno-sanitize-recover=undefined" bash tools/build_linux.sh
-          run() { out/afw-asan-test "$@" --patch-report 2>&1 | grep -E "\[attest\]|^ATTEST |^GATE" ; }
+          run() { f=$1; shift; out/afw-asan-test "$f" --patch-report "$@" 2>&1 | grep -E "\[attest\]|^ATTEST |^GATE" ; }
           for v in 1 2 3 4; do
             . out/libattest$v.syms
             A="$afw_at_jmp,$afw_at_tbl,2"
