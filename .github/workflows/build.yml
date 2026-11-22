@@ -171,6 +171,9 @@ jobs:
           for f in out/artprobe/art/*; do
             "$TC/llvm-objdump" -d --no-show-raw-insn "$f" 2>/dev/null | python3 -I tools/gs_scan.py "$(basename "$f")" | tee -a out/art-gs-scan.txt
           done
+          echo "--- what objdump prints for system-boot.oat (format check)"
+          "$TC/llvm-readelf" -SW out/artprobe/art/system-boot.oat | grep -E "^\s+\[" | head -12
+          "$TC/llvm-objdump" -d --no-show-raw-insn out/artprobe/art/system-boot.oat | sed -n '1,12p;2000,2012p' | cut -c1-120
           echo "--- our gate on libart.so as it is today" | tee -a out/art-gs-scan.txt
           out/afw-loader out/artprobe/art/libart.so --patch-report 2>&1 \
             | grep -E "^(Library|Needs|Code|Patched|GATE|TLS)|unproven|UNPROVEN [0-9]|refused" | head -30 | tee -a out/art-gs-scan.txt
