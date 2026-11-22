@@ -15,6 +15,7 @@
 #include "funcs.h"
 #include "platform.h"
 #include "tls_static.h"
+#include "vma.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -751,6 +752,26 @@ static int lib_finish(afw_lib *lib, int verbose) {
             free(pageprot); return -1;
         }
     }
+
+    /* 6e. Hand the image to the VMA layer, so the library's own mprotect /
+     *     madvise / munmap work as on Linux (libc's WriteProtected globals,
+     *     issue #12). Once, with the final protections, before any
+     *     constructor: re-adopting later could overwrite changes Linux code
+     *     made. The stub area after the image stays outside. ELF PF_* and
+     *     Linux PROT_* differ: R and X are swapped. */
+    for (i = 0; i < npages; i++)
+        pageprot[i] = (unsigned char)(((pageprot[i] & PF_R) ? LNX_PROT_READ : 0) |
+                                      ((pageprot[i] & PF_W) ? LNX_PROT_WRITE : 0) |
+                                      ((pageprot[i] & PF_X) ? LNX_PROT_EXEC : 0));
+    {
+        int rc = afw_vma_adopt((uint64_t)(uintptr_t)lib->base, (uint64_t)lib->size, pageprot);
+        if (rc != 0) {
+            fprintf(stderr, "error: the VMA layer refused %s's image (%d)\n",
+                    lib->soname ? lib->soname : lib->path, rc);
+            free(pageprot); return -1;
+        }
+        lib->vma_adopted = 1;
+    }
     free(pageprot);
 
     if (afw_load_patch_only) return 0;
@@ -893,6 +914,9 @@ static void discard(afw_lib *lib) {
         fprintf(stderr, "warning: TLS module of the failed library stays registered\n");
     lib->tls_module = 0;
     free(lib->irel); lib->irel = NULL; lib->nirel = lib->capirel = 0;
+    if (lib->vma_adopted && afw_vma_forget((uint64_t)(uintptr_t)lib->base) != 0)
+        fprintf(stderr, "warning: the VMA layer still lists the failed library\n");
+    lib->vma_adopted = 0;
     if (lib->base) afw_mem_free(lib->base, lib->size + AFW_STUB_RESERVE);
     lib->base = NULL; lib->stub_area = NULL;
     free(lib->pageprot); lib->pageprot = NULL; lib->pending = 0;

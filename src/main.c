@@ -168,6 +168,19 @@ static int run_syscall_tests(const afw_lib *lib) {
             r = rax();
             check("'mov rax, 39; syscall' (the __restore_rt form) works", r == host_pid());
         }
+        if (gen && afw_sym(lib, "afw_sys_bss_page")) {
+            /* libc's WriteProtected<libc_globals> (issue #12): mprotect on the
+             * library's own .bss, through a patched site, as libc does it */
+            volatile char *pg = (volatile char *)afw_sym(lib, "afw_sys_bss_page");
+            long a = (long)(uintptr_t)pg;
+            pg[0] = 5;
+            check("mprotect(PROT_READ) on the library's own .bss succeeds", gen(10, a, 4096, 1, 0, 0, 0) == 0);
+            check("... the contents are kept", pg[0] == 5);
+            check("mprotect(PROT_READ|PROT_WRITE) back succeeds, and the page is writable",
+                  gen(10, a, 4096, 3, 0, 0, 0) == 0 && (pg[0] = 6, pg[0] == 6));
+            check("mprotect on the stub area after the image -> -ENOMEM (not Linux memory)",
+                  gen(10, (long)(uintptr_t)lib->stub_area, 4096, 7, 0, 0, 0) == -12);
+        }
     }
 
     {

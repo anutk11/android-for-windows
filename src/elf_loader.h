@@ -52,6 +52,7 @@ typedef struct afw_lib_s {
 
     /* phase A done, phase B (TLS close, IFUNC, RELRO, constructors) not yet */
     int pending;
+    int vma_adopted;            /* the image is registered with the VMA layer (6e) */
     unsigned char *pageprot;
     size_t npages, relro_first, relro_last;
 
