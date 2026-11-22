@@ -204,6 +204,17 @@ static void run_loader_api_tests(const afw_lib *user) {
     f = base_h ? dls(base_h, "afw_base_pick", NULL) : NULL;
     check("dlsym of an IFUNC returns the resolved function", f && ((ifn)f)() == 5);
     check("dlsym(RTLD_DEFAULT)", dls(NULL, "afw_base_value", NULL) != NULL);
+    {   /* RTLD_NEXT: only libraries loaded after the caller's (base, then user) */
+        const void *in_base = afw_sym(afw_find_loaded("libdeps_base.so"), "afw_base_value");
+        const void *in_user = afw_sym(user, "afw_deps_check");
+        void *nx = (void *)(intptr_t)-1;
+        check("dlsym(RTLD_NEXT) from the dependency finds the library loaded after it",
+              dls(nx, "afw_deps_check", in_base) == in_user);
+        check("dlsym(RTLD_NEXT) never returns the caller's own library",
+              dls(nx, "afw_base_value", in_base) == NULL);
+        check("dlsym(RTLD_NEXT) from the last library -> NULL", dls(nx, "afw_base_value", in_user) == NULL);
+        while (dle()) {}
+    }
     while (dle()) {}
     check("dlopen of a missing library -> NULL", dlo("libdoes_not_exist.so", 2, NULL) == NULL);
     e = dle();

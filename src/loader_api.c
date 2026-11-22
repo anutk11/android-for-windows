@@ -12,8 +12,9 @@
  *   dlopen(loaded)        that library's handle (no second copy)
  *   dlopen(new)           loaded with its DT_NEEDED libraries, constructors run
  *   dlopen(missing)       NULL, dlerror() = 'dlopen failed: library "x" not found'
- *   dlsym                 RTLD_DEFAULT (0) / RTLD_NEXT (-1) / main = every
- *                         library in load order; unknown handle -> NULL + error
+ *   dlsym                 RTLD_DEFAULT (0) / main = every library in load
+ *                         order; RTLD_NEXT (-1) = only those loaded after the
+ *                         caller's; unknown handle -> NULL + error
  *   dlerror               the last error once, then NULL (per thread)
  *   dlclose               0; libraries stay loaded (bionic keeps most too)
  *   dl_iterate_phdr       every finished library: base, name, program headers,
@@ -80,12 +81,36 @@ SYSV void *afw_l_android_dlopen_ext(const char *name, int flags, const void *ext
     return afw_l_dlopen(name, flags, caller);
 }
 
+/* The library an address lies in, as its load-order index; -1 if none. */
+static int lib_index_of(const void *addr) {
+    int k;
+    afw_lib *l;
+    for (k = 0; (l = afw_lib_at(k)) != NULL; k++)
+        if ((const unsigned char *)addr >= l->base && (const unsigned char *)addr < l->base + l->size)
+            return k;
+    return -1;
+}
+
+/* RTLD_NEXT, as bionic: only libraries loaded AFTER the caller's. A caller
+ * outside every library (the loader itself, a test) is the main program:
+ * every library comes after it. */
+static void *next_sym(const char *sym, const void *caller) {
+    int k = lib_index_of(caller) + 1;
+    afw_lib *l;
+    for (; (l = afw_lib_at(k)) != NULL; k++) {
+        void *p = l->pending ? NULL : afw_sym(l, sym);
+        if (p) return p;
+    }
+    return NULL;
+}
+
 SYSV void *afw_l_dlsym(void *handle, const char *sym, const void *caller) {
     void *p;
-    (void)caller;
     if (!sym) { set_err("dlsym failed: symbol name is null"); return NULL; }
-    if (handle == NULL || handle == (void *)(intptr_t)-1 || handle == &g_main_handle) {
-        p = afw_global_sym(sym);      /* RTLD_NEXT is approximated by the global order */
+    if (handle == (void *)(intptr_t)-1) {
+        p = next_sym(sym, caller);
+    } else if (handle == NULL || handle == &g_main_handle) {
+        p = afw_global_sym(sym);      /* RTLD_DEFAULT: every library in load order */
     } else if (!afw_is_loaded(handle)) {
         set_err("dlsym failed: invalid handle %p", handle);
         return NULL;
