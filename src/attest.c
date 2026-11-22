@@ -27,7 +27,7 @@ typedef struct {
 /* linker64, Android 14 UE1A.230829.036.A1 x86_64 (provenance-scan.txt) */
 #define LINKER64 "c5f2d0e1e2c6104d3c30a6169bee9363f16ad1a658ab1bc375e93bbcc6842bd3"
 /* libc++_shared.so from the pinned NDK (android-lib job) */
-#define LIBCXX   "__LIBCXX_SHA256__"
+#define LIBCXX   "7918ebd0b8074c312d0c610205d49760b98c008026e6b817cd92103a3e12241b"
 
 static const record g_records[] = {
     {LINKER64, {0x8088c, 0xd940, 6, "linker64 table 0xd940: entries 0-5 (sites 0x808da = entry 3, 0x80914 = entry 5)"}},
