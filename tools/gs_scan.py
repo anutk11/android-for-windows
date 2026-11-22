@@ -15,7 +15,9 @@ from collections import Counter
 
 label = sys.argv[1] if len(sys.argv) > 1 else "?"
 hdr = re.compile(r"^[0-9a-f]+ <(.+)>:$")
-ins = re.compile(r"^\s+[0-9a-f]+:\s+(\S+)\s*(.*)$")
+# "addr:<TAB>[raw bytes<TAB>]mnemonic<TAB>operands" - some files (the .oat
+# ones) get the raw bytes printed even with --no-show-raw-insn; skip them.
+ins = re.compile(r"^\s+[0-9a-f]+:\s+(?:(?:[0-9a-f]{2} )+\s*)?([a-z][a-z0-9.]*)\s*(.*)$")
 seg = re.compile(r"%(gs|fs):(-?(?:0x[0-9a-f]+|\d+)?(?:\([^)]*\))?)")
 
 total = Counter()          # gs / fs
