@@ -90,3 +90,59 @@ objcopy --dump-section .gnu_debugdata="$W/debugdata.xz" "$W/libc.so" /dev/null 2
 if [ -s "$W/debugdata.xz" ]; then
   xz -dc "$W/debugdata.xz" > "$W/libc.debug" && echo "== .gnu_debugdata symbols extracted"
 fi
+
+# ---- Provenance (for the libc_shared_globals oracle, issue #1) ----------
+# Metadata only: hashes, build properties, APEX manifest. No image content.
+P="$(pwd)/out/provenance-scan.txt"
+{
+  echo "== SDK package: $PKG"
+  cat "$D/source.properties" 2>/dev/null || echo "(no source.properties)"
+  echo; echo "== sha256"
+  sha256sum "$IMG" "$W/libc.so" 2>/dev/null | sed "s#$SDK/##; s#$(pwd)/##"
+  [ -f "$W/linker64" ] && sha256sum "$W/linker64" | sed "s#$(pwd)/##"
+  for A in com.android.runtime.apex com.android.runtime.capex; do
+    [ -f "$W/$A" ] && sha256sum "$W/$A" | sed "s#$(pwd)/##"
+  done
+  echo; echo "== ELF build ids"
+  for f in "$W/libc.so" "$W/linker64"; do
+    [ -f "$f" ] && echo "$(basename "$f"): $(readelf -n "$f" | awk '/Build ID/{print $3}')"
+  done
+  echo; echo "== runtime APEX manifest (apex_manifest.pb, printable strings + version varint)"
+  if [ -f "$W/apex/apex_manifest.pb" ]; then
+    strings -n 3 "$W/apex/apex_manifest.pb"
+    python3 - "$W/apex/apex_manifest.pb" <<'PY'
+import sys
+b = open(sys.argv[1], "rb").read()
+i = 0
+def varint(i):
+    v = s = 0
+    while True:
+        c = b[i]; i += 1; v |= (c & 0x7f) << s; s += 7
+        if not c & 0x80: return v, i
+while i < len(b):
+    key, i = varint(i); field, wt = key >> 3, key & 7
+    if wt == 0:
+        v, i = varint(i)
+        if field == 2: print("apex version =", v)
+    elif wt == 2:
+        n, i = varint(i)
+        if field == 1: print("apex name =", b[i:i+n].decode(errors="replace"))
+        i += n
+    elif wt == 5: i += 4
+    elif wt == 1: i += 8
+    else: break
+PY
+  else echo "(not found)"; fi
+  echo; echo "== system build.prop (full)"
+  cat "$W/build.prop" 2>/dev/null || echo "(not found)"
+} > "$P"
+cat "$P"
+
+# Pin: fail loudly if the SDK served a different libc than the one measured.
+EXPECT_LIBC_BUILD_ID="${EXPECT_LIBC_BUILD_ID:-fa337969c798946280caa45e2d71a2e7}"
+GOT_ID="$(readelf -n "$W/libc.so" | awk '/Build ID/{print $3}')"
+if [ "$GOT_ID" != "$EXPECT_LIBC_BUILD_ID" ]; then
+  echo "ERROR: libc.so Build ID $GOT_ID, expected $EXPECT_LIBC_BUILD_ID - the SDK image changed"
+  exit 1
+fi
+echo "== libc.so Build ID matches the pinned value"
