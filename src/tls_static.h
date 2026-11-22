@@ -31,6 +31,11 @@ uint64_t afw_tls_static_off(int mod);
 uintptr_t *afw_tls_static_alloc(void **block);
 void afw_tls_static_free(void *block);
 
+/* Address of byte `offset` of module `module` (1-based) for the calling
+ * thread, or NULL if the module does not exist or offset >= its p_memsz. */
+void *afw_tls_static_resolve(uint64_t module, uint64_t offset);
+uint64_t afw_tls_static_memsz(int mod);   /* p_memsz of module mod, 0 if unknown */
+
 /* What general-dynamic code calls (resolved for every library in G1, ahead
  * of libc's own export: TEMPORARY until bionic's DTV is built in G2). */
 typedef struct { uint64_t module, offset; } afw_tls_index;

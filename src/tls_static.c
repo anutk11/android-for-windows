@@ -83,12 +83,26 @@ int afw_tls_static_finish(void) {
     return afw_tls_thread_rebuild();
 }
 
-SYSV void *afw_tls_get_addr(const afw_tls_index *ti) {
+uint64_t afw_tls_static_memsz(int mod) {
+    return (mod >= 1 && mod <= g_layout.nmod) ? g_seg[mod - 1].p_memsz : 0;
+}
+
+void *afw_tls_static_resolve(uint64_t module, uint64_t offset) {
     uintptr_t *tp = afw_tls_block();
-    if (!ti || ti->module < 1 || ti->module > (uint64_t)g_layout.nmod || !tp) {
-        fprintf(stderr, "fatal: __tls_get_addr with module %llu (loaded: %d)\n",
-                ti ? (unsigned long long)ti->module : 0ULL, g_layout.nmod);
+    if (!tp || module < 1 || module > (uint64_t)g_layout.nmod) return NULL;
+    /* inside the module's block: offset < p_memsz (reviewer 2, PR #6 A2);
+     * off >= p_memsz always holds (tls_layout.c), so this never wraps */
+    if (offset >= g_seg[module - 1].p_memsz) return NULL;
+    return (unsigned char *)tp - g_layout.off[module - 1] + offset;
+}
+
+SYSV void *afw_tls_get_addr(const afw_tls_index *ti) {
+    void *p = ti ? afw_tls_static_resolve(ti->module, ti->offset) : NULL;
+    if (!p) {
+        fprintf(stderr, "fatal: __tls_get_addr(module %llu, offset 0x%llx): outside every TLS block "
+                        "(%d modules)\n", ti ? (unsigned long long)ti->module : 0ULL,
+                ti ? (unsigned long long)ti->offset : 0ULL, g_layout.nmod);
         abort();
     }
-    return (unsigned char *)tp - g_layout.off[ti->module - 1] + ti->offset;
+    return p;
 }

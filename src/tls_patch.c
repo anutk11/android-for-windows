@@ -127,38 +127,24 @@ int afw_tls_init(void) {
     }
     g_fls = FlsAlloc(fls_release);
     if (g_fls == FLS_OUT_OF_INDEXES) { fprintf(stderr, "[tls] no FLS index\n"); return -1; }
-    AddVectoredExceptionHandler(1, fs_handler);
+    if (!AddVectoredExceptionHandler(1, fs_handler)) { fprintf(stderr, "[tls] cannot install the fs: handler\n"); return -1; }
     g_ready = 1;
     return afw_tls_thread_init();
 }
 
-static void publish(void) {
+static int g_fail_publish;   /* test hook: make the next publish fail */
+void afw_tls_test_fail_publish(int on) { g_fail_publish = on; }
+
+/* Make blk this thread's block for the CPU (TEB TlsSlots) and for the
+ * release at thread exit (FLS). Returns 0, or -1 if any step failed. */
+static int publish(uintptr_t *blk, void *alloc) {
     int i;
-    for (i = 0; i < BIONIC_TLS_SLOTS; i++) TlsSetValue(g_slot[i], (void *)t_block[i]);
-    FlsSetValue(g_fls, t_alloc);
+    if (g_fail_publish) { g_fail_publish = 0; return -1; }
+    for (i = 0; i < BIONIC_TLS_SLOTS; i++)
+        if (!TlsSetValue(g_slot[i], (void *)blk[i])) return -1;
+    return FlsSetValue(g_fls, alloc) ? 0 : -1;
 }
-
-int afw_tls_thread_init(void) {
-    if (!t_block) t_block = afw_tls_static_alloc(&t_alloc);
-    if (!t_block) { fprintf(stderr, "[tls] cannot allocate the thread's TLS block\n"); return -1; }
-    t_block[TLS_SLOT_SELF] = (uintptr_t)t_block;
-    t_block[TLS_SLOT_THREAD_ID] = (uintptr_t)GetCurrentThreadId();
-    t_block[TLS_SLOT_STACK_GUARD] = g_guard;
-    publish();
-    return 0;
-}
-
-int afw_tls_thread_rebuild(void) {
-    void *old_alloc = t_alloc, *new_alloc;
-    uintptr_t *old = t_block, *nb = afw_tls_static_alloc(&new_alloc);
-    if (!nb) return -1;
-    if (old) memcpy(nb, old, BIONIC_TLS_SLOTS * sizeof *nb);
-    nb[TLS_SLOT_SELF] = (uintptr_t)nb;
-    t_block = nb; t_alloc = new_alloc;
-    publish();                       /* the FLS value now names the new block */
-    afw_tls_static_free(old_alloc);
-    return 0;
-}
+static uintptr_t thread_id(void) { return (uintptr_t)GetCurrentThreadId(); }
 
 #else
 /* Linux: fs: already works natively; nothing to patch. */
@@ -168,27 +154,58 @@ int afw_tls_teb_offset(int slot) { (void)slot; return -1; }
 /* Same rule as FLS on Windows: the key frees a thread's block at exit. */
 static pthread_key_t g_key;
 static void key_release(void *p) { afw_tls_static_free(p); }
+static int g_fail_publish;
+void afw_tls_test_fail_publish(int on) { g_fail_publish = on; }
+static int publish(uintptr_t *blk, void *alloc) {
+    (void)blk;
+    if (g_fail_publish) { g_fail_publish = 0; return -1; }
+    return pthread_setspecific(g_key, alloc) == 0 ? 0 : -1;
+}
+static uintptr_t thread_id(void) { return 0; }
 int afw_tls_init(void) {
     if (pthread_key_create(&g_key, key_release) != 0) return -1;
     return afw_tls_thread_init();
 }
-int afw_tls_thread_init(void) {
-    if (!t_block) t_block = afw_tls_static_alloc(&t_alloc);
-    if (!t_block) return -1;
-    t_block[TLS_SLOT_SELF] = (uintptr_t)t_block;
-    t_block[TLS_SLOT_STACK_GUARD] = g_guard;
-    pthread_setspecific(g_key, t_alloc);
-    return 0;
-}
-int afw_tls_thread_rebuild(void) {
-    void *old_alloc = t_alloc, *new_alloc;
-    uintptr_t *old = t_block, *nb = afw_tls_static_alloc(&new_alloc);
-    if (!nb) return -1;
-    if (old) memcpy(nb, old, BIONIC_TLS_SLOTS * sizeof *nb);
-    nb[TLS_SLOT_SELF] = (uintptr_t)nb;
-    t_block = nb; t_alloc = new_alloc;
-    pthread_setspecific(g_key, t_alloc);
-    afw_tls_static_free(old_alloc);
-    return 0;
-}
 #endif
+
+/* The thread's state changes only after publishing succeeded (reviewer 2,
+ * PR #6 A1): on failure the new block is freed and nothing else moves. */
+int afw_tls_thread_init(void) {
+    void *alloc;
+    uintptr_t *blk;
+    if (t_block) return 0;
+    blk = afw_tls_static_alloc(&alloc);
+    if (!blk) { fprintf(stderr, "[tls] cannot allocate the thread's TLS block\n"); return -1; }
+    blk[TLS_SLOT_SELF] = (uintptr_t)blk;
+    blk[TLS_SLOT_THREAD_ID] = thread_id();
+    blk[TLS_SLOT_STACK_GUARD] = g_guard;
+    if (publish(blk, alloc) != 0) {
+        fprintf(stderr, "[tls] cannot publish the thread's TLS block\n");
+        afw_tls_static_free(alloc);
+        return -1;
+    }
+    t_block = blk; t_alloc = alloc;
+    return 0;
+}
+
+/* Used once, when the layout becomes final (before any library code runs):
+ * module data is taken fresh from the .tdata images, only the slots carry over. */
+int afw_tls_thread_rebuild(void) {
+    void *new_alloc;
+    uintptr_t *nb = afw_tls_static_alloc(&new_alloc);
+    if (!nb) return -1;
+    if (t_block) memcpy(nb, t_block, BIONIC_TLS_SLOTS * sizeof *nb);
+    else { nb[TLS_SLOT_THREAD_ID] = thread_id(); nb[TLS_SLOT_STACK_GUARD] = g_guard; }
+    nb[TLS_SLOT_SELF] = (uintptr_t)nb;
+    if (publish(nb, new_alloc) != 0) {
+        /* put the old block back everywhere a partial publish may have reached */
+        if (t_block && publish(t_block, t_alloc) != 0)
+            fprintf(stderr, "[tls] FATAL: cannot restore the old TLS block\n"), abort();
+        afw_tls_static_free(new_alloc);
+        fprintf(stderr, "[tls] cannot publish the rebuilt TLS block; the old one stays\n");
+        return -1;
+    }
+    afw_tls_static_free(t_alloc);    /* only now: nothing names the old block any more */
+    t_block = nb; t_alloc = new_alloc;
+    return 0;
+}

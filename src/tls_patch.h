@@ -30,6 +30,9 @@ int afw_tls_thread_init(void);
  * TLS layout (bionic slots carried over). Returns 0 or -1. */
 int afw_tls_thread_rebuild(void);
 
+/* Test hook: the next publish of a thread block fails (negative tests). */
+void afw_tls_test_fail_publish(int on);
+
 /* Windows TEB offset (gs:) that holds bionic slot `slot`, or -1 when there
  * is none (non-Windows, or slot out of range). Used by load-time patching. */
 int afw_tls_teb_offset(int slot);

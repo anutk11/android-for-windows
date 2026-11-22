@@ -16,6 +16,7 @@
 #include "tls_patch.h"
 #include "crash.h"
 #include "syscall.h"
+#include "tls_static.h"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -198,14 +199,14 @@ typedef int *(SYSV *tls_ptr_fn)(void);
 typedef SYSV void (*tls_wait_fn)(void);
 typedef int (SYSV *tls_worker_fn)(int, tls_wait_fn, int);
 
-static volatile long g_arrived;
-static SYSV void tls_barrier(void) {          /* two threads meet here */
+static volatile long g_arrived, g_barrier_open;
+static SYSV void tls_barrier(void) {          /* two threads meet here, unless the barrier was opened */
 #if defined(_WIN32)
     InterlockedIncrement(&g_arrived);
 #else
     __atomic_add_fetch(&g_arrived, 1, __ATOMIC_SEQ_CST);
 #endif
-    while (g_arrived < 2) {}
+    while (g_arrived < 2 && !g_barrier_open) {}
 }
 
 typedef struct { tls_worker_fn fn; int id, use_ie, rc; } tls_job;
@@ -220,22 +221,36 @@ static void *tls_thread(void *p) {
     return 0;
 }
 
-static int run_tls_threads(tls_worker_fn fn, int use_ie) {
+/* Every creation and wait is checked (reviewer 2, PR #6 A3). If a thread
+ * cannot be created, the barrier is opened so the other one cannot hang,
+ * and the run reports failure. fail_second simulates that (negative test). */
+static int run_tls_threads(tls_worker_fn fn, int use_ie, int fail_second) {
     tls_job j[2] = {{fn, 1, use_ie, -1}, {fn, 2, use_ie, -1}};
-    int k;
-    g_arrived = 0;
+    int k, created[2] = {0, 0}, ok = 1;
+    g_arrived = 0; g_barrier_open = 0;
 #if defined(_WIN32)
-    HANDLE h[2];
-    for (k = 0; k < 2; k++) h[k] = CreateThread(NULL, 0, tls_thread, &j[k], 0, NULL);
-    WaitForMultipleObjects(2, h, TRUE, INFINITE);
-    for (k = 0; k < 2; k++) CloseHandle(h[k]);
+    HANDLE h[2] = {NULL, NULL};
+    for (k = 0; k < 2; k++) {
+        h[k] = (k == 1 && fail_second) ? NULL : CreateThread(NULL, 0, tls_thread, &j[k], 0, NULL);
+        created[k] = h[k] != NULL;
+        if (!created[k]) { ok = 0; g_barrier_open = 1; printf("    thread %d could not be created\n", k + 1); }
+    }
+    for (k = 0; k < 2; k++)
+        if (created[k]) {
+            if (WaitForSingleObject(h[k], 30000) != WAIT_OBJECT_0) { ok = 0; printf("    thread %d did not finish\n", k + 1); }
+            CloseHandle(h[k]);
+        }
 #else
     pthread_t t[2];
-    for (k = 0; k < 2; k++) pthread_create(&t[k], NULL, tls_thread, &j[k]);
-    for (k = 0; k < 2; k++) pthread_join(t[k], NULL);
+    for (k = 0; k < 2; k++) {
+        created[k] = !(k == 1 && fail_second) && pthread_create(&t[k], NULL, tls_thread, &j[k]) == 0;
+        if (!created[k]) { ok = 0; g_barrier_open = 1; printf("    thread %d could not be created\n", k + 1); }
+    }
+    for (k = 0; k < 2; k++)
+        if (created[k] && pthread_join(t[k], NULL) != 0) { ok = 0; printf("    thread %d could not be joined\n", k + 1); }
 #endif
     if (j[0].rc || j[1].rc) printf("    worker results: thread 1 -> %d, thread 2 -> %d\n", j[0].rc, j[1].rc);
-    return j[0].rc == 0 && j[1].rc == 0;
+    return ok && j[0].rc == 0 && j[1].rc == 0;
 }
 
 static int run_tls_tests(const afw_lib *lib) {
@@ -256,11 +271,35 @@ static int run_tls_tests(const afw_lib *lib) {
     check("general-dynamic address lies below tp", (uintptr_t)gd() < (uintptr_t)afw_tls_block());
 #if defined(_WIN32)
     check("initial-exec (fs:[0] + TPOFF64) == general-dynamic", ie() == gd());
-    check("two threads, initial-exec: private copies", run_tls_threads(worker, 1));
+    check("two threads, initial-exec: private copies", run_tls_threads(worker, 1, 0));
 #else
     (void)ie;   /* on Linux fs: belongs to the host C library: initial-exec runs only on Windows */
 #endif
-    check("two threads, general-dynamic: private copies", run_tls_threads(worker, 0));
+    check("two threads, general-dynamic: private copies", run_tls_threads(worker, 0, 0));
+    printf("  negative tests (failures must be reported, never hidden or hung):\n");
+    check("second thread cannot be created: reported, no hang", run_tls_threads(worker, 0, 1) == 0);
+    {
+        int *v = gd();
+        int before = *v;
+        uintptr_t *tp_before = afw_tls_block();
+        afw_tls_test_fail_publish(1);
+        check("rebuild whose publish fails returns -1", afw_tls_thread_rebuild() == -1);
+        check("... and the thread keeps its old block and values", afw_tls_block() == tp_before && *gd() == before);
+        check("a rebuild that succeeds still works afterwards", afw_tls_thread_rebuild() == 0 && *gd() == before);
+    }
+    {
+        afw_tls_index bad;
+        uint64_t memsz = 0;
+        int m = lib->tls_module;
+        (void)bad;
+        memsz = afw_tls_static_memsz(m);
+        check("__tls_get_addr: last byte of the module resolves", afw_tls_static_resolve((uint64_t)m, memsz - 1) != NULL);
+        check("__tls_get_addr: offset == p_memsz refused", afw_tls_static_resolve((uint64_t)m, memsz) == NULL);
+        check("__tls_get_addr: offset > p_memsz refused", afw_tls_static_resolve((uint64_t)m, memsz + 64) == NULL);
+        check("__tls_get_addr: offset near 2^64 refused", afw_tls_static_resolve((uint64_t)m, ~(uint64_t)0) == NULL);
+        check("__tls_get_addr: module 0 / unknown module refused",
+              afw_tls_static_resolve(0, 0) == NULL && afw_tls_static_resolve((uint64_t)m + 1, 0) == NULL);
+    }
     printf("%s\n", g_failed ? "G1-TLS TESTS FAILED" : "G1-TLS TESTS PASSED");
     return g_failed ? 1 : 0;
 }
