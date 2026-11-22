@@ -29,3 +29,18 @@ __attribute__((naked)) int afw_ie_test_flags(void) {      /* 1 if afw_ie.b has b
             "movzx %al, %eax\n\t"
             "ret");
 }
+
+/* a branch lands right after the access: the successor cannot be moved, so
+ * the trampoline must take the preceding instruction instead.
+ * x == 0: afw_ie.b + 1; otherwise 1 */
+__attribute__((naked)) int afw_ie_branch_after(int x) {
+    __asm__("mov afw_ie@gottpoff(%rip), %rcx\n\t"
+            "xor %eax, %eax\n\t"
+            "test %edi, %edi\n\t"
+            "jnz 2f\n\t"
+            "lea 1(%rdi), %edx\n\t"
+            "mov %fs:4(%rcx), %eax\n"
+            "2:\n\t"
+            "add $1, %eax\n\t"
+            "ret");
+}

@@ -97,10 +97,10 @@ jobs:
             out/afw-loader "$f" --patch-report 2>&1 | grep -vE "^  MISSING" | tee -a out/patch-scan.txt
           done
           echo "--- expected load-gate results (an unexpected change fails the build)"
-          # libc: REFUSE since G1-TLS tightened the gate - its fs:[reg] sites (gwp_asan, ELF TLS
-          # with writes) are not handled yet (docs/design/G1-TLS.md, section 6)
-          grep -E "GATE libc.so|fs:\[reg\] at libc" out/patch-scan.txt || true
-          grep -q "GATE libc.so: would" out/patch-scan.txt
+          # libc: RUN - every one of its 17 fs:[reg] sites (gwp_asan ELF TLS) gets a trampoline
+          test "$(grep -c "fs:\[reg\] at libc.so+0x[0-9a-f]*: ELF TLS access, trampoline" out/patch-scan.txt)" -eq 17
+          grep -E "fs:\[reg\] at libc" out/patch-scan.txt || true
+          grep -q "GATE libc.so: would RUN" out/patch-scan.txt
           grep -q "GATE ld-android.so: would REFUSE" out/patch-scan.txt   # 3 unproven look-alikes, known
           echo "gate results as expected"
           echo "--- libc ELF TLS: who uses the TPOFF64 GOT entry (issue #3, proposal 1; issue #4)" | tee out/libc-tls-scan.txt
@@ -160,7 +160,7 @@ jobs:
           grep -q "2 unsupported fs: accesses" out/fsgate.txt
           # fs:[reg] is rewritten on Windows only: on Linux the gate must refuse it
           if out/afw-asan out/libtls_ie_test.so > out/ie.txt 2>&1; then cat out/ie.txt; echo "fs:[reg] ran unrewritten"; exit 1; fi
-          grep -q "5 fs:\[reg\] accesses not rewritten" out/ie.txt
+          grep -q "6 fs:\[reg\] accesses not rewritten" out/ie.txt
           out/afw-asan out/libcxx_exception_test.so --patch-report --strict --min-landing-pads=1
           out/afw-asan out/libc++_shared.so --patch-report
 

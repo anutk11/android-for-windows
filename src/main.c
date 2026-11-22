@@ -286,9 +286,10 @@ static int run_ie_tests(const afw_lib *lib) {
     ie_ptr_fn addr = (ie_ptr_fn)afw_sym(lib, "afw_ie_addr");
     ie_set_fn store_ret = (ie_set_fn)afw_sym(lib, "afw_ie_store_ret");
     ie_int_fn test_flags = (ie_int_fn)afw_sym(lib, "afw_ie_test_flags");
+    ie_and_fn branch_after = (ie_and_fn)afw_sym(lib, "afw_ie_branch_after");
     g_ie_read_b = read_b;
     printf("\nG1-TLS fs:[reg] tests (%d accesses rewritten through trampolines):\n", lib->patch.fs_reg_trampolined);
-    check("all 5 fs:[reg] accesses rewritten", lib->patch.fs_reg_trampolined == 5);
+    check("all 6 fs:[reg] accesses rewritten", lib->patch.fs_reg_trampolined == 6);
     check("read fs:[reg+4] (initial value)", read_b() == 22);
     write_a(5);
     check("write fs:[reg] lands where tp + TPOFF points", addr()[0] == 5);
@@ -298,6 +299,8 @@ static int run_ie_tests(const afw_lib *lib) {
     check("flags from test after the stub (b=22: bit 0 clear)", test_flags() == 1);
     addr()[1] = 23;
     check("flags change with the value (b=23)", test_flags() == 0 && read_b() == 23);
+    check("branch target right after the access: predecessor moved instead", branch_after(0) == 24);
+    check("... and the branch to that target still works", branch_after(7) == 1);
 #if defined(_WIN32)
     {
         int other = -1;

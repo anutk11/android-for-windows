@@ -22,6 +22,8 @@ typedef struct {
 typedef struct { unsigned char *p; int len; int movable; } hist;
 /* fs:[reg] site: the instruction plus the following instructions moved with it */
 typedef struct { unsigned char *start; int pre_len, ins_len, total, ends_ret; } fsite;
+/* two ways to collect the 5 bytes: successors first, or predecessors first */
+typedef struct { fsite opt[2]; int nopt; } fsite2;
 
 #define VEC_PUSH(arr, n, cap, val) do { \
     if ((n) == (cap)) { (cap) = (cap) ? (cap) * 2 : 1024; (arr) = realloc((arr), (cap) * sizeof *(arr)); } \
@@ -484,7 +486,7 @@ static int copy_insn(ZydisDecoder *dec, unsigned char *dst, const unsigned char 
  * Returns 1 and fills *f, or 0 with a reason. */
 static int fs_reg_site(ZydisDecoder *dec, unsigned char *p, unsigned char *fstart, unsigned char *end,
                        unsigned char *const prev[3], const ZydisDecodedInstruction *ins,
-                       const ZydisDecodedOperand *ops, fsite *f, const char **why) {
+                       const ZydisDecodedOperand *ops, int pred_first, fsite *f, const char **why) {
     int k, total = ins->length, cnt = 0, len;
     unsigned char *q = p + ins->length, *start = p;
     for (k = 0; k < ins->operand_count_visible; k++)
@@ -499,14 +501,23 @@ static int fs_reg_site(ZydisDecoder *dec, unsigned char *p, unsigned char *fstar
     if (uses_r11(ins, ops)) { *why = "instruction uses r11"; return 0; }
     if (ins->attributes & ZYDIS_ATTRIB_IS_RELATIVE) { *why = "instruction is rip-relative"; return 0; }
     f->ends_ret = 0;
-    while (total < 5 && cnt < 3 && q < end) {
-        if (*q == 0xC3) { total += 1; f->ends_ret = 1; break; }          /* plain ret: the stub returns */
-        if (!tramp_movable(dec, q, end, &len)) break;
-        total += len; q += len; cnt++;
-    }
-    for (k = 0; total < 5 && k < 3 && prev[k] && prev[k] >= fstart; k++) {
-        if (!tramp_movable(dec, prev[k], start, &len) || prev[k] + len != start) break;
-        total += len; start = prev[k];
+    {
+        int pass;
+        for (pass = 0; pass < 2; pass++) {
+            if ((pass == 0) == !pred_first) {       /* successors (a final plain ret may end the stub) */
+                while (total < 5 && cnt < 3 && q < end && !f->ends_ret) {
+                    if (*q == 0xC3) { total += 1; f->ends_ret = 1; break; }
+                    if (!tramp_movable(dec, q, end, &len)) break;
+                    total += len; q += len; cnt++;
+                }
+            } else {                                  /* predecessors */
+                for (k = 0; total < 5 && k < 3 && prev[k] && prev[k] >= fstart; k++) {
+                    if (prev[k] >= start) continue;
+                    if (!tramp_movable(dec, prev[k], start, &len) || prev[k] + len != start) break;
+                    total += len; start = prev[k];
+                }
+            }
+        }
     }
     if (total < 5) { *why = "fewer than 5 movable bytes around it"; return 0; }
     f->start = start; f->pre_len = (int)(p - start); f->ins_len = ins->length;
@@ -579,7 +590,7 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
     size_t ntargets = 0, captargets = 0;
     site *sites = NULL;
     size_t nsites = 0, capsites = 0, i;
-    fsite *fsites = NULL;
+    fsite2 *fsites = NULL;
     size_t nfsites = 0, capfsites = 0;
     unsigned char *stub_for[AFW_MAX_SYSCALL] = {0};
     size_t stub_used = 0;
@@ -669,9 +680,17 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                         const char *why = "";
                         rep->fs_reg_in_func++;
                         unsigned char *prev[3] = {h[0].p, h[1].p, h[2].p};
-                        if (fs_reg_site(&dec, p, ranges[r].addr, end, prev, &ins, ops, &fx, &why)) {
+                        fsite2 f2;
+                        f2.nopt = 0;
+                        if (fs_reg_site(&dec, p, ranges[r].addr, end, prev, &ins, ops, 0, &f2.opt[0], &why))
+                            f2.nopt++;
+                        if (fs_reg_site(&dec, p, ranges[r].addr, end, prev, &ins, ops, 1, &f2.opt[f2.nopt], &why) &&
+                            (f2.nopt == 0 || f2.opt[1].start != f2.opt[0].start || f2.opt[1].total != f2.opt[0].total))
+                            f2.nopt++;
+                        if (f2.nopt) fx = f2.opt[0];
+                        if (f2.nopt) {
                             rep->fs_reg_feasible++;
-                            VEC_PUSH(fsites, nfsites, capfsites, fx);
+                            VEC_PUSH(fsites, nfsites, capfsites, f2);
                             if (verbose) fprintf(stderr, "  [patch] fs:[reg] at %s: ELF TLS access, trampoline "
                                                          "(%d bytes moved%s)\n", where, fx.total,
                                                  fx.ends_ret ? ", ends with ret" : "");
@@ -849,13 +868,16 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
 
     /* Pass 2b: fs:[reg] trampolines (design section 6) */
     for (i = 0; i < nfsites && !fatal; i++) {
-        fsite *f = &fsites[i];
+        fsite *f = NULL;
         int32_t teb = afw_tls_teb_offset(0);
-        int len, k;
+        int len, k, o;
         int64_t rel;
-        describe(c, f->start, where, sizeof where);
-        if (target_inside(targets, ntargets, (uint64_t)(uintptr_t)f->start,
-                          (uint64_t)(uintptr_t)(f->start + f->total))) {
+        for (o = 0; o < fsites[i].nopt && !f; o++)     /* the first layout no branch lands inside */
+            if (!target_inside(targets, ntargets, (uint64_t)(uintptr_t)fsites[i].opt[o].start,
+                               (uint64_t)(uintptr_t)(fsites[i].opt[o].start + fsites[i].opt[o].total)))
+                f = &fsites[i].opt[o];
+        describe(c, fsites[i].opt[0].start + fsites[i].opt[0].pre_len, where, sizeof where);
+        if (!f) {
             rep->fs_reg_feasible--; rep->fs_unsupported++;
             fprintf(stderr, "  [patch] fs:[reg] at %s: REFUSED (a branch lands inside the moved bytes); "
                             "library will not be run\n", where);
