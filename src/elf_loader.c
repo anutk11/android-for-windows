@@ -377,6 +377,11 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
         free(file); return -1;
     }
     ph = (Elf64_Phdr *)(file + eh->e_phoff);
+    /* a copy for dl_iterate_phdr (the file buffer is freed early) */
+    lib->phdr = (Elf64_Phdr *)malloc((size_t)eh->e_phnum * sizeof(Elf64_Phdr) + 1);
+    if (!lib->phdr) { fprintf(stderr, "error: out of memory\n"); free(file); return -1; }
+    memcpy(lib->phdr, ph, (size_t)eh->e_phnum * sizeof(Elf64_Phdr));
+    lib->phnum = eh->e_phnum;
 
     /* Executable sections (when section headers exist): the audit sweeps
      * only these, not whole PT_LOAD segments that also hold .dynstr/.rodata */
@@ -826,6 +831,63 @@ static int file_needed(const char *path, unsigned char **buf, const char **names
     return c;
 }
 
+static int find_lib(const char *name, const char *dir, char *out, size_t outsz);
+
+/* ---- the registry, for the linker API (loader_api.c) ------------------ */
+static const char *base_name(const char *p) {
+    const char *b = strrchr(p, '/'), *bs = strrchr(p, '\\');
+    if (bs && (!b || bs > b)) b = bs;
+    return b ? b + 1 : p;
+}
+
+afw_lib *afw_lib_at(int k) { return (k >= 0 && k < g_nlibs) ? g_libs[k] : NULL; }
+
+afw_lib *afw_find_loaded(const char *name) {
+    int k;
+    const char *want = base_name(name);
+    for (k = 0; k < g_nlibs; k++)
+        if ((g_libs[k]->soname && strcmp(g_libs[k]->soname, want) == 0) ||
+            strcmp(base_name(g_libs[k]->path), want) == 0)
+            return g_libs[k];
+    return NULL;
+}
+
+int afw_is_loaded(const void *handle) {
+    int k;
+    for (k = 0; k < g_nlibs; k++) if ((const void *)g_libs[k] == handle) return 1;
+    return 0;
+}
+
+/* RTLD_DEFAULT order: every finished library, in load order (an IFUNC is
+ * resolved by afw_sym, never for an unfinished library). */
+void *afw_global_sym(const char *name) {
+    int k;
+    for (k = 0; k < g_nlibs; k++) {
+        void *p = g_libs[k]->pending ? NULL : afw_sym(g_libs[k], name);
+        if (p) return p;
+    }
+    return NULL;
+}
+
+int afw_find_lib(const char *name, char *out, size_t outsz) {
+    char dir[1024];
+    if (strchr(name, '/') || strchr(name, '\\')) {
+        FILE *t = fopen(name, "rb");
+        if (!t) return 0;
+        fclose(t);
+        snprintf(out, outsz, "%s", name);
+        return 1;
+    }
+    /* AFW_LIB_PATH, then the directory of the first library loaded */
+    if (g_nlibs) {
+        const char *p = g_libs[0]->path, *b = base_name(p);
+        snprintf(dir, sizeof dir, "%.*s", b > p ? (int)(b - p - 1) : 1, b > p ? p : ".");
+    } else {
+        snprintf(dir, sizeof dir, ".");
+    }
+    return find_lib(name, dir, out, outsz);
+}
+
 static int already_loaded(const char *name) {
     int k;
     const char *base;
@@ -877,7 +939,18 @@ static int prepare_with_deps(const char *path, afw_lib *lib, afw_lib *deps, int 
         }
         if (*ndeps >= maxdeps) { fprintf(stderr, "error: too many libraries\n"); free(buf); return -1; }
         if (verbose) printf("\n== dependency %s (of %s)\n", found, path);
-        if (prepare_with_deps(found, &deps[(*ndeps)++], deps, maxdeps, ndeps, verbose) != 0) {
+        {   /* the library keeps its path: `found` is this frame's (ASan: use after return) */
+            char *own = (char *)malloc(strlen(found) + 1);
+            afw_lib *d = &deps[(*ndeps)++];
+            int rc;
+            if (!own) { fprintf(stderr, "error: out of memory\n"); free(buf); return -1; }
+            strcpy(own, found);
+            rc = prepare_with_deps(own, d, deps, maxdeps, ndeps, verbose);
+            if (rc != 0) free(own);
+            else d->path_owned = 1;
+            if (rc == 0) continue;
+        }
+        {
             fprintf(stderr, "error: dependency %s failed to load\n", found);
             free(buf); return -1;
         }
@@ -920,6 +993,8 @@ static void discard(afw_lib *lib) {
     if (lib->base) afw_mem_free(lib->base, lib->size + AFW_STUB_RESERVE);
     lib->base = NULL; lib->stub_area = NULL;
     free(lib->pageprot); lib->pageprot = NULL; lib->pending = 0;
+    free(lib->phdr); lib->phdr = NULL; lib->phnum = 0;
+    if (lib->path_owned) { free((void *)lib->path); lib->path = NULL; lib->path_owned = 0; }
 }
 
 int afw_load(const char *path, afw_lib *lib, int verbose) {

@@ -160,6 +160,70 @@ static int run_futex_threads(volatile int32_t *w) {
     return ok;
 }
 
+/* The linker API libdl.so forwards to (loader_api.c), called the way libdl
+ * calls it: through the shims, System V ABI. */
+static int g_phdr_libs, g_phdr_ok, g_phdr_tls_ok;
+static SYSV int phdr_cb(void *vi, size_t size, void *data) {
+    struct { uint64_t addr; const char *name; const Elf64_Phdr *phdr; uint16_t phnum;
+             unsigned long long adds, subs; size_t tls_modid; void *tls_data; } *i = vi;
+    int k, has_load = 0;
+    const afw_lib *user = (const afw_lib *)data;
+    if (size < sizeof *i) return 1;
+    g_phdr_libs++;
+    for (k = 0; k < i->phnum; k++) if (i->phdr[k].p_type == PT_LOAD) has_load = 1;
+    if (has_load && i->name) g_phdr_ok++;
+    if (i->addr == (uint64_t)user->bias)
+        g_phdr_tls_ok = i->tls_modid == (size_t)user->tls_module && i->tls_data != NULL;
+    return 0;
+}
+static void run_loader_api_tests(const afw_lib *user) {
+    typedef SYSV void *(*dlopen_fn)(const char *, int, const void *);
+    typedef SYSV void *(*dlsym_fn)(void *, const char *, const void *);
+    typedef SYSV char *(*dlerror_fn)(void);
+    typedef SYSV int (*iter_fn)(SYSV int (*)(void *, size_t, void *), void *);
+    typedef SYSV int (*dladdr_fn)(const void *, void *);
+    typedef SYSV int (*ifn)(void);
+    dlopen_fn dlo = (dlopen_fn)afw_shim_lookup("__loader_dlopen");
+    dlsym_fn dls = (dlsym_fn)afw_shim_lookup("__loader_dlsym");
+    dlerror_fn dle = (dlerror_fn)afw_shim_lookup("__loader_dlerror");
+    iter_fn it = (iter_fn)afw_shim_lookup("__loader_dl_iterate_phdr");
+    dladdr_fn dla = (dladdr_fn)afw_shim_lookup("__loader_dladdr");
+    void *main_h, *base_h, *f;
+    char *e;
+    struct { const char *fname; void *fbase; const char *sname; void *saddr; } info;
+    printf("  the linker API (__loader_*, what libdl.so forwards to):\n");
+    check("every __loader_* function libdl.so imports is provided", dlo && dls && dle && it && dla);
+    if (!(dlo && dls && dle && it && dla)) return;
+    main_h = dlo(NULL, 2, NULL);
+    f = main_h ? dls(main_h, "afw_deps_check", NULL) : NULL;
+    check("dlopen(NULL) + dlsym finds a symbol in any loaded library", f && ((ifn)f)() == 42);
+    base_h = dlo("libdeps_base.so", 2, NULL);
+    check("dlopen of a loaded library returns it, no second copy", base_h && base_h == afw_find_loaded("libdeps_base.so"));
+    f = base_h ? dls(base_h, "afw_base_value", NULL) : NULL;
+    check("dlsym on that handle", f && ((ifn)f)() == 30);
+    f = base_h ? dls(base_h, "afw_base_pick", NULL) : NULL;
+    check("dlsym of an IFUNC returns the resolved function", f && ((ifn)f)() == 5);
+    check("dlsym(RTLD_DEFAULT)", dls(NULL, "afw_base_value", NULL) != NULL);
+    while (dle()) {}
+    check("dlopen of a missing library -> NULL", dlo("libdoes_not_exist.so", 2, NULL) == NULL);
+    e = dle();
+    check("... dlerror says which, as bionic does", e && strstr(e, "\"libdoes_not_exist.so\" not found"));
+    check("... and only once", dle() == NULL);
+    check("dlsym of a missing symbol -> NULL", base_h && dls(base_h, "no_such_symbol", NULL) == NULL);
+    e = dle();
+    check("... dlerror: undefined symbol", e && strstr(e, "undefined symbol: no_such_symbol"));
+    check("dlsym on an invalid handle -> NULL, not a crash", dls((void *)(uintptr_t)0x1234, "x", NULL) == NULL);
+    e = dle();
+    check("... dlerror: invalid handle", e && strstr(e, "invalid handle"));
+    g_phdr_libs = g_phdr_ok = g_phdr_tls_ok = 0;
+    check("dl_iterate_phdr visits every library", it(phdr_cb, (void *)user) == 0 && g_phdr_libs == 2 && g_phdr_ok == 2);
+    check("... with the TLS module and this thread's block", g_phdr_tls_ok);
+    memset(&info, 0, sizeof info);
+    check("dladdr names the library an address belongs to",
+          dla((const void *)afw_sym(user, "afw_deps_check"), &info) == 1 && info.fbase == user->base &&
+          info.fname && strstr(info.fname, "libdeps_user.so"));
+}
+
 static int run_syscall_tests(const afw_lib *lib) {
     getpid_fn gp = (getpid_fn)afw_sym(lib, "afw_sys_getpid");
     write_fn wr = (write_fn)afw_sym(lib, "afw_sys_write");
@@ -591,7 +655,7 @@ static int run_redzone_tests(const afw_lib *lib) {
 }
 
 int main(int argc, char **argv) {
-    afw_lib lib;
+    static afw_lib lib;   /* loaded libraries stay loaded: the registry points at it */
     int verbose = 1, rc = 0, strict = 0, min_pads = 0, call_trap = 0;
     const char *preload_fail = NULL;
     int with_deps = 0;
@@ -716,6 +780,7 @@ int main(int argc, char **argv) {
               ((dfn)afw_sym(&lib, "afw_deps_check"))() == 42);
         check("it was linked to a library, not to bionic-win", lib.nimports_linked >= 3);
         check("it has TLS although the dependency loaded first has none", lib.tls_module >= 1);
+        run_loader_api_tests(&lib);
         printf("%s\n", g_failed ? "DEPS TEST FAILED" : "DEPS TEST PASSED");
         rc |= g_failed;
     }

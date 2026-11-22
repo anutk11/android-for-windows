@@ -7,6 +7,7 @@
 #include "bionic_shim.h"
 #include "platform.h"
 #include "tls_static.h"
+#include "loader_api.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -217,6 +218,19 @@ static const shim_entry g_shims[] = {
     /* TEMPORARY for G1: ahead of libc's own, until bionic's DTV is built (G2) */
     S("__tls_get_addr", afw_tls_get_addr),
     S("__loader_shared_globals", s_loader_shared_globals),
+    /* the linker's API, which libdl.so forwards to (loader_api.c) */
+    S("__loader_dlopen", afw_l_dlopen),
+    S("__loader_android_dlopen_ext", afw_l_android_dlopen_ext),
+    S("__loader_dlsym", afw_l_dlsym),
+    S("__loader_dlvsym", afw_l_dlvsym),
+    S("__loader_dlerror", afw_l_dlerror),
+    S("__loader_dlclose", afw_l_dlclose),
+    S("__loader_dladdr", afw_l_dladdr),
+    S("__loader_dl_iterate_phdr", afw_l_dl_iterate_phdr),
+    S("__loader_android_get_LD_LIBRARY_PATH", afw_l_android_get_LD_LIBRARY_PATH),
+    S("__loader_android_get_application_target_sdk_version", afw_l_android_get_application_target_sdk_version),
+    S("__loader_android_handle_signal", afw_l_android_handle_signal),
+    S("__loader_cfi_fail", afw_l_cfi_fail),
 };
 #undef S
 

@@ -48,7 +48,10 @@ typedef struct afw_lib_s {
     struct { uint64_t *where; uint64_t resolver; } *irel;
     size_t nirel, capirel;             /* 1-based static TLS module id, 0 = no PT_TLS */
 
-    char build_id[AFW_BUILD_ID_HEX];   /* NT_GNU_BUILD_ID, hex; "" if none */
+    char build_id[AFW_BUILD_ID_HEX];
+    Elf64_Phdr *phdr;           /* a copy of the program headers (dl_iterate_phdr) */
+    int path_owned;             /* path was allocated for this library (dependencies) */
+    int phnum;   /* NT_GNU_BUILD_ID, hex; "" if none */
 
     /* phase A done, phase B (TLS close, IFUNC, RELRO, constructors) not yet */
     int pending;
@@ -91,6 +94,13 @@ int afw_load(const char *path, afw_lib *lib, int verbose);
  * libraries loaded before it, then bionic-win. deps[] receives the loaded
  * dependencies (*ndeps counts them). */
 int afw_load_with_deps(const char *path, afw_lib *lib, afw_lib *deps, int maxdeps, int *ndeps, int verbose);
+
+/* The registry of loaded libraries, for the linker API (loader_api.c). */
+afw_lib *afw_lib_at(int k);                        /* k-th in load order, or NULL */
+afw_lib *afw_find_loaded(const char *name);        /* by soname or file name */
+int afw_is_loaded(const void *handle);
+void *afw_global_sym(const char *name);            /* RTLD_DEFAULT */
+int afw_find_lib(const char *name, char *out, size_t outsz);
 
 /* Find an exported symbol (like dlsym). */
 void *afw_sym(const afw_lib *lib, const char *name);
