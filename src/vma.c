@@ -44,13 +44,16 @@ typedef struct {
     uint64_t mapped_bytes;   /* sum of (end - start) over P_MAPPED extents */
     vma_ext *ext;            /* sorted partition of [base, base + size) */
     size_t next, cap;
+    unsigned char owned;     /* 1 = VMA owns the OS reservation; 0 = adopted */
 } winalloc;
 
 /* Sorted by base, pairwise disjoint. */
 static winalloc *g_a;
 static size_t g_n, g_cap;
 static uint64_t g_os_calls;
+#ifdef AFW_TEST
 static int g_fail_os;
+#endif
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -100,11 +103,13 @@ uint64_t afw_vma_os_call_count(void) {
     return n;
 }
 
+#ifdef AFW_TEST
 void afw_vma_test_fail_os(int nth) {
     LOCK();
     g_fail_os = nth > 0 ? nth : 0;
     UNLOCK();
 }
+#endif
 
 /* Round len up to pages; reject overflow of len, size_t truncation, or addr + n. */
 static int range(uint64_t addr, uint64_t len, uint64_t *n) {
@@ -273,6 +278,7 @@ static winalloc *add(uint64_t base, uint64_t size) {
     w->ext = ext;
     w->next = 1;
     w->cap = 8;
+    w->owned = 1;
     w->ext[0].start = base;
     w->ext[0].end = base + size;
     w->ext[0].state = 0;
@@ -288,7 +294,9 @@ static void remove_alloc(winalloc *w) {
 
 static int os_tick(void) {
     g_os_calls++;
+#ifdef AFW_TEST
     if (g_fail_os > 0 && --g_fail_os == 0) return -1;
+#endif
     return 0;
 }
 
@@ -379,10 +387,12 @@ static int os_protect(uint64_t a, uint64_t n, int prot) {
 static int os_free_range(uint64_t addr, uint64_t size) { (void)addr; (void)size; return 1; }
 #endif
 
-/* Release a Windows allocation once nothing in it is mapped. If the OS call
- * fails, the entry stays (it still describes reserved memory). */
+/* Release a VMA-owned Windows allocation once nothing in it is mapped.
+ * Adopted library regions (owned == 0) are never released here: the loader
+ * owns the VirtualAlloc (and its trailing stub reserve) and frees it after
+ * afw_vma_forget(). If the OS call fails, the entry stays (still reserved). */
 static void release_if_empty(winalloc *w) {
-    if (w->mapped_bytes) return;
+    if (!w->owned || w->mapped_bytes) return;
     if (os_release(w->base, w->size) != 0) {
         fprintf(stderr, "[vma] could not release 0x%llx (kept as reserved)\n", (unsigned long long)w->base);
         return;
@@ -659,4 +669,86 @@ int64_t afw_madvise(uint64_t addr, uint64_t len, int advice) {
     r = each(addr, n, do_dontneed, 0, 1);
     UNLOCK();
     return r;
+}
+
+int afw_vma_adopt(uint64_t base, uint64_t size, const unsigned char *page_prot) {
+    size_t npages, nruns, cap, p, r, idx;
+    vma_ext *ext;
+    winalloc *w;
+
+    if (!base || (base & (PG - 1)) || !size || (size & (PG - 1)) || !page_prot ||
+        size > (uint64_t)SIZE_MAX || base > UINT64_MAX - size)
+        return -LNX_EINVAL;
+
+    npages = (size_t)(size / PG);
+    nruns = 1;
+    for (p = 1; p < npages; p++)
+        if ((page_prot[p] & P_PROT) != (page_prot[p - 1] & P_PROT)) nruns++;
+
+    cap = nruns < 8 ? 8 : nruns;
+    if (cap > SIZE_MAX / sizeof *ext) return -LNX_ENOMEM;
+    ext = (vma_ext *)malloc(cap * sizeof *ext);
+    if (!ext) return -LNX_ENOMEM;
+
+    for (p = 0, r = 0; p < npages; r++) {
+        unsigned char prot = (unsigned char)(page_prot[p] & P_PROT);
+        size_t q = p + 1;
+        while (q < npages && (page_prot[q] & P_PROT) == prot) q++;
+        ext[r].start = base + (uint64_t)p * PG;
+        ext[r].end = base + (uint64_t)q * PG;
+        ext[r].state = (unsigned char)(P_MAPPED | P_COMMIT | prot);
+        p = q;
+    }
+
+    LOCK();
+    idx = lower_bound_alloc(base);
+    if (idx < g_n && g_a[idx].base == base && g_a[idx].size == size) {
+        if (g_a[idx].owned) { UNLOCK(); free(ext); return -LNX_EEXIST; }
+        /* Idempotent re-adopt (e.g. after RELRO): replace extents atomically. */
+        free(g_a[idx].ext);
+        g_a[idx].ext = ext;
+        g_a[idx].next = nruns;
+        g_a[idx].cap = cap;
+        g_a[idx].mapped_bytes = size;
+        UNLOCK();
+        return 0;
+    }
+    if (idx < g_n && g_a[idx].base < base + size) {
+        UNLOCK();
+        free(ext);
+        return -LNX_EEXIST;
+    }
+    if (g_n == g_cap) {
+        size_t ncap;
+        winalloc *na;
+        if (g_cap > SIZE_MAX / 2 / sizeof *g_a) { UNLOCK(); free(ext); return -LNX_ENOMEM; }
+        ncap = g_cap ? g_cap * 2 : 16;
+        na = (winalloc *)realloc(g_a, ncap * sizeof *g_a);
+        if (!na) { UNLOCK(); free(ext); return -LNX_ENOMEM; }
+        g_a = na; g_cap = ncap;
+    }
+    if (idx < g_n) memmove(&g_a[idx + 1], &g_a[idx], (g_n - idx) * sizeof *g_a);
+    g_n++;
+    w = &g_a[idx];
+    w->base = base;
+    w->size = size;
+    w->mapped_bytes = size;
+    w->ext = ext;
+    w->next = nruns;
+    w->cap = cap;
+    w->owned = 0;
+    UNLOCK();
+    return 0;
+}
+
+int afw_vma_forget(uint64_t base) {
+    winalloc *w;
+    if (!base) return 0;
+    LOCK();
+    w = find(base);
+    if (!w) { UNLOCK(); return 0; }
+    if (w->base != base || w->owned) { UNLOCK(); return -LNX_EINVAL; }
+    remove_alloc(w);
+    UNLOCK();
+    return 0;
 }
