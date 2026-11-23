@@ -292,6 +292,7 @@ jobs:
           if not %errorlevel% equ 42 (type out\exec.txt & echo exec_min exited %errorlevel%, not 42 & exit /b 1)
           out\afw-loader.exe out\exec_min --exec hello > nul 2>&1
           if not %errorlevel% equ 11 (echo wrong argc exited %errorlevel%, not 11 & exit /b 1)
+          exit /b 0
       - name: "G1: an ordinary Android executable runs main() with the real libc - informational"
         continue-on-error: true
         timeout-minutes: 3
