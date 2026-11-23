@@ -13,6 +13,8 @@
 #define LNX_EBADF    9
 #define LNX_EFAULT   14
 #define LNX_EEXIST   17
+#define LNX_ENOTDIR  20
+#define LNX_EISDIR   21
 #define LNX_EINVAL   22
 #define LNX_EMFILE   24
 #define LNX_ESPIPE   29
@@ -20,16 +22,19 @@
 #define LNX_ELOOP    40
 #define LNX_AT_FDCWD            (-100)
 #define LNX_AT_SYMLINK_NOFOLLOW 0x100
+#define LNX_AT_REMOVEDIR        0x200
 #define LNX_AT_EMPTY_PATH       0x1000
-#define LNX_O_CLOEXEC 0x80000
-#define LNX_O_NONBLOCK 0x800
-#define LNX_O_DIRECT   0x4000
-#define LNX_O_PATH     0x200000
+#define LNX_O_LARGEFILE 0x8000
+#define LNX_O_CLOEXEC   0x80000
+#define LNX_O_NONBLOCK  0x800
+#define LNX_O_DIRECT    0x4000
+#define LNX_O_PATH      0x200000
 #define LNX_F_GETFD 1
 #define LNX_F_SETFD 2
 #define LNX_F_GETFL 3
 #define LNX_F_SETFL 4
 #define S_IFMT_  0170000u
+#define S_IFDIR_ 0040000u
 #define S_IFREG_ 0100000u
 #define S_IFLNK_ 0120000u
 
@@ -68,7 +73,8 @@ int main(void) {
     /* 3. fcntl F_GETFD / F_SETFD / F_GETFL / F_SETFL / unknown */
     chk("fcntl(F_GETFD) reflects O_CLOEXEC", afw_fd_fcntl(fd, LNX_F_GETFD, 0) == 1);
     chk("fcntl(F_SETFD, 0) clears cloexec", afw_fd_fcntl(fd, LNX_F_SETFD, 0) == 0 && afw_fd_fcntl(fd, LNX_F_GETFD, 0) == 0);
-    chk("fcntl(F_GETFL) returns O_RDWR", (afw_fd_fcntl(fd, LNX_F_GETFL, 0) & AFW_O_ACCMODE) == AFW_O_RDWR);
+    chk("fcntl(F_GETFL) returns exact O_RDWR|O_LARGEFILE (0x8002)",
+        afw_fd_fcntl(fd, LNX_F_GETFL, 0) == (AFW_O_RDWR | LNX_O_LARGEFILE));
     chk("fcntl(unknown) -> -ENOSYS", afw_fd_fcntl(fd, 999, 0) == -LNX_ENOSYS);
 
     /* 4. write, lseek, read, fstat, newfstatat */
@@ -143,22 +149,31 @@ int main(void) {
     chk("openat(O_NONBLOCK) -> -EINVAL", afw_fd_openat(LNX_AT_FDCWD, path, AFW_O_RDONLY | LNX_O_NONBLOCK, 0) == -LNX_EINVAL);
     chk("openat(unknown bit 0x40000000) -> -EINVAL", afw_fd_openat(LNX_AT_FDCWD, path, AFW_O_RDONLY | 0x40000000, 0) == -LNX_EINVAL);
 
-    /* 6c. F_SETFL toggling O_APPEND on/off consistently on both Linux and Windows */
-    fd = afw_fd_openat(LNX_AT_FDCWD, path, AFW_O_RDWR | AFW_O_TRUNC | AFW_O_APPEND, 0);
-    chk("F_SETFL: open O_APPEND and write 4 bytes", fd >= 3 && afw_fd_write(fd, "1111", 4) == 4);
-    chk("F_SETFL: unsupported flag -> -EINVAL", afw_fd_fcntl(fd, LNX_F_SETFL, LNX_O_DIRECT) == -LNX_EINVAL);
-    chk("F_SETFL: clearing O_APPEND allows overwrite at offset 0",
+    /* 6c. F_GETFL / F_SETFL exact Linux x86_64 flags and O_APPEND toggle */
+    fd = afw_fd_openat(LNX_AT_FDCWD, path,
+                       AFW_O_RDWR | AFW_O_TRUNC | AFW_O_APPEND | AFW_O_NOFOLLOW, 0);
+    chk("F_SETFL: open O_RDWR|O_TRUNC|O_APPEND|O_NOFOLLOW -> exact F_GETFL 0x28402",
+        fd >= 3 &&
+        afw_fd_fcntl(fd, LNX_F_GETFL, 0) == (AFW_O_RDWR | AFW_O_APPEND | LNX_O_LARGEFILE | AFW_O_NOFOLLOW) &&
+        afw_fd_write(fd, "1111", 4) == 4);
+    chk("F_SETFL: unsupported flag -> -EINVAL without mutating F_GETFL",
+        afw_fd_fcntl(fd, LNX_F_SETFL, LNX_O_DIRECT) == -LNX_EINVAL &&
+        afw_fd_fcntl(fd, LNX_F_GETFL, 0) == (AFW_O_RDWR | AFW_O_APPEND | LNX_O_LARGEFILE | AFW_O_NOFOLLOW));
+    chk("F_SETFL: clearing O_APPEND preserves O_RDWR|O_LARGEFILE|O_NOFOLLOW (0x28002) and overwrites at 0",
         afw_fd_fcntl(fd, LNX_F_SETFL, 0) == 0 &&
-        (afw_fd_fcntl(fd, LNX_F_GETFL, 0) & AFW_O_APPEND) == 0 &&
+        afw_fd_fcntl(fd, LNX_F_GETFL, 0) == (AFW_O_RDWR | LNX_O_LARGEFILE | AFW_O_NOFOLLOW) &&
         afw_fd_lseek(fd, 0, AFW_SEEK_SET) == 0 && afw_fd_write(fd, "22", 2) == 2 &&
         afw_fd_lseek(fd, 0, AFW_SEEK_SET) == 0 && afw_fd_read(fd, buf, 16) == 4 &&
         memcmp(buf, "2211", 4) == 0);
-    chk("F_SETFL: re-enabling O_APPEND writes at EOF after lseek(0)",
-        afw_fd_fcntl(fd, LNX_F_SETFL, AFW_O_APPEND) == 0 &&
-        (afw_fd_fcntl(fd, LNX_F_GETFL, 0) & AFW_O_APPEND) == AFW_O_APPEND &&
-        afw_fd_lseek(fd, 0, AFW_SEEK_SET) == 0 && afw_fd_write(fd, "33", 2) == 2 &&
-        afw_fd_lseek(fd, 0, AFW_SEEK_SET) == 0 && afw_fd_read(fd, buf, 16) == 6 &&
-        memcmp(buf, "221133", 6) == 0 && afw_fd_close(fd) == 0);
+    {
+        int64_t cur_fl = afw_fd_fcntl(fd, LNX_F_GETFL, 0);
+        chk("F_SETFL(F_GETFL | O_APPEND): re-enables O_APPEND (0x28402) and writes at EOF",
+            afw_fd_fcntl(fd, LNX_F_SETFL, cur_fl | AFW_O_APPEND) == 0 &&
+            afw_fd_fcntl(fd, LNX_F_GETFL, 0) == (AFW_O_RDWR | AFW_O_APPEND | LNX_O_LARGEFILE | AFW_O_NOFOLLOW) &&
+            afw_fd_lseek(fd, 0, AFW_SEEK_SET) == 0 && afw_fd_write(fd, "33", 2) == 2 &&
+            afw_fd_lseek(fd, 0, AFW_SEEK_SET) == 0 && afw_fd_read(fd, buf, 16) == 6 &&
+            memcmp(buf, "221133", 6) == 0 && afw_fd_close(fd) == 0);
+    }
 
     /* 6d. Symlinks: lstat (AT_SYMLINK_NOFOLLOW) vs stat, and openat(O_NOFOLLOW) -> -ELOOP */
     {
@@ -189,6 +204,80 @@ int main(void) {
             afw_fd_unlinkat(LNX_AT_FDCWD, linkpath, 0) == 0 &&
             afw_fd_newfstatat(LNX_AT_FDCWD, linkpath, &st, LNX_AT_SYMLINK_NOFOLLOW) == -LNX_ENOENT &&
             afw_fd_newfstatat(LNX_AT_FDCWD, path, &st, 0) == 0 && st.st_size == 6);
+    }
+
+    /* 6e. Directory F_GETFL (0x38000), directory symlink, and Windows junction separation */
+    {
+        const char *dirp = "out/fd_test_dir";
+        const char *dlink = "out/fd_test_dirlink";
+        int64_t dfd;
+        (void)afw_fd_unlinkat(LNX_AT_FDCWD, dlink, 0);
+        (void)afw_fd_unlinkat(LNX_AT_FDCWD, dirp, LNX_AT_REMOVEDIR);
+        chk("mkdir out/fd_test_dir succeeds", afw_os_mkdir(dirp, 0755) == 0);
+        dfd = afw_fd_openat(LNX_AT_FDCWD, dirp, AFW_O_RDONLY | AFW_O_DIRECTORY | AFW_O_NOFOLLOW, 0);
+        chk("dir open(O_DIRECTORY|O_NOFOLLOW) -> exact F_GETFL 0x38000",
+            dfd >= 3 &&
+            afw_fd_fcntl(dfd, LNX_F_GETFL, 0) == (AFW_O_RDONLY | LNX_O_LARGEFILE | AFW_O_DIRECTORY | AFW_O_NOFOLLOW));
+        chk("dir F_SETFL(0x38000|O_APPEND) -> 0x38400, then F_SETFL(0) -> 0x38000",
+            afw_fd_fcntl(dfd, LNX_F_SETFL, 0x38000 | AFW_O_APPEND) == 0 &&
+            afw_fd_fcntl(dfd, LNX_F_GETFL, 0) == 0x38400 &&
+            afw_fd_fcntl(dfd, LNX_F_SETFL, 0) == 0 &&
+            afw_fd_fcntl(dfd, LNX_F_GETFL, 0) == 0x38000 &&
+            afw_fd_close(dfd) == 0);
+
+        chk("create directory symlink out/fd_test_dirlink -> fd_test_dir",
+            afw_os_symlink("fd_test_dir", dlink) == 0);
+        memset(&st, 0, sizeof st);
+        chk("lstat on directory symlink reports S_IFLNK",
+            afw_fd_newfstatat(LNX_AT_FDCWD, dlink, &st, LNX_AT_SYMLINK_NOFOLLOW) == 0 &&
+            (st.st_mode & S_IFMT_) == S_IFLNK_);
+        memset(&st, 0, sizeof st);
+        chk("stat on directory symlink follows to S_IFDIR",
+            afw_fd_newfstatat(LNX_AT_FDCWD, dlink, &st, 0) == 0 &&
+            (st.st_mode & S_IFMT_) == S_IFDIR_);
+        chk("openat(O_RDONLY|O_NOFOLLOW) on directory symlink -> -ELOOP",
+            afw_fd_openat(LNX_AT_FDCWD, dlink, AFW_O_RDONLY | AFW_O_NOFOLLOW, 0) == -LNX_ELOOP);
+        chk("openat(O_DIRECTORY|O_NOFOLLOW) on directory symlink -> -ENOTDIR",
+            afw_fd_openat(LNX_AT_FDCWD, dlink, AFW_O_RDONLY | AFW_O_DIRECTORY | AFW_O_NOFOLLOW, 0) == -LNX_ENOTDIR);
+        chk("unlinkat(AT_REMOVEDIR) on directory symlink -> -ENOTDIR",
+            afw_fd_unlinkat(LNX_AT_FDCWD, dlink, LNX_AT_REMOVEDIR) == -LNX_ENOTDIR);
+        chk("unlinkat(0) removes directory symlink while keeping target dir",
+            afw_fd_unlinkat(LNX_AT_FDCWD, dlink, 0) == 0 &&
+            afw_fd_newfstatat(LNX_AT_FDCWD, dirp, &st, 0) == 0 && (st.st_mode & S_IFMT_) == S_IFDIR_);
+
+#ifdef _WIN32
+        {
+            const char *junc = "out/fd_test_junc";
+            int64_t jfd;
+            (void)afw_fd_unlinkat(LNX_AT_FDCWD, junc, LNX_AT_REMOVEDIR);
+            chk("Windows junction: create out/fd_test_junc -> out/fd_test_dir",
+                afw_os_junction(dirp, junc) == 0);
+            memset(&st, 0, sizeof st);
+            chk("Windows junction: lstat (AT_SYMLINK_NOFOLLOW) reports S_IFDIR, not S_IFLNK",
+                afw_fd_newfstatat(LNX_AT_FDCWD, junc, &st, LNX_AT_SYMLINK_NOFOLLOW) == 0 &&
+                (st.st_mode & S_IFMT_) == S_IFDIR_);
+            memset(&st, 0, sizeof st);
+            chk("Windows junction: stat (follow) reports S_IFDIR",
+                afw_fd_newfstatat(LNX_AT_FDCWD, junc, &st, 0) == 0 &&
+                (st.st_mode & S_IFMT_) == S_IFDIR_);
+            jfd = afw_fd_openat(LNX_AT_FDCWD, junc, AFW_O_RDONLY | AFW_O_NOFOLLOW, 0);
+            chk("Windows junction: openat(O_RDONLY|O_NOFOLLOW) succeeds (not -ELOOP), F_GETFL 0x28000",
+                jfd >= 3 && afw_fd_fcntl(jfd, LNX_F_GETFL, 0) == 0x28000 && afw_fd_close(jfd) == 0);
+            jfd = afw_fd_openat(LNX_AT_FDCWD, junc, AFW_O_RDONLY | AFW_O_DIRECTORY | AFW_O_NOFOLLOW, 0);
+            memset(&st, 0, sizeof st);
+            chk("Windows junction: openat(O_DIRECTORY|O_NOFOLLOW) succeeds (not -ENOTDIR), fstat S_IFDIR, F_GETFL 0x38000",
+                jfd >= 3 &&
+                afw_fd_fstat(jfd, &st) == 0 && (st.st_mode & S_IFMT_) == S_IFDIR_ &&
+                afw_fd_fcntl(jfd, LNX_F_GETFL, 0) == 0x38000 &&
+                afw_fd_close(jfd) == 0);
+            chk("Windows junction: unlinkat(0) -> -EISDIR, unlinkat(AT_REMOVEDIR) removes junction keeping target dir",
+                afw_fd_unlinkat(LNX_AT_FDCWD, junc, 0) == -LNX_EISDIR &&
+                afw_fd_unlinkat(LNX_AT_FDCWD, junc, LNX_AT_REMOVEDIR) == 0 &&
+                afw_fd_newfstatat(LNX_AT_FDCWD, dirp, &st, 0) == 0 && (st.st_mode & S_IFMT_) == S_IFDIR_);
+        }
+#endif
+        chk("unlinkat(AT_REMOVEDIR) removes out/fd_test_dir",
+            afw_fd_unlinkat(LNX_AT_FDCWD, dirp, LNX_AT_REMOVEDIR) == 0);
     }
 
     /* 7. EMFILE: exhaust all AFW_MAX_FDS - 3 slots cleanly, then close and reopen */

@@ -38,6 +38,10 @@ _Static_assert(offsetof(afw_lnx_stat, st_ctime_s) == 104, "st_ctim offset");
      AFW_O_TRUNC | AFW_O_APPEND | AFW_O_DIRECTORY | AFW_O_NOFOLLOW | \
      LNX_O_LARGEFILE | LNX_O_CLOEXEC)
 
+/* Flags Linux x86_64 preserves in file->f_flags and reports from F_GETFL. */
+#define LNX_F_STATUS_STORED_MASK \
+    (AFW_O_ACCMODE | AFW_O_APPEND | LNX_O_LARGEFILE | AFW_O_DIRECTORY | AFW_O_NOFOLLOW)
+
 #define LNX_F_GETFD 1
 #define LNX_F_SETFD 2
 #define LNX_F_GETFL 3
@@ -51,7 +55,7 @@ typedef struct {
     int         kind;
     int         std_fd;     /* 0/1/2 for FD_STDIO */
     afw_os_file os;         /* OS handle for FD_FILE */
-    int         flags;      /* AFW_O_ACCMODE | AFW_O_APPEND */
+    int         flags;      /* LNX_F_STATUS_STORED_MASK (with LNX_O_LARGEFILE forced) */
     int         cloexec;
 } fd_entry;
 
@@ -62,9 +66,9 @@ static int g_fds_init;
 static void fds_ensure_init(void) {
     if (g_fds_init) return;
     memset(g_fds, 0, sizeof g_fds);
-    g_fds[0].kind = FD_STDIO; g_fds[0].std_fd = 0; g_fds[0].os = AFW_OS_FILE_INVALID; g_fds[0].flags = AFW_O_RDONLY;
-    g_fds[1].kind = FD_STDIO; g_fds[1].std_fd = 1; g_fds[1].os = AFW_OS_FILE_INVALID; g_fds[1].flags = AFW_O_WRONLY;
-    g_fds[2].kind = FD_STDIO; g_fds[2].std_fd = 2; g_fds[2].os = AFW_OS_FILE_INVALID; g_fds[2].flags = AFW_O_WRONLY;
+    g_fds[0].kind = FD_STDIO; g_fds[0].std_fd = 0; g_fds[0].os = AFW_OS_FILE_INVALID; g_fds[0].flags = AFW_O_RDONLY | LNX_O_LARGEFILE;
+    g_fds[1].kind = FD_STDIO; g_fds[1].std_fd = 1; g_fds[1].os = AFW_OS_FILE_INVALID; g_fds[1].flags = AFW_O_WRONLY | LNX_O_LARGEFILE;
+    g_fds[2].kind = FD_STDIO; g_fds[2].std_fd = 2; g_fds[2].os = AFW_OS_FILE_INVALID; g_fds[2].flags = AFW_O_WRONLY | LNX_O_LARGEFILE;
     g_fds_init = 1;
 }
 
@@ -141,7 +145,7 @@ int64_t afw_fd_openat(int64_t dirfd, const char *path, int64_t flags, uint64_t m
     g_fds[slot].kind    = FD_FILE;
     g_fds[slot].std_fd  = -1;
     g_fds[slot].os      = f;
-    g_fds[slot].flags   = (int)(flags & (AFW_O_ACCMODE | AFW_O_APPEND));
+    g_fds[slot].flags   = (int)(flags & LNX_F_STATUS_STORED_MASK) | LNX_O_LARGEFILE;
     g_fds[slot].cloexec = (flags & LNX_O_CLOEXEC) ? 1 : 0;
     afw_fd_unlock();
     return slot;
@@ -336,12 +340,11 @@ int64_t afw_fd_fcntl(int64_t fd, int64_t cmd, int64_t arg) {
         r = g_fds[fd].flags;
         break;
     case LNX_F_SETFL:
-        if (arg & ~(int64_t)(AFW_O_ACCMODE | AFW_O_CREAT | AFW_O_EXCL |
-                             LNX_O_NOCTTY | AFW_O_TRUNC | AFW_O_APPEND | LNX_O_LARGEFILE)) {
+        if (arg & ~(int64_t)LNX_SUPPORTED_OPEN_FLAGS) {
             r = -LNX_EINVAL;
             break;
         }
-        g_fds[fd].flags = (g_fds[fd].flags & AFW_O_ACCMODE) | (int)(arg & AFW_O_APPEND);
+        g_fds[fd].flags = (g_fds[fd].flags & ~AFW_O_APPEND) | (int)(arg & AFW_O_APPEND);
         r = 0;
         break;
     default:
