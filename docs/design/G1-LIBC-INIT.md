@@ -99,21 +99,27 @@ bionic: its constructor runs first, printf, malloc, `getenv`, `getprogname`, and
   downward the way Windows grows a stack), then jumps to `_start` with `rbp = rdx = 0`.
 - **Environment forwarding & pre-constructor sync:** `--exec` inherits the host process
   environment by default (overrideable with `--env KEY=VAL`, or cleared with
-  `--clean-env`), and writes `envp` and `progname` into `libc_shared_globals` **before**
-  loading dependencies so `libc.so`'s constructors, executable constructors, and `main()`
-  all observe the exact same environment, program name, and single `AT_RANDOM` 16-byte
-  seed (`afw_shared_globals_random()`).
+  `--clean-env`), and writes `envp` and `progname` into `libc_shared_globals` before
+  loading dependencies. Once Phase A maps the executable and its dependencies,
+  `afw_exec_prepare_auxv()` installs the executable's **complete** `auxv` (`AT_PHDR`,
+  `AT_PHENT`, `AT_PHNUM`, `AT_ENTRY`, `AT_EXECFN`, `AT_RANDOM`, etc.) into
+  `libc_shared_globals` **before** Phase B runs any `libc.so` or executable constructor,
+  so constructors and `main()` observe the exact same `auxv`, `envp`, `progname`, and
+  single `AT_RANDOM` seed.
 - **Explicit caveats / defaults (measured / intentional for G1):**
   - `PT_INTERP` (`/system/bin/linker64`) is used only to identify an executable; the
     interpreter binary itself is **not** mapped (`AT_BASE = 0`) because `afw-loader`
-    replaces the dynamic linker.
+    replaces the dynamic linker. Executable `e_entry` is validated to lie inside a
+    file-backed `PT_LOAD` segment with `PF_X` before mapping memory.
   - Several `auxv` fields use fixed G1 defaults: `AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`
     are `10000` (first Android app uid/gid, matching `src/syscall.c`), `AT_HWCAP` and
     `AT_HWCAP2` are `0` (conservative baseline x86_64 until CPUID mapping), and
     `AT_SECURE` is `0`.
-- `test/exec_min.c` (no libc) checks every field of the stack (including forwarded host
-  environment variables and `--env` overrides), with a separate exit code for each wrong
-  field (11 for wrong `argc`, 17 for missing env var, 18 for bad override).
+- `test/exec_min.c` (no libc) checks every field of the initial stack (all 15 `auxv`
+  tags including presence checks for zero-valued tags, plus forwarded host environment
+  variables and `--env` overrides), with a distinct exit code per wrong field. A
+  negative ELF (`out/exec_bad_entry`) verifies that an `e_entry` inside a non-executable
+  `PT_LOAD` segment is rejected before jumping.
 - Syscalls still answered with ENOSYS along this path: faccessat, newfstatat, openat (the
   property area `/dev/__properties__`), rt_sigaction, sched_getaffinity, fstat. libc lives
   with all of them; they're next in line (files, signals).

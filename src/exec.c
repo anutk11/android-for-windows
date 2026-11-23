@@ -77,6 +77,43 @@ static uint64_t phdr_in_memory(const afw_lib *exe) {
 #define AFW_EXEC_MAX_ARGS 4096
 #define AFW_EXEC_MAX_ENV  4096
 
+static uint64_t g_exec_auxv[2 * 20];
+static size_t g_exec_auxv_len;
+
+void afw_exec_prepare_auxv(const afw_lib *exe, const char *execfn) {
+    const unsigned char *at_random;
+    size_t k = 0;
+    if (!exe || !exe->entry) return;
+    if (!execfn) execfn = exe->path;
+
+    /* Reuse the single AT_RANDOM seed initialized in libc_shared_globals so
+     * libc.so constructors, executable constructors, and KernelArgumentBlock
+     * see the exact same 16 random bytes (stack guard / setjmp cookie). */
+    at_random = afw_shared_globals_random();
+
+    /* Fixed/default auxv fields (documented in docs/design/G1-LIBC-INIT.md):
+     *   AT_BASE  = 0: afw-loader replaces PT_INTERP (/system/bin/linker64)
+     *                 rather than mapping a separate interpreter binary.
+     *   AT_*UID/GID = 10000: first Android app uid/gid (matches syscall.c).
+     *   AT_HWCAP/2  = 0: conservative baseline x86_64 until CPUID mapping. */
+#define PUT(t, v) (g_exec_auxv[k++] = (uint64_t)(t), g_exec_auxv[k++] = (uint64_t)(v))
+    PUT(AT_PHDR_, phdr_in_memory(exe));
+    PUT(AT_PHENT_, sizeof(Elf64_Phdr));
+    PUT(AT_PHNUM_, exe->phnum);
+    PUT(AT_PAGESZ_, 4096);
+    PUT(AT_BASE_, 0);
+    PUT(AT_ENTRY_, exe->entry);
+    PUT(AT_UID_, 10000); PUT(AT_EUID_, 10000); PUT(AT_GID_, 10000); PUT(AT_EGID_, 10000);
+    PUT(AT_HWCAP_, 0); PUT(AT_HWCAP2_, 0);
+    PUT(AT_SECURE_, 0);
+    PUT(AT_RANDOM_, (uintptr_t)at_random);
+    PUT(AT_EXECFN_, (uintptr_t)execfn);
+    PUT(AT_NULL_, 0);
+#undef PUT
+    g_exec_auxv_len = k;
+    afw_shared_globals_set_process(g_exec_auxv, NULL, execfn);
+}
+
 /* Not instrumented by ASan: the program's own stack grows down from the
  * block, through what ASan would have made an alloca red zone (measured:
  * a false "dynamic-stack-buffer-overflow" in the syscall entry). */
@@ -84,12 +121,10 @@ static uint64_t phdr_in_memory(const afw_lib *exe) {
 __attribute__((no_sanitize("address")))
 #endif
 int afw_exec(const afw_lib *exe, int argc, char **argv, char **envp) {
-    static uint64_t auxv[2 * 20];
     static char *empty_env[1] = {NULL};
-    const unsigned char *at_random;
     char **envp_use = envp ? envp : empty_env;
     uint64_t *blk;
-    size_t nenv = 0, nwords, bytes, i, k = 0;
+    size_t nenv = 0, nwords, bytes, i;
     int a;
     unsigned char *mem;
 
@@ -105,35 +140,11 @@ int afw_exec(const afw_lib *exe, int argc, char **argv, char **envp) {
         }
     }
 
-    /* Reuse the single AT_RANDOM seed initialized in libc_shared_globals so
-     * libc.so constructors and the executable's KernelArgumentBlock see the
-     * exact same 16 random bytes (stack guard / setjmp cookie). */
-    at_random = afw_shared_globals_random();
+    afw_exec_prepare_auxv(exe, argv[0]);
+    afw_shared_globals_set_process(g_exec_auxv, envp_use, argv[0]);
 
-    /* Fixed/default auxv fields (documented in docs/design/G1-LIBC-INIT.md):
-     *   AT_BASE  = 0: afw-loader replaces PT_INTERP (/system/bin/linker64)
-     *                 rather than mapping a separate interpreter binary.
-     *   AT_*UID/GID = 10000: first Android app uid/gid (matches syscall.c).
-     *   AT_HWCAP/2  = 0: conservative baseline x86_64 until CPUID mapping. */
-#define PUT(t, v) (auxv[k++] = (uint64_t)(t), auxv[k++] = (uint64_t)(v))
-    PUT(AT_PHDR_, phdr_in_memory(exe));
-    PUT(AT_PHENT_, sizeof(Elf64_Phdr));
-    PUT(AT_PHNUM_, exe->phnum);
-    PUT(AT_PAGESZ_, 4096);
-    PUT(AT_BASE_, 0);
-    PUT(AT_ENTRY_, exe->entry);
-    PUT(AT_UID_, 10000); PUT(AT_EUID_, 10000); PUT(AT_GID_, 10000); PUT(AT_EGID_, 10000);
-    PUT(AT_HWCAP_, 0); PUT(AT_HWCAP2_, 0);
-    PUT(AT_SECURE_, 0);
-    PUT(AT_RANDOM_, (uintptr_t)at_random);
-    PUT(AT_EXECFN_, (uintptr_t)argv[0]);
-    PUT(AT_NULL_, 0);
-#undef PUT
-    /* Keep libc_shared_globals synced with the executable's full auxv, envp, and argv[0]. */
-    afw_shared_globals_set_process(auxv, envp_use, argv[0]);
-
-    /* Layout: argc | argv[0..argc-1] | NULL | envp[0..nenv-1] | NULL | auxv[0..k-1] */
-    nwords = 1 + (size_t)argc + 1 + nenv + 1 + k;
+    /* Layout: argc | argv[0..argc-1] | NULL | envp[0..nenv-1] | NULL | auxv[0..len-1] */
+    nwords = 1 + (size_t)argc + 1 + nenv + 1 + g_exec_auxv_len;
     if (nwords > (SIZE_MAX - 64) / 8) { fprintf(stderr, "error: initial stack size overflow\n"); return -1; }
     bytes = nwords * 8 + 64;
     mem = (unsigned char *)afw_alloca(bytes);
@@ -144,7 +155,7 @@ int afw_exec(const afw_lib *exe, int argc, char **argv, char **envp) {
     blk[i++] = 0;
     for (a = 0; (size_t)a < nenv; a++) blk[i++] = (uint64_t)(uintptr_t)envp_use[a];
     blk[i++] = 0;
-    memcpy(&blk[i], auxv, k * 8);
+    memcpy(&blk[i], g_exec_auxv, g_exec_auxv_len * 8);
 
     fflush(stdout); fflush(stderr);
     afw_enter(exe->entry, blk);

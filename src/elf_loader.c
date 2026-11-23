@@ -12,6 +12,7 @@
  */
 #include "elf_loader.h"
 #include "bionic_shim.h"
+#include "exec.h"
 #include "funcs.h"
 #include "platform.h"
 #include "tls_static.h"
@@ -431,6 +432,24 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
         fprintf(stderr, "error: no loadable segments or no dynamic section\n");
         free(file); return -1;
     }
+    if (lib->is_exec && !afw_load_patch_only) {
+        int entry_ok = 0;
+        for (i = 0; i < eh->e_phnum; i++) {
+            uint64_t seg_sz = ph[i].p_filesz;
+            if (ph[i].p_type != PT_LOAD || !(ph[i].p_flags & PF_X)) continue;
+            if (seg_sz == 0 || seg_sz > ph[i].p_memsz || seg_sz > UINT64_MAX - ph[i].p_vaddr) continue;
+            if (eh->e_entry >= ph[i].p_vaddr && eh->e_entry < ph[i].p_vaddr + seg_sz) {
+                entry_ok = 1;
+                break;
+            }
+        }
+        if (!entry_ok) {
+            fprintf(stderr, "error: executable %s has e_entry 0x%llx outside any executable PT_LOAD segment\n",
+                    path, (unsigned long long)eh->e_entry);
+            free(file);
+            return -1;
+        }
+    }
     lo = ALIGN_DOWN(lo, AFW_PAGE_SIZE);
     hi = ALIGN_UP(hi, AFW_PAGE_SIZE);
     lib->size = (size_t)(hi - lo);
@@ -440,7 +459,7 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
     lib->stub_area = lib->base ? lib->base + lib->size : NULL;
     if (!lib->base) { fprintf(stderr, "error: out of memory\n"); free(file); return -1; }
     lib->bias = (intptr_t)lib->base - (intptr_t)lo;
-    if (lib->is_exec && eh->e_entry && eh->e_entry >= lo && eh->e_entry < hi)
+    if (lib->is_exec && !afw_load_patch_only)
         lib->entry = (uint64_t)lib->bias + eh->e_entry;
 
     npages = lib->size / AFW_PAGE_SIZE;
@@ -731,6 +750,8 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
     }
     lib->pending = 1;
     if (g_defer_finish) return 0;      /* afw_load_with_deps finishes the whole set together */
+    if (!afw_load_patch_only && lib->is_exec && lib->entry)
+        afw_exec_prepare_auxv(lib, path);
     return lib_finish(lib, verbose);
 }
 
@@ -1008,6 +1029,11 @@ int afw_load_with_deps(const char *path, afw_lib *lib, afw_lib *deps, int maxdep
         for (k = g_nlibs - 1; k >= first; k--) retire_failed(g_libs[k]);
         return -1;
     }
+    /* Now that the executable and all dependencies are mapped (Phase A), install
+     * the executable's complete auxv into libc_shared_globals BEFORE Phase B runs
+     * libc.so's or the executable's constructors. */
+    if (!afw_load_patch_only && lib->is_exec && lib->entry)
+        afw_exec_prepare_auxv(lib, path);
     if (verbose) printf("\n== all %d libraries mapped and relocated; TLS layout closes now\n", g_nlibs - first);
     for (k = first; k < g_nlibs; k++)    /* dependency order: a library after the ones it needs */
         if (g_libs[k]->pending && lib_finish(g_libs[k], verbose) != 0) {

@@ -44,6 +44,23 @@ jobs:
           # executables: one with no libc (checks the initial stack), one ordinary (real bionic)
           "$TC/clang" --target=x86_64-linux-android29 -O2 -fno-jump-tables -nostdlib -fPIE -pie \
             -Wl,--pack-dyn-relocs=none -o out/exec_min test/exec_min.c
+          # negative ELF test (PR #16, reviewer 2): e_entry inside a non-executable PT_LOAD segment
+          python3 -c '
+          import struct
+          data = bytearray(open("out/exec_min", "rb").read())
+          phoff = struct.unpack_from("<Q", data, 32)[0]
+          phent, phnum = struct.unpack_from("<HH", data, 54)
+          bad = None
+          for i in range(phnum):
+              ptype, pflags, _, pvaddr, _, _, pmemsz, _ = struct.unpack_from("<IIQQQQQQ", data, phoff + i * phent)
+              if ptype == 1 and (pflags & 1) == 0 and pvaddr > 0 and pmemsz > 0:
+                  bad = pvaddr
+                  break
+          assert bad is not None, "no non-executable PT_LOAD with vaddr > 0 found"
+          struct.pack_into("<Q", data, 24, bad)
+          open("out/exec_bad_entry", "wb").write(data)
+          print(f"created out/exec_bad_entry with non-exec e_entry=0x{bad:x}")
+          '
           "$TC/clang" --target=x86_64-linux-android34 -O2 -fPIE -pie -Wl,--pack-dyn-relocs=none \
             -o out/hello_exe test/hello_exe.c
           "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 -nostdlib -Wl,-soname,libdeps_base.so \
@@ -79,6 +96,7 @@ jobs:
           path: |
             out/*.so
             out/exec_min
+            out/exec_bad_entry
             out/hello_exe
 
   # Gate G1 experiment: static scan of the real bionic libc.so.
@@ -260,6 +278,10 @@ jobs:
           [ $rc -eq 18 ] || { echo "exec_min without override exited $rc, not 18"; exit 1; }
           set +e; AFW_EXEC_MIN=ok out/afw-asan out/exec_min --env AFW_OVERRIDE=two --exec hello > /dev/null 2>&1; rc=$?; set -e
           [ $rc -eq 11 ] || { echo "exec_min with a wrong argc exited $rc, not 11"; exit 1; }
+          if out/afw-asan out/exec_bad_entry --exec hello world > out/badentry.txt 2>&1; then
+            cat out/badentry.txt; echo "exec_bad_entry was not refused"; exit 1
+          fi
+          grep -q "outside any executable PT_LOAD segment" out/badentry.txt
           # fs:[reg] is rewritten on Windows only: on Linux the gate must refuse it
           if out/afw-asan out/libtls_ie_test.so > out/ie.txt 2>&1; then cat out/ie.txt; echo "fs:[reg] ran unrewritten"; exit 1; fi
           grep -q "8 fs:\[reg\] accesses not rewritten" out/ie.txt
@@ -335,6 +357,9 @@ jobs:
           if not %errorlevel% equ 18 (echo missing override exited %errorlevel%, not 18 & exit /b 1)
           out\afw-loader.exe out\exec_min --env AFW_OVERRIDE=two --exec hello > nul 2>&1
           if not %errorlevel% equ 11 (echo wrong argc exited %errorlevel%, not 11 & exit /b 1)
+          out\afw-loader.exe out\exec_bad_entry --exec hello world > out\badentry.txt 2>&1
+          if %errorlevel% equ 0 (type out\badentry.txt & echo exec_bad_entry was not refused & exit /b 1)
+          findstr /c:"outside any executable PT_LOAD segment" out\badentry.txt >nul || (type out\badentry.txt & echo wrong error for exec_bad_entry & exit /b 1)
           exit /b 0
       - name: "G1: an ordinary Android executable runs main() with the real libc (required)"
         timeout-minutes: 3
@@ -347,6 +372,7 @@ jobs:
           type out\hello-exe.txt
           if not "%rc%"=="42" (echo hello_exe exited %rc%, not 42 & exit /b 1)
           findstr /c:"constructor=1" out\hello-exe.txt >nul || (echo main did not run after the constructor & exit /b 1)
+          findstr /c:"ctor_auxv=1" out\hello-exe.txt >nul || (echo full auxv was not ready in constructor & exit /b 1)
           findstr /c:"host_env=from_windows" out\hello-exe.txt >nul || (echo host env var was not forwarded & exit /b 1)
           findstr /c:"flag_env=from_flag" out\hello-exe.txt >nul || (echo --env flag var was not forwarded & exit /b 1)
           findstr /c:"atexit handler ran" out\hello-exe.txt >nul || (echo atexit did not run & exit /b 1)
