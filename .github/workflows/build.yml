@@ -76,7 +76,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: libhello
-          path: out/*.so
+          path: |
+            out/*.so
+            out/exec_min
+            out/hello_exe
 
   # Gate G1 experiment: static scan of the real bionic libc.so.
   # The extracted Android files are NOT uploaded (licensing): only the report.
