@@ -43,17 +43,24 @@ static void set_err(const char *fmt, ...) {
     t_has_err = 1;
 }
 
-/* Anchor retained deps[] arrays so LSan sees the allocation start even if only
- * an interior deps[i] stayed loaded or quarantined. */
-static afw_lib *g_kept_deps[64];
-static int g_nkept_deps;
-static void keep_deps_alloc(afw_lib *deps) {
-    if (g_nkept_deps < 64) g_kept_deps[g_nkept_deps++] = deps;
+/* Anchor retained deps[] blocks on an unbounded intrusive list (allocated up
+ * front before afw_load_with_deps: linking on retention needs zero allocation,
+ * cannot fail under OOM, and keeps the block base reachable for LSan even if
+ * only an interior deps[i] stayed loaded or quarantined). */
+typedef struct afw_deps_block_s {
+    struct afw_deps_block_s *next;
+    afw_lib deps[32];
+} afw_deps_block;
+static afw_deps_block *g_kept_deps_head;
+static void keep_deps_block(afw_deps_block *blk) {
+    blk->next = g_kept_deps_head;
+    g_kept_deps_head = blk;
 }
 
 SYSV void *afw_l_dlopen(const char *name, int flags, const void *caller) {
     char path[1200];
-    afw_lib *lib, *deps;
+    afw_lib *lib;
+    afw_deps_block *dblk;
     int ndeps = 0;
     (void)flags; (void)caller;   /* RTLD_LAZY/NOW/LOCAL/GLOBAL: binding is always now, scope global */
     if (!name) return &g_main_handle;
@@ -64,30 +71,30 @@ SYSV void *afw_l_dlopen(const char *name, int flags, const void *caller) {
     }
     /* loaded libraries stay loaded: the registry keeps pointers into these */
     lib = (afw_lib *)calloc(1, sizeof *lib);
-    deps = (afw_lib *)calloc(32, sizeof *deps);
+    dblk = (afw_deps_block *)calloc(1, sizeof *dblk);
     {
         char *p = (char *)malloc(strlen(path) + 1);
-        if (!lib || !deps || !p) {
-            free(lib); free(deps); free(p);
+        if (!lib || !dblk || !p) {
+            free(lib); free(dblk); free(p);
             set_err("dlopen failed: out of memory loading \"%s\"", name);
             return NULL;
         }
         strcpy(p, path);
-        if (afw_load_with_deps(p, lib, deps, 32, &ndeps, 0) != 0) {
+        if (afw_load_with_deps(p, lib, dblk->deps, 32, &ndeps, 0) != 0) {
             int i, keep_deps = 0;
             /* Only free allocations that are neither loaded in g_libs[] nor
-             * quarantined in g_quarantine[] (past the point of no return). */
+             * quarantined on the intrusive quarantine list (past point of no return). */
             set_err("dlopen failed: could not load \"%s\" (see the loader's message)", name);
             if (!afw_is_retained(lib)) { free(lib); free(p); }
             for (i = 0; i < ndeps; i++)
-                if (afw_is_retained(&deps[i])) { keep_deps = 1; break; }
-            if (keep_deps) keep_deps_alloc(deps);
-            else free(deps);
+                if (afw_is_retained(&dblk->deps[i])) { keep_deps = 1; break; }
+            if (keep_deps) keep_deps_block(dblk);
+            else free(dblk);
             return NULL;
         }
     }
-    if (ndeps == 0) free(deps);
-    else keep_deps_alloc(deps);
+    if (ndeps == 0) free(dblk);
+    else keep_deps_block(dblk);
     return lib;
 }
 

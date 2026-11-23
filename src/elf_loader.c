@@ -43,7 +43,7 @@ int afw_gate_ok(const afw_lib *lib) {
 #define MAX_LIBS 64
 static afw_lib *g_libs[MAX_LIBS];
 static int g_nlibs;
-static afw_lib *g_quarantine[MAX_LIBS];
+static afw_lib *g_quarantine_head;   /* intrusive list: unbounded, zero-alloc, fail-safe under OOM */
 static int g_nquarantine;
 
 #ifdef AFW_TEST
@@ -814,6 +814,13 @@ static int lib_finish(afw_lib *lib, int verbose) {
  * library list (main's lib is on its stack), no mapping, no TLS module. */
 int afw_loaded_count(void) { return g_nlibs; }
 int afw_quarantined_count(void) { return g_nquarantine; }
+const afw_lib *afw_quarantined_at(int k) {
+    const afw_lib *q;
+    if (k < 0) return NULL;
+    for (q = g_quarantine_head; q; q = q->quarantine_next)
+        if (k-- == 0) return q;
+    return NULL;
+}
 
 /* DT_NEEDED names of an ELF file on disk (without mapping it). Returns the
  * count (<= max), or -1. names point into *buf, which the caller frees. */
@@ -878,9 +885,10 @@ int afw_is_loaded(const void *handle) {
 }
 
 int afw_is_retained(const void *handle) {
-    int k;
+    const afw_lib *q;
     if (afw_is_loaded(handle)) return 1;
-    for (k = 0; k < g_nquarantine; k++) if ((const void *)g_quarantine[k] == handle) return 1;
+    for (q = g_quarantine_head; q; q = q->quarantine_next)
+        if ((const void *)q == handle) return 1;
     return 0;
 }
 
@@ -1057,20 +1065,20 @@ static void discard(afw_lib *lib) {
 
 /* Past the point of no return (IFUNC/constructors ran, or static TLS layout
  * closed with this library's module in it): remove from active g_libs[] so no
- * lookup returns a failed library, but retain mapping, TLS module, and struct
- * in g_quarantine[] (no UAF, no orphan TLS module, reachable for LSan). */
+ * lookup returns a failed library, and link onto the unbounded intrusive
+ * quarantine list (zero allocation: cannot fail even under OOM). Keeps the
+ * mapping, TLS module, path, and afw_lib struct alive (no UAF, no orphan TLS
+ * module, reachable for LSan). */
 static void quarantine(afw_lib *lib) {
-    int k;
     remove_from_registry(lib);
     free(lib->irel); lib->irel = NULL; lib->nirel = lib->capirel = 0;
     free(lib->pageprot); lib->pageprot = NULL;
     free(lib->phdr); lib->phdr = NULL; lib->phnum = 0;
-    for (k = 0; k < g_nquarantine; k++)
-        if (g_quarantine[k] == lib) return;
-    if (g_nquarantine < MAX_LIBS)
-        g_quarantine[g_nquarantine++] = lib;
-    else
-        fprintf(stderr, "warning: quarantine table full for failed library\n");
+    if (lib->quarantined) return;
+    lib->quarantined = 1;
+    lib->quarantine_next = g_quarantine_head;
+    g_quarantine_head = lib;
+    g_nquarantine++;
 }
 
 static void retire_failed(afw_lib *lib) {

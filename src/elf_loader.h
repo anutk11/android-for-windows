@@ -56,6 +56,8 @@ typedef struct afw_lib_s {
     /* phase A done, phase B (TLS close, IFUNC, RELRO, constructors) not yet */
     int pending;
     int code_ran;               /* IFUNC resolver or constructor started: past rollback point */
+    int quarantined;            /* retained past point of no return (never freed/unmapped) */
+    struct afw_lib_s *quarantine_next;   /* intrusive quarantine list (zero-alloc, unbounded) */
     int vma_adopted;            /* the image is registered with the VMA layer (6e) */
     unsigned char *pageprot;
     size_t npages, relro_first, relro_last;
@@ -83,6 +85,7 @@ int afw_loaded_count(void);
 /* How many failed libraries are quarantined (past point of no return: TLS
  * already closed or code already ran, so mapping/TLS/struct stay live). */
 int afw_quarantined_count(void);
+const afw_lib *afw_quarantined_at(int k);
 
 /* The load gate: 1 if patching left the library provably safe to run.
  * Blocks on: unproven look-alikes, undecodable exception tables, syscall

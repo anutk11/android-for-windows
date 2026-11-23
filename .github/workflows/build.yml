@@ -228,6 +228,8 @@ jobs:
           grep -q "late IFUNC lib_finish failure quarantined cleanly" out/finish-fail-late-ifunc.txt
           out/afw-asan-test out/libhello.so --finish-fail-late=dep:out/libdeps_user.so | tee out/finish-fail-late-dep.txt
           grep -q "late dep-set lib_finish failure kept base loaded and quarantined user" out/finish-fail-late-dep.txt
+          out/afw-asan-test out/libhello.so --finish-fail-late=stress:out/libifunc_test.so | tee out/finish-fail-late-stress.txt
+          grep -q "stress test: 70 late lib_finish failures quarantined cleanly" out/finish-fail-late-stress.txt
           # a refused library (PT_TLS + fs:[reg], refused on Linux) leaves nothing behind
           out/afw-asan out/libtls_test.so --preload-fail=out/libtls_ie_test.so | tee out/preload.txt
           grep -q "refused, and nothing left behind" out/preload.txt
@@ -297,6 +299,8 @@ jobs:
           out\afw-loader-test.exe out\libhello.so --finish-fail-late=ifunc:out\libifunc_test.so
           if errorlevel 1 exit /b 1
           out\afw-loader-test.exe out\libhello.so --finish-fail-late=dep:out\libdeps_user.so
+          if errorlevel 1 exit /b 1
+          out\afw-loader-test.exe out\libhello.so --finish-fail-late=stress:out\libifunc_test.so
           if errorlevel 1 exit /b 1
       - name: "G1: extract the real bionic on this Windows runner (never uploaded)"
         shell: bash
