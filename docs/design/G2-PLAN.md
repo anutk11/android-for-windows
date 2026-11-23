@@ -1,7 +1,7 @@
 # תכנון Gate G2: ריבוי חוטים (`pthreads` + `futex`), `MADV_DONTNEED` מקבילי, `filemap`, `dlopen`/TLS דינמי וחריגות C++
 
-מצב: **טיוטה מעודכנת (גרסה 4) — שולבו גם שלושת התיקונים מסבב ביקורת 2 של בודק 2 מול `dd3e4e8`** (לפי [`docs/COLLABORATION.md`](../COLLABORATION.md), שורות 15, 77).
-מיועד לביקורת של **בודק 3** (זיכרון, TLS, חוטים, VEH), **בודק 2** (Linux ABI, `filemap`, `futex`, אורקל `libc_shared_globals`), ו**בודק 1** (שערי טעינה, 9 אתרי `UNPROVEN`, חריגות C++ / `libc++_shared.so`).
+מצב: **גרסה 5 — שולבו כל ממצאי בודק 3 (Red Zone ב־`MADV_DONTNEED`, סדר `SYS_exit`, `futex`/DTV/`VMA_FILEMAP` `.eh_frame`) וכל ממצאי בודק 2 (`dd3e4e8`)** (לפי [`docs/COLLABORATION.md`](../COLLABORATION.md), שורות 15, 77).
+**אישור בודק 3:** מאושר להתחיל מיד בניסוי שלב 0 (`G2-1`, `exp/g2-pthread-probe`); סעיפים `G2-3` ו־`G2-4` עודכנו לפי שני החוסמים שלו ומוכנים לאישור סופי של בודקים 2, 3 ו־1.
 
 סימון לפי כלל 7: **[נמדד]** = מבוסס על קוד קיים או פלט CI מפורש, **[השערה]** = טענה שטרם נמדדה ותוכרע בניסוי (כלל 7א).
 
@@ -51,7 +51,7 @@
 1. **פרופיל syscalls של Bionic:** אילו קריאות מערכת Bionic מבצעת בתוך `pthread_create` (רגיל ו־`detached`), `pthread_join`, `pthread_mutex`, ו־`pthread_cond_broadcast` (`mmap`, `mprotect`, `clone` (`56`), `futex` (`202` — אילו opcodes בדיוק), `set_tid_address` (`218`), `rt_sigprocmask` (`14`), `set_robust_list` (`273`), `prctl` (`157`), ו־`munmap`+`exit` בחוט `detached`), ומהם דגלי `clone` ופריסת `newtls` בפועל.
 2. **כניסה ויציאה מ־trampoline אסמבלי על מחסנית Bionic (`child_stack`):** מעבר בטוח ממחסנית `CreateThread` למחסנית שהוקצתה ב־`mmap` עם יישור ABI של 16 בתים, וחזרה מבוקרת למחסנית Windows המקורית.
 3. **בדיקת גבולות stack ו־guard page:** אימות ש־`mprotect(PROT_NONE)` על ה־guard page בתחתית מחסנית Bionic אכן תופס גלישת מחסנית ומדווח קריסה (ולא משחית זיכרון או נתפס ב־VEH שגוי).
-4. **בדיקת VEH, חריגת C++ ו־unwinding מתוך החוט המשני על מחסנית Bionic:** הפעלת `fs:` read fault (VEH), זריקה ותפיסה של חריגת C++ (`libunwind` / `.eh_frame`), ו־stack walk מתוך החוט המשני.
+4. **בדיקת VEH, חריגת C++, unwinding וקריאת Win32 עמוקה מתוך החוט המשני על מחסנית Bionic:** הפעלת `fs:` read fault (VEH), זריקה ותפיסה של חריגת C++ (`libunwind` / `.eh_frame`), stack walk, ו**קריאה עמוקה ל־Win32 API** (כמו `CreateFileW` / `VirtualQuery`) מתוך מחסנית Bionic כדי לוודא ש־`ntdll`/`__chkstk` אינם נכשלים על `NT_TIB` המותאם.
 5. **בדיקת חזרה מסודרת ל־Windows thread exit:** שחזור `RSP` ו־`NT_TIB` (`StackBase`, `StackLimit`, `DeallocationStack`) לפני `ExitThread()`, ואימות ש־`FLS` callbacks ו־`DLL_THREAD_DETACH` רצים בלי קריסה גם אחרי `munmap` של מחסנית Bionic.
 
 ### 3.2 השוואת שתי אפשרויות ותנאי Fallback מפורש
@@ -62,7 +62,7 @@
 | שחרור TLS | **אסור** לרשום `FLS` release על `newtls` שהוקצה ע"י Bionic (מונע double-free על `mmap` של Bionic) | הטוען מנהל את הבלוק |
 | מחסנית וחוטים מנותקים | דורש trampoline, עדכון/שחזור `NT_TIB`, וטיפול ב־`_exit_with_stack_teardown` | החוט רץ תמיד על מחסנית Windows המקורית (ללא החלפת `NT_TIB`) |
 
-- **שער החלטה משלב 0 (תנאי Fallback ברור):** רק אם ניסוי שלב 0 עובר בהצלחה בכל 5 הסעיפים ב־Windows CI — מממשים את **אפשרות א' (`SYS_clone`)**. אם אחד מהסעיפים (VEH/SEH, unwinding, guard page או `DLL_THREAD_DETACH`) נכשל או דורש הסתמכות על מבנה Windows לא מתועד — **עוברים לאפשרות ב' (יירוט `pthread_create`)** ל־G2, בכפוף לאישור בודק 3.
+- **שער החלטה משלב 0 (תנאי Fallback ברור):** רק אם ניסוי שלב 0 עובר בהצלחה בכל 5 הסעיפים ב־Windows CI — מממשים את **אפשרות א' (`SYS_clone`)**. אם אחד מהסעיפים (VEH/SEH, unwinding, guard page, קריאת `ntdll`/`__chkstk` או `DLL_THREAD_DETACH`) נכשל או דורש הסתמכות על מבנה Windows לא מתועד — **עוברים לאפשרות ב' (יירוט `pthread_create`)** ל־G2, בכפוף לאישור בודק 3.
 
 ### 3.3 הפרדה מפורשת בין Windows TLS לבין Android TLS ומסלול `newtls` **[השערה — לאימות בניסוי שלב 0]**
 
@@ -93,15 +93,17 @@ Bionic pthread_create()
 
 ### 3.4 מוקש `_exit_with_stack_teardown` ומחזור החיים המלא של `clear_child_tid`
 
-#### א. `_exit_with_stack_teardown` (חוטים מנותקים `PTHREAD_CREATE_DETACHED`)
-בחוט מנותק, Bionic קוראת ל־`_exit_with_stack_teardown(stack_base, stack_size)`: `SYS_munmap` על המחסנית הנוכחית ומיד `SYS_exit(0)` בלי לגעת במחסנית.
-1. כל חוט `clone` שומר במבנה per-thread (`afw_thread_ctx`, מוקצה על ה־heap ורשום ב־`FLS` ייעודי נפרד משחרור TLS!) את מצב המחסנית המקורית של Windows (`host_rsp`, `host_stack_base`, `host_stack_limit`, `host_dealloc_stack`).
+#### א. `_exit_with_stack_teardown` וסדר היציאה הבטוח ב־`SYS_exit(60)` (תוקן לפי חוסם בודק 3!)
+בחוט מנותק (`PTHREAD_CREATE_DETACHED`), Bionic קוראת ל־`_exit_with_stack_teardown(stack_base, stack_size)`: `SYS_munmap` על המחסנית הנוכחית ומיד `SYS_exit(0)` בלי לגעת במחסנית. בחוט `joinable`, ברגע ש־`clear_child_tid` מאופס ומוער, החוט המצטרף (`pthread_join`) עלול לקרוא מיד ל־`munmap` על המחסנית ועל `newtls` של החוט היוצא!
+
+לכן הסדר המחייב הוא:
+1. כל חוט `clone` שומר ב־`afw_thread_ctx` (מוקצה על ה־heap ורשום ב־`FLS` ייעודי נפרד משחרור TLS!) את מצב המחסנית המקורית של Windows (`host_rsp`, `host_stack_base`, `host_stack_limit`, `host_dealloc_stack`).
 2. אם `SYS_munmap(addr, len)` מזהה שהטווח `[addr, addr + len)` **מכיל את `RSP` הנוכחי של החוט הקורא**: מאמת את הטווח ב־VMA, דוחה את השחרור לשדה `ctx->pending_stack_unmap = {addr, len}` ומחזיר `0` — כך ש־`afw_syscall_entry` חוזר בבטחה להוראת `SYS_exit(0)`.
-3. בכניסה ל־`SYS_exit(code)` (`60`):
-   - מפעיל `afw_thread_clear_tid_once(ctx)` (איפוס אטומי + `WakeByAddressAll`),
-   - **עובר בחזרה למחסנית Windows המקורית** (`RSP = host_rsp`) **ומשחזר את `NT_TIB` המקורי**,
-   - מבצע `afw_munmap(ctx->pending_stack_unmap.addr, ctx->pending_stack_unmap.len)` אם קיים,
-   - קורא `ExitThread((DWORD)code)` — כך ש־`FLS` callbacks ו־`DLL_THREAD_DETACH` רצים על מחסנית Windows חוקית.
+3. **בכניסה ל־`SYS_exit(code)` (`60`) — הסדר הקריטי (מונע UAF בחוט `joinable`!):**
+   1. **קודם כול:** מעבר בחזרה למחסנית Windows המקורית (`RSP = host_rsp`) ושחזור `NT_TIB` (`StackBase`, `StackLimit`, `DeallocationStack`).
+   2. ביצוע `afw_munmap(ctx->pending_stack_unmap.addr, ctx->pending_stack_unmap.len)` (עבור חוט `detached`).
+   3. **רק עכשיו** — לאחר שהחוט אינו נוגע עוד בשום זיכרון של Bionic — קריאה ל־`afw_thread_clear_tid_once(ctx, 0)` (מרגע זה `pthread_join` רשאי לשחרר את מחסנית הילד וה־`newtls` שלו בבטחה!).
+   4. קריאה ל־`ExitThread((DWORD)code)` — כל `FLS` callbacks ו־`DLL_THREAD_DETACH` רצים על מחסנית Windows חוקית.
 
 #### ב. חוזה אטומי מדויק עבור `clear_child_tid` (כולל `SYS_set_tid_address` ויציאה חריגה)
 - **ייצוג בזיכרון (ללא `volatile`):** ב־`afw_thread_ctx` (מוקצה per-thread, מצביע אליו שמור ב־`_Thread_local` וב־`FlsSetValue(g_thread_ctx_fls, ctx)`):
@@ -114,111 +116,58 @@ Bionic pthread_create()
 - **החלפת הכתובת במהלך חיי החוט (`SYS_set_tid_address(tidptr)` — syscall `218`):**
   - מבצע `atomic_store_explicit(&ctx->clear_child_tid_addr, (uintptr_t)tidptr, memory_order_release)` ומחזיר `sys_gettid()`.
   - אם `tidptr == NULL` (`0`): האיפוס וה־wake ביציאה מושבתים. אם `tidptr` היא כתובת חדשה מיושרת ל־4 בתים: ביציאה יאופס ויוער אך ורק ה־`tidptr` החדש (לעולם לא הישן).
-- **איפוס אטומי וסדר זיכרון ביחס ל־wake (`afw_thread_clear_tid_once(ctx)`):**
+- **איפוס אטומי וסדר זיכרון ביחס ל־wake (`afw_thread_clear_tid_once(ctx, int in_fls)`):**
   1. מחסום חד־פעמי: `if (atomic_exchange_explicit(&ctx->clear_tid_done, 1, memory_order_acq_rel) != 0) return;`
   2. שליפה וניקוי של הכתובת: `uintptr_t addr = atomic_exchange_explicit(&ctx->clear_child_tid_addr, 0, memory_order_acq_rel);`
   3. אם `addr != 0`:
+     - **הגנה במסלול יציאה חריגה (`in_fls == 1`, הערת בודק 3):** במסלול `SYS_exit` רגיל `clear_tid_done` כבר `1` ולכן ה־FLS callback הוא no-op; אך אם חוט יוצא חריג דרך `FLS` (`LdrShutdownThread`), מוודאים קודם דרך `afw_vma_is_writable(addr, 4)` שהכתובת עדיין ממופה לקריאה/כתיבה ב־VMA לפני הכתיבה (מונע חריגה בתוך `LdrShutdownThread` אם הזיכרון כבר שוחרר).
      - **כתיבה אטומית (לא `volatile`!):** `atomic_store_explicit((_Atomic int32_t *)addr, 0, memory_order_seq_cst);` (ב־Windows `platform.c` שקול ל־`InterlockedExchange((volatile LONG *)addr, 0)`).
      - **סדר זיכרון מפורש:** הכתיבה האטומית `seq_cst` (שכוללת `release`) **קודמת בסדר זיכרון (`happens-before`)** לקריאת `WakeByAddressAll((PVOID)addr)` (ב־Linux: `futex(FUTEX_WAKE, INT_MAX)`). לכן כל חוט ב־`pthread_join` שמתעורר מה־futex מובטח לראות `*addr == 0` וכן את כל כתיבות החוט שקדמו ליציאתו.
-  4. **ביצוע פעם אחת בלבד גם במסלול יציאה חריג:** הפונקציה נקראת (א) במסלול הרגיל ב־`SYS_exit(60)`, ו־(ב) ב־`FLS` callback של `g_thread_ctx_fls` כרשת ביטחון לכל יציאה חריגה (למשל `ExitThread` ישיר), שגם משחרר את `ctx`. בזכות `atomic_exchange(&ctx->clear_tid_done, 1)`, האיפוס וה־wake רצים **פעם אחת בדיוק**.
-- **סנכרון התחלה ב־`SYS_clone` (`56`):** מאשר רק דגלי thread נתמכים (`CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | CLONE_FILES | CLONE_FS` + `CLONE_SETTLS`/`CLONE_PARENT_SETTID`/`CLONE_CHILD_SETTID`/`CLONE_CHILD_CLEARTID`; `fork` נדחה ב־`-ENOSYS`). ההורה ממתין על אירוע התחלה עד שהילד קורא `GetCurrentThreadId()`, כותב `parent_tidptr`/`child_tidptr`, רושם `clear_child_tid_addr`, ומאתחל TEB + `t_block`.
+  4. **ביצוע פעם אחת בלבד:** נקראת (א) ב־`SYS_exit(60)` (אחרי החלפה ל־`host_rsp`!), ו־(ב) ב־`FLS` callback של `g_thread_ctx_fls` שגם משחרר את `ctx`.
+- **סנכרון התחלה ואימות `tid` ב־`SYS_clone` (`56`):**
+  - מאשר רק דגלי thread נתמכים (`CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | CLONE_FILES | CLONE_FS` + `CLONE_SETTLS`/`CLONE_PARENT_SETTID`/`CLONE_CHILD_SETTID`/`CLONE_CHILD_CLEARTID`; `fork` נדחה ב־`-ENOSYS`).
+  - מאמת שה־`tid` (`GetCurrentThreadId()`) חיובי בתחום `int32_t` (`tid > 0 && tid <= INT32_MAX`, הערת בודק 3), ונכתב **זהה** ל־`parent_tidptr`, ל־`child_tidptr`, לערך ההחזרה של `SYS_clone` ול־`SYS_gettid`.
+  - ההורה ממתין על אירוע התחלה עד שהילד כותב `parent_tidptr`/`child_tidptr`, רושם `clear_child_tid_addr`, ומאתחל TEB + `t_block`.
 
 ### 3.5 תכנון מפורש ל־`SYS_futex` (`202`)
 
 **קיים ונמדד ב־[`src/syscall.c`](../../src/syscall.c) (שורות 185–256) [נמדד]:**
 - `FUTEX_WAIT` (`0`), `FUTEX_WAKE` (`1`), `FUTEX_WAIT_BITSET` (`9`, `val3 == 0xffffffffu`), `FUTEX_WAKE_BITSET` (`10`, `val3 == 0xffffffffu`) מעל `WaitOnAddress` / `WakeByAddressSingle` / `WakeByAddressAll`, עם `CLOCK_MONOTONIC` ו־`CLOCK_REALTIME` (`FUTEX_CLOCK_REALTIME`) ולולאת הגנה מפני התעוררות מוקדמת של טיימר Windows.
 
-**נדרש להוסיף ב־G2 עבור `pthreads` (`pthread_mutex`, `pthread_cond`, `pthread_rwlock`, `pthread_once`, `pthread_join`):**
-- **`FUTEX_REQUEUE` (`3`) ו־`FUTEX_CMP_REQUEUE` (`4`)** (ל־`pthread_cond_broadcast` ב־Bionic — יאומת בשלב 0):
-  - אימות יישור 4 בתים ל־`uaddr` ו־`uaddr2`; ב־`CMP_REQUEUE` בדיקת `*uaddr == val3` (אחרת `-EAGAIN`).
-  - **שתי חלופות להכרעת בודקים 2 ו־3:**
-    - **חלופה 1 (מעל `WaitOnAddress`):** אחרי בדיקת `*uaddr == val3`, מעיר `WakeByAddressAll(uaddr)` (כך שה־waiters מתעוררים ומתחרים מחדש על `uaddr2` בתוך Bionic). מהיר ופשוט ל־`WAIT`/`WAKE`, אך אינו תומך ב־bitset חלקי ויוצר thundering herd ב־`broadcast`.
-    - **חלופה 2 (טבלת waiters פנימית נעולה ב־`SRWLOCK`):** העברת צמתי waiter אמיתית מדלי `uaddr` לדלי `uaddr2`, תמיכה ב־bitset חלקי וספירת woken מדויקת.
+**החלטת תכנון ל־G2 (בהסכמת בודק 3):**
+- **חלופה 1 (`WaitOnAddress` + `WakeByAddressAll` אחרי בדיקת `*uaddr == val3`)** עבור `FUTEX_REQUEUE` (`3`) ו־`FUTEX_CMP_REQUEUE` (`4`) (אימות יישור 4 בתים ל־`uaddr` ו־`uaddr2`; ב־`CMP_REQUEUE` בדיקת `*uaddr == val3` אחרת `-EAGAIN`), **בתנאי** שניסוי שלב 0 (`G2-1`) מאמת:
+  1. Bionic אינה שולחת bitset חלקי (`val3 != 0xffffffff`), ו־
+  2. `pthread_cond_broadcast` ב־Bionic מעדכנת את `cond->state` לפני `REQUEUE` ואינה תלויה בערך ההחזרה המדויק של מספר המועברים (אלא רק ב־`< 0` לשגיאה).
+- אם שלב 0 יחשוף צורך ב־bitset חלקי או בספירת requeue מדויקת (או ב־G3 מול ART), עוברים לחלופה 2 (טבלת waiters פנימית נעולה ב־`SRWLOCK`).
 - **דיוק שעונים:** לשמור על סירוב `FUTEX_CLOCK_REALTIME` ב־`FUTEX_WAIT` רגיל (מותר רק ב־`FUTEX_WAIT_BITSET`, כמו בליבת Linux).
 
 ---
 
-## 4. זרם עבודה 2 — `MADV_DONTNEED` מקבילי ובטוח לחוטים (`src/vma.c`) [לבודק 3 ובודק 2]
+## 4. זרם עבודה 2 — `MADV_DONTNEED` מקבילי ובטוח לחוטים (`src/vma.c`) [ללא VEH — תוקן לפי בודק 3 ובודק 2]
 
-### 4.1 הבעיה הקיימת [נמדד]
+### 4.1 למה בוטל מנגנון `decommit + recommit` + VEH [תגלית קריטית של בודק 3]
 
-ב־[`src/vma.c`](../../src/vma.c) (`do_dontneed`, שורות 614–643), `os_decommit` ואחריו `os_commit` פותחים חלון קצר שבו העמוד הוא `MEM_RESERVE`. בחוט יחיד (G1) זה תקין; בריבוי חוטים (G2, ובפרט Scudo), חוט אחר שניגש לעמוד בחלון חוטף `EXCEPTION_ACCESS_VIOLATION`.
+ב־[`src/vma.c`](../../src/vma.c) (`do_dontneed`, שורות 614–643), `os_decommit` ואחריו `os_commit` פותחים חלון שבו העמוד הוא `MEM_RESERVE` (לא נגיש). תכנון קודם הציע לתפוס חריגות של חוטים מקבילים בתוך VEH — אך **בודק 3 חשף סיבה עקרונית שפוסלת כל מנגנון VEH על גישות דאטה אקראיות של קוד אנדרואיד**:
 
-`MEM_RESET` / `DiscardVirtualMemory` אינם מבטיחים איפוס לאפסים (מפרים חוזה Linux של `MADV_DONTNEED`), ו־`memset(0)` אינו עובד על `PROT_READ` ואינו משחרר commit.
+- **השחתת Red Zone בקרנל Windows (`KiUserExceptionDispatcher`):** ברגע שמתרחשת `EXCEPTION_ACCESS_VIOLATION` ב־Windows x64, הקרנל כותב את `CONTEXT` ו־`EXCEPTION_RECORD` (~1.4KB) ישירות **מתחת ל־`RSP`** של החוט הנפגע — **לפני שה־VEH מתחיל לרוץ**. אם החוט מריץ פונקציית עלה של System V (ב־`libc.so` או `libc++_shared.so`) שמחזיקה משתנים חיים ב־128 הבתים של ה־Red Zone, החריגה משחיתה אותם בשקט; החזרת `EXCEPTION_CONTINUE_EXECUTION` ממשיכה ריצה עם מחסנית מושחתת!
+- בנוסף, `MEM_RESET` / `DiscardVirtualMemory` אינם מבטיחים איפוס לאפסים (מפרים חוזה Linux של `MADV_DONTNEED`).
 
-### 4.2 פרוטוקול C11 אטומי חסר־מרוצים (Double-Buffered Active Window) + המתנת קרנל בטוחה תחת Preemption
+### 4.2 התכנון החדש ל־G2 — `memset(0)` תחת `g_lock` על עמודים נגישים + `os_decommit` על `PROT_NONE` (ללא VEH!)
 
-**כללי ברזל (מסקנות PR #11 וביקורת בודק 2 על `42c9b2e` ו־`dd3e4e8`):**
-1. **ללא `volatile` וללא C11 data races:** כל משתנה משותף בין הכותב לקורא ה־VEH הוא `_Atomic` (`<stdatomic.h>`) ונקרא/נכתב אך ורק דרך פעולות אטומיות מפורשות (`atomic_load_explicit` / `atomic_store_explicit`).
-2. **ללא נעילות user-mode בתוך ה־VEH:** ה־VEH לעולם אינו נועל את `g_lock` (`SRWLOCK`), אינו קורא ל־`malloc`, אינו נוגע ב־Loader Lock, ואינו משתמש ב־`SwitchToThread()` או במגבלת `retry` קצרה שעלולה לקרוס שגוית תחת preemption של הכותב.
+הפתרון מבטל לחלוטין גם את השחתת ה־Red Zone (ממצא בודק 3) וגם כל סכנת preemption / deadlock ב־VEH (ממצא בודק 2):
 
-#### מבנה הנתונים האטומי (2 תאים + Event קרנל מוקצה מראש)
-```c
-#include <stdatomic.h>
-
-typedef struct {
-    _Atomic uint64_t start;
-    _Atomic uint64_t end;
-} afw_dn_range;
-
-/* שני תאים מתחלפים: הכותב לעולם אינו כותב לתא שאליו g_dn_state מצביע כרגע. */
-static afw_dn_range     g_dn_slot[2];
-/* פריסת g_dn_state:
- *   bit 0:     active (1 = בתוך decommit->commit, 0 = לא פעיל)
- *   bit 1:     slot index (0 או 1)
- *   bits 2..63: מונה דור (generation) מונוטוני עולה */
-static _Atomic uint64_t g_dn_state;
-/* Windows: manual-reset Event שמוקצה פעם אחת באתחול ה-VMA (CreateEventW(NULL, TRUE, TRUE, NULL)):
- *          המתנה עליו ב-WaitForSingleObject היא קריאת קרנל ישירה (NtWaitForSingleObject)
- *          בלי אף נעילת user-mode, בלי הקצאות heap, ובלי Loader Lock. */
-```
-
-#### פרוטוקול הכותב (`do_dontneed`, תחת `g_lock` לכל אורך החלון)
-1. **החזקת `g_lock` (`SRWLOCK`) לכל אורך `decommit -> recommit`:** מונעת מחוט אחר לבצע `mprotect(PROT_NONE)` או `munmap` באמצע החלון (אין בלבול בין דף שפורק זמנית ל־`PROT_NONE` לוגי).
-2. **הגבלה קשיחה למיפויים פרטיים אנונימיים בלבד (`MAP_PRIVATE | MAP_ANONYMOUS`):** `do_dontneed` לעולם אינו מבצע `decommit+recommit` על `VMA_FILEMAP` או `MAP_SHARED` (מחזיר `0` ללא שינוי נתונים).
-3. **מדוע הכותב לעולם אינו יכול להיחסם מול נעילה שמחזיק החוט הנפגע (הוכחת אי־deadlock):** כל עוד `active == 1`, הכותב מבצע **אך ורק** `VirtualFree(MEM_DECOMMIT)` ו־`VirtualAlloc(MEM_COMMIT)` — הוא לעולם אינו רוכש נעילת אפליקציה, Loader Lock, heap lock, או futex. לכן הסיבה היחידה שחלון `active == 1` מתארך היא השהיה זמנית (preemption) של הכותב ע"י מתזמן מערכת ההפעלה.
-4. **פרסום הטווח (כותב יחיד תחת `g_lock`):**
-   - `uint64_t cur = atomic_load_explicit(&g_dn_state, memory_order_relaxed);`
-   - `uint64_t next_gen = (cur >> 2) + 1;`
-   - `unsigned next_slot = (unsigned)(next_gen & 1u);` *(התא הלא־פעיל! אף קורא בדור `cur >> 2` לא קורא ממנו.)*
-   - `atomic_store_explicit(&g_dn_slot[next_slot].start, ext.start, memory_order_relaxed);`
-   - `atomic_store_explicit(&g_dn_slot[next_slot].end,   ext.end,   memory_order_relaxed);`
-   - `ResetEvent(g_dn_event);` *(מכבה את האירוע **לפני** פרסום `active = 1` — מבטל missed-wakeup!)*
-   - `uint64_t active_st = (next_gen << 2) | ((uint64_t)next_slot << 1) | 1u;`
-   - `atomic_store_explicit(&g_dn_state, active_st, memory_order_release);` *(מפרסם `start`/`end` + `active=1` אטומית.)*
-5. מבצע `os_decommit(ext.start, len)` ואז `os_commit(ext.start, len, prot)`.
-6. **סגירת החלון בכל מסלול יציאה (כולל כשל `MEM_COMMIT` / OOM!):**
-   - `uint64_t idle_st = (next_gen << 2) | ((uint64_t)next_slot << 1) | 0u;`
-   - `atomic_store_explicit(&g_dn_state, idle_st, memory_order_release);`
-   - `SetEvent(g_dn_event);` *(מעיר בקרנל כל חוט VEH שממתין — תמיד **אחרי** `active=0`!)*
-   - מתבצע **לפני** החזרת `-ENOMEM` ולפני שחרור `g_lock`.
-
-#### הוכחת אי־ערבוב ופרוטוקול הקורא (`vma_dontneed_veh`, חסר נעילות user-mode, עמיד ל־Preemption)
-1. מסנן מיד: `ExceptionCode == EXCEPTION_ACCESS_VIOLATION`, `NumberParameters >= 2`, `fault_addr >= 0x10000`.
-2. קורא snapshot אטומי:
-   - `uint64_t st1 = atomic_load_explicit(&g_dn_state, memory_order_acquire);`
-   - אם `st1 == 0`: לא רץ `dontneed` מעולם -> `EXCEPTION_CONTINUE_SEARCH`.
-   - `unsigned slot = (unsigned)((st1 >> 1) & 1u);`
-   - `uint64_t lo = atomic_load_explicit(&g_dn_slot[slot].start, memory_order_relaxed);`
-   - `uint64_t hi = atomic_load_explicit(&g_dn_slot[slot].end,   memory_order_relaxed);`
-   - `uint64_t st2 = atomic_load_explicit(&g_dn_state, memory_order_acquire);`
-   - **למה `(lo, hi)` לעולם אינו מעורבב משתי פעולות שונות:** הכותב לעולם אינו נוגע ב־`g_dn_slot[slot]` כל עוד `g_dn_state` נמצא בדור `st1 >> 2`; הוא כותב לתא `slot ^ 1` רק בדור `(st1 >> 2) + 1`, ויחזור לכתוב ל־`slot` רק בדור `(st1 >> 2) + 2`. לכן כל עוד `(st2 >> 2) <= (st1 >> 2) + 1`, הזוג `(lo, hi)` שייך **במלואו** לדור `st1 >> 2`; ואם `(st2 >> 2) >= (st1 >> 2) + 2`, הפעולה של `st1` כבר הסתיימה מזמן.
-3. **המתנה עמידה ל־Preemption (ללא קריסה שגויה וללא לולאה אינסופית):**
-   - **מקרה א' (`(st1 & 1) == 1` — `dontneed` פעיל כרגע) ו־`fault_addr` ב־`[lo, hi)` (או `st2 != st1`):**
-     - **מסלול מהיר (ללא syscall):** עד `256` מחזורי `_mm_pause()` בבדיקה `atomic_load_acquire(&g_dn_state) != st1` (מכסה מיקרו־שניות כשהכותב רץ על ליבה אחרת).
-     - **מסלול Preemption (המתנה אמיתית בקרנל):** אם `atomic_load_acquire(&g_dn_state) == st1` עדיין מתקיים (הכותב הושעה ע"י המתזמן!), קוראים ל־`WaitForSingleObject(g_dn_event, 5000)` *(קריאת קרנל ישירה, מפנה את ה־CPU מיד לחוט הכותב, אפס נעילות user-mode; **[השערה — תאומת בניסוי ייעודי ב־Windows CI ב־G2-3]**)*.
-     - **אין missed-wakeup:** כי הכותב קורא `ResetEvent` לפני פרסום `active_st`, וקורא `SetEvent` אחרי פרסום `idle_st`. גם אם כותב חדש הספיק להריץ `ResetEvent` לדור `g+1`, ההמתנה מתעוררת מיד בסיום `g+1` ורואה `g_dn_state != st1`.
-     - **מה קורה אם הכותב נתקע או מת קטסטרופלית?** אם חלפו `5000 ms` (`WAIT_TIMEOUT`) ו־`atomic_load_acquire(&g_dn_state) == st1` עדיין פעיל — ה־VEH רושם אבחון שגיאה ומחזיר `EXCEPTION_CONTINUE_SEARCH` (קריסה מדווחת, **לעולם לא hang שקט**).
-     - **מה קורה אם הכותב הסתיים (או נכשל ב־OOM וסגר את החלון ל־`active=0`)?** ה־VEH בודק תקרת retry של **פעם אחת בלבד** לכל `(fault_addr, st1 >> 2)` (`t_dn_retry_addr`, `t_dn_retry_gen`) ומחזיר `EXCEPTION_CONTINUE_EXECUTION`. אם העמוד באמת חזר — ההוראה מצליחה; אם `os_commit` נכשל (OOM) או שהייתה כתיבה ל־`PROT_READ`, הפגיעה השנייה רואה `active == 0` ו־`(fault_addr, gen)` שכבר נוסה פעם אחת -> `EXCEPTION_CONTINUE_SEARCH` -> קריסה תקינה!
-   - **מקרה ב' (`(st1 & 1) == 0` — `dontneed` בדיוק הסתיים לפני כניסת ה־VEH) ו־`fault_addr` ב־`[lo, hi)`:**
-     - אם `(t_dn_retry_addr != fault_addr || t_dn_retry_gen != (st1 >> 2))`: רושמים אותם ומחזירים `EXCEPTION_CONTINUE_EXECUTION` **פעם אחת בדיוק**.
-     - בכל פגיעה חוזרת באותו `(fault_addr, gen)` -> `EXCEPTION_CONTINUE_SEARCH`.
-4. **מגבלה מתועדת:** גישה ממצב קרנל (כמו `ReadFile`/`WriteFile` ישירות לבאפר שעובר `MADV_DONTNEED` במקביל) אינה עוברת ב־user-mode VEH ועלולה להחזיר `ERROR_NOACCESS` (`EFAULT`).
+1. **החזקת `g_lock` (`SRWLOCK`) של `src/vma.c` לכל אורך `do_dontneed`:** מונעת מחוט אחר לבצע `mprotect` או `munmap` במקביל.
+2. **הגבלה קשיחה למיפויים פרטיים אנונימיים בלבד (`MAP_PRIVATE | MAP_ANONYMOUS`):** על `VMA_FILEMAP` או `MAP_SHARED`, `MADV_DONTNEED` הוא no-op בטוח (`return 0`), ולעולם אינו משנה נתוני קובץ/נתונים משותפים.
+3. **טיפול לפי מצב ה־extent (`w->ext[i]`):**
+   - **לא ב־`MEM_COMMIT` (`!(state & P_COMMIT)`):** נשאר `MEM_RESERVE` (כבר מאופס לוגית).
+   - **עמוד `PROT_NONE` ב־`MEM_COMMIT` (`prot == 0`):** מבצע `os_decommit(start, len)` כרגיל (`state = P_MAPPED`). גישה לעמוד `PROT_NONE` ממילא אסורה וצריכה להפיל חריגה, כך שאין שום חריגות שווא ואין השחתת Red Zone — וה־commit משתחרר מיד.
+   - **עמוד נגיש עם `PROT_WRITE` (`(prot & PROT_WRITE) != 0`):** מבצע **`memset((void *)start, 0, len)`** ישירות במקום — **אפס חריגות VEH, אפס השחתת Red Zone, אפס סיכון preemption!** חוטים מקבילים שקוראים מהעמוד רואים או את הערך הישן או אפסים (תואם במדויק לסמנטיקת Linux), וגישת קרנל (`ReadFile`/`WriteFile`) לעולם אינה מקבלת `ERROR_NOACCESS`!
+   - **עמוד `PROT_READ` אנונימי ללא `PROT_WRITE` (`prot != 0 && !(prot & PROT_WRITE)`):** תחת `g_lock` משנים זמנית ל־`PAGE_READWRITE` (או `PAGE_EXECUTE_READWRITE` אם `PROT_EXEC`), מאפסים ב־`memset((void *)start, 0, len)`, ומשחזרים את ההרשאה המקורית (`PAGE_READONLY` / `PAGE_EXECUTE_READ`). אם שינוי ההרשאה הזמני נכשל -> מחזירים `-ENOMEM` בלי לשנות מטא־דאטה (כלל 8). **אפס חריגות VEH.**
+4. **דחיית אופטימיזציית Commit Charge ל־G3 (מונחה־מדידה, כלל 7א):** איפוס ב־`memset(0)` אינו מחזיר Commit Charge מידית למערכת ההפעלה על דפי `RW`; שחרור Commit Charge יישקל ב־G3 רק אם מדידה אמיתית מול ART תראה לחץ זיכרון ממשי (וגם אז לעולם לא באמצעות VEH על קוד System V עם Red Zone).
 5. **בדיקות חובה (`tools/vma_test.c` — כלל 4):**
-   - **עומס רב־חוטי + בדיקת Preemption מכוונת (חובה):** (א) 8 חוטי קוראים/כותבים/אטומיים מול חוט `MADV_DONTNEED` — 0 קריסות, ערכים תקינים בלבד; (ב) **הדמיית Preemption ארוכה (`#ifdef AFW_TEST`):** השהיה מכוונת של `50 ms` בתוך חלון `decommit -> commit` (ארוכה מקוונטת מתזמן Windows) בזמן שחוט קורא פוגע בדף — חייב להמתין ב־`g_dn_event`, להמשיך בהצלחה עם **0 קריסות שגויות**!
-   - **שלילית (`PROT_READ`):** כתיבה לדף `PROT_READ` תוך כדי `MADV_DONTNEED` אינה נתקעת ב־retry וממשיכה ל־fault report.
-   - **שלילית OOM:** כשל מוזרק ב־`os_commit` (`afw_vma_test_fail_os`) סוגר את `g_dn_state` ל־`active=0` ומעיר `g_dn_event`, והקורא מדווח fault נקי (ללא hang).
-   - **שלילית timeout:** בדיקה ייעודית (עם timeout קצר בבדיקה) שהכותב תקוע בחלון -> `WAIT_TIMEOUT` -> `EXCEPTION_CONTINUE_SEARCH`, לא hang.
+   - **בדיקת עומס רב־חוטית (חובה):** 8 חוטי קוראים/כותבים/אטומיים מול חוט `MADV_DONTNEED` על `PROT_READ|PROT_WRITE` וגם על `PROT_READ` אנונימי — 0 קריסות, אפס VEH faults, ערכים תקינים (ישן או 0) ואימות איפוס מלא לאפסים.
+   - **`PROT_NONE` decommit:** אימות ש־`MADV_DONTNEED` על עמוד `PROT_NONE` ב־`MEM_COMMIT` עדיין משחרר commit (`os_decommit`) ומאפס עמוד חדש בעת `mprotect(PROT_READ|PROT_WRITE)` עוקב.
+   - **שלילית (`VMA_FILEMAP`):** `MADV_DONTNEED` על מיפוי קובץ אינו מאפס את תוכן הקובץ ומחזיר `0`.
 
 ---
 
@@ -239,17 +188,19 @@ static _Atomic uint64_t g_dn_state;
 
 ### 5.2 אילוצי Windows, יישור 64KB, וטיפול אמיתי ב־`munmap` חלקי
 
-1. **יישור `offset` ל־64KB מול 4KB:**
+1. **יישור `offset` ל־64KB מול 4KB (כולל הערת בודק 3 על `delta`):**
    - `aligned_off = offset & ~0xFFFFULL`, `delta = offset - aligned_off` (כפולה של `4KB`).
-   - ממפים view מ־`aligned_off` ומחזירים למזמין `view_base + delta` (מיושרת ל־4KB כנדרש ב־Linux).
+   - ממפים view מ־`aligned_off` ומחזירים למזמין `addr = view_base + delta` (מיושרת ל־4KB כנדרש ב־Linux).
+   - **`mapped_bytes` סופר אך ורק את הטווח הלוגי `[addr, addr + len)`** (ולא את בתי ה־`delta` שלפני `addr`), כך ש־`munmap(addr, len)` מלא אכן מגיע ל־`mapped_bytes == 0` ומשחרר את ה־view ב־`UnmapViewOfFile(view_base)`.
+   - אם `delta > 0`, מחילים `VirtualProtect(view_base, delta, PAGE_NOACCESS, &old)` על הקידומת שלפני `addr` כדי שלא תהיה נגישה.
 2. **קובץ בגודל 0 ודף סופי חלקי:**
    - `CreateFileMappingW` נכשל על קובץ של **0 בתים** (`ERROR_FILE_INVALID`). בקובץ בגודל 0: מקצים טווח `PROT_NONE` בגודל `roundup(len, 4096)` (כמו Linux: `mmap` מצליח וכל גישה גורמת ל־fault/`SIGBUS`, בלי לקרוס ב־`CreateFileMappingW`).
-   - דף סופי חלקי: ממפים עד `min(delta + len, file_size - aligned_off)`. ב־Windows, `MapViewOfFile` מאפס אוטומטית את הזנב מה־EOF עד סוף העמוד האחרון (4KB) — **נוסיף בדיקה מפורשת שמוודאת זאת ב־Windows CI**. בקשה לעמודים שלמים *מעבר* ל־`roundup(file_size, 4096)` תיענה בדחייה מתועדת (`-ENOSYS`) או תמומש כ־`PROT_NONE` (יוכרע לפי הערת בודק 2).
-3. **`munmap` חלקי אמיתי וטרנזקציוני ב־`VMA_FILEMAP` (תוקן לפי ממצאים של בודק 2!):**
+   - דף סופי חלקי: ממפים עד `min(delta + len, file_size - aligned_off)`. ב־Windows, `MapViewOfFile` מאפס אוטומטית את הזנב מה־EOF עד סוף העמוד האחרון (4KB) — **נוסיף בדיקה מפורשת שמוודאת זאת ב־Windows CI**. בקשה לעמודים שלמים *מעבר* ל־`roundup(file_size, 4096)` תיענה בדחייה מתועדת (`-ENOSYS`) או תמומש כ־`PROT_NONE`.
+3. **`munmap` חלקי אמיתי וטרנזקציוני ב־`VMA_FILEMAP` (תוקן לפי ממצאי בודק 2 ובודק 3!):**
    - ב־`src/vma.c` מפרידים ב־`winalloc` בין `kind = VMA_ANON` (`VirtualAlloc`/`VirtualFree`) לבין `kind = VMA_FILEMAP` (`MapViewOfFile`/`UnmapViewOfFile`, שומר את `view_base` המקורי לפני `delta`).
    - **פרוטוקול טרנזקציוני תלת־שלבי (מונע מצב שבו `VirtualProtect` הצליח אבל הקצאת מטא־דאטה נכשלה!):**
      1. **שלב 1 — הקצאת מטא־דאטה מראש לפני כל קריאת OS:** קוראים ל־`split_range(w, a, b, &i0, &i1)` (שמבצע `ensure_ext_cap(w, w->next + 2)` מראש; פיצול extent לשני חצאים שווי־מצב **אינו משנה את המצב הלוגי** של אף עמוד). אם הקצאת הזיכרון נכשלת -> מחזירים `-ENOMEM` מיד **בלי לקרוא ל־`VirtualProtect`**.
-     2. **שלב 2 — קריאת OS:** קוראים דרך `src/platform.c` ל־`VirtualProtect(unmap_start, unmap_len, PAGE_NOACCESS, &old)` על הטווח המשוחרר. אם `VirtualProtect` נכשל -> מריצים `coalesce_around(w, i0, i1)` (ללא הקצאה, אינו יכול להיכשל) ומחזירים `-ENOMEM` — המטא־דאטה וה־OS נשארים מסונכרנים ב־100%!
+     2. **שלב 2 — קריאת OS:** קוראים דרך `src/platform.c` ל־`VirtualProtect(unmap_start, unmap_len, PAGE_NOACCESS, &old)` על הטווח המשוחרר (**יאומת במדידה מפורשת ב־Windows CI ש־`VirtualProtect(PAGE_NOACCESS)` מצליח על תת־טווח של `MapViewOfFile(FILE_MAP_READ)`**). אם `VirtualProtect` נכשל -> מריצים `coalesce_around(w, i0, i1)` (ללא הקצאה, אינו יכול להיכשל) ומחזירים `-ENOMEM` — המטא־דאטה וה־OS נשארים מסונכרנים ב־100%.
      3. **שלב 3 — עדכון מטא־דאטה (בלתי־נכשל, אפס הקצאות):** מסמנים את ה־extents `[i0, i1)` כ־`state = 0`, מפחיתים מ־`mapped_bytes`, ומריצים `coalesce_around` (ללא `malloc`, אינו יכול להיכשל). כל גישה עתידית ל־4KB ששוחררו חוטפת `EXCEPTION_ACCESS_VIOLATION` מיד (כמו `SIGSEGV` ב־Linux).
      4. כאשר `mapped_bytes == 0`, קוראים ל־`UnmapViewOfFile(view_base)` (דרך `src/platform.c`) ומשחררים את הרשומה.
      - **מגבלה מתועדת של `VMA_FILEMAP`:** `MAP_FIXED` המנסה למפות מחדש *לתוך* חור שנוצר ע"י `munmap` חלקי בתוך view חי של `MapViewOfFile` מחזיר `-ENOSYS` (כי Windows אינו מפצל view פתוח); `MADV_DONTNEED` על `VMA_FILEMAP` הוא no-op (`return 0`).
@@ -257,7 +208,7 @@ static _Atomic uint64_t g_dn_state;
 4. **מחיקה של קובץ ממופה (`FILE_SHARE_DELETE`) וכלל 8:**
    - [`afw_os_open`](../../src/platform.c) (שורה 190) כבר פותח קבצים עם `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` **[נמדד]**.
    - **כלל 8:** כל קריאות Win32 (`CreateFileMappingW`, `MapViewOfFile`, `UnmapViewOfFile`, `VirtualProtect`) נשארות אך ורק ב־`src/platform.c`; `src/filemap.c` הוא C11 טהור, וכל שינוי במטא־דאטה קורה רק אחרי שהקריאה ל־OS הצליחה.
-   - בדיקות חובה (`tools/filemap_test.c`, Linux ASan + Windows): `MAP_SHARED|PROT_READ`, `MAP_PRIVATE|PROT_READ`, היסט 4KB שאינו כפולת 64KB, קובץ 0 בתים, דף סופי חלקי מאופס, `munmap` חלקי (בדיקה שהאמצע גורם ל־fault והצדדים נשארים קריאים!), `unlink` בזמן מיפוי, ודחיית `PROT_EXEC`/`PROT_WRITE`/`O_WRONLY`.
+   - בדיקות חובה (`tools/filemap_test.c`, Linux ASan + Windows): `MAP_SHARED|PROT_READ`, `MAP_PRIVATE|PROT_READ`, היסט 4KB שאינו כפולת 64KB (כולל בדיקת `PAGE_NOACCESS` על `delta` ו־`UnmapViewOfFile` ב־`munmap` מלא), קובץ 0 בתים, דף סופי חלקי מאופס, `munmap` חלקי (האמצע גורם ל־fault והצדדים נשארים קריאים), `unlink` בזמן מיפוי, ודחיית `PROT_EXEC`/`PROT_WRITE`/`O_WRONLY`.
 
 ---
 
@@ -274,17 +225,17 @@ static _Atomic uint64_t g_dn_state;
    - מנעול ייעודי (`SRWLOCK` / `pthread_rwlock`, נפרד לחלוטין מ־VMA lock ו־VEH) שמגן על `g_libs[]` כך ש־`dl_iterate_phdr` בזמן זריקת חריגה במקביל ל־`dlopen` לעולם לא קורא רשימה משתנה.
 2. **`__loader_add_thread_local_dtor` / `__loader_remove_thread_local_dtor`:**
    - רשומים ב־[`G1-LIBC-INIT.md`](G1-LIBC-INIT.md) שורה 183; נדרשים ל־`__cxa_thread_atexit` ב־`libc++_shared.so`.
-   - סדר teardown קשיח ביציאת חוט: רישום ה־dtors רץ **לפני** שחרור בלוק ה־TLS של החוט (ולפני `clear_child_tid` wake / `ExitThread`), ובסדר LIFO כנדרש בתקן C++.
-3. **טעינה דינמית (`dlopen`) של ספרייה עם `PT_TLS` (DTV / TLS דינמי):**
-   - הרחבת `afw_tls_get_addr` לטבלת DTV per-thread (או מילוי `libc_shared_globals->tls_modules` לאחר האורקל של בודק 2).
+   - סדר teardown קשיח ביציאת חוט: רישום ה־dtors רץ **לפני** שחרור בלוקי ה־DTV וה־TLS של החוט (ולפני `clear_child_tid` wake / `ExitThread`), ובסדר LIFO כנדרש בתקן C++.
+3. **טעינה דינמית (`dlopen`) של ספרייה עם `PT_TLS` — DTV פנימי ב־`afw_tls_get_addr` (החלטת בודק 3):**
+   - טבלת DTV per-thread שמורה בתוך `afw_thread_ctx`, הקצאה עצלה בגישה ראשונה (העתקת `.tdata` ואיפוס `.tbss`), שחרור ב־FLS **אחרי** ריצת `thread_local` destructors, ודיווח `dlpi_tls_data` מתוך אותה טבלת DTV ב־`afw_l_dl_iterate_phdr` — מנתק את G2 מתלות ב־`libc_shared_globals->tls_modules`.
 4. **חריגות C++ חוצות־ספריות וחריגה חוצת־callback של Windows:**
    - **תנאי קבלה מחייבים לבדיקת ה־unwinder (ממצא 6 של בודק 2):**
      1. ה־unwinder (`libunwind` ב־`libc++_shared.so`) מאתר דרך `dl_iterate_phdr` את ה־ELF ו־program headers (`PT_GNU_EH_FRAME`) של **שתי** הספריות (הזורקת והתופסת).
      2. מידע ה־unwind (`.eh_frame`) של הספרייה הזורקת נגיש בפועל בזמן ה־stack walk.
      3. `throw std::runtime_error("payload")` ב־DSO א' נתפס ע"י `catch (const std::runtime_error &e)` ב־DSO ב' עם תוכן הודעה מדויק (לא רק `catch (...)`).
      4. אותה חריגה חוצת־DSO עובדת גם מתוך חוט משני שנוצר ב־`pthread_create`.
-     5. destructors של משתני `thread_local` נקראים **פעם אחת בדיוק** בסיום החוט, לפני שחרור ה־TLS והספרייה שאליהם הם מתייחסים (מאומת במונה + ASan/Windows).
-   - **חריגה חוצת־callback של Windows:** ניסוי מדיד של חריגת C++ העוברת דרך גשר callback של הטוען (`.eh_frame` תקני לגשרים + בחינת `RtlInstallFunctionTableCallback` במקרה של SEH).
+     5. destructors של משתני `thread_local` נקראים **פעם אחת בדיוק** בסיום החוט, לפני שחרור ה־DTV/TLS והספרייה שאליהם הם מתייחסים (מאומת במונה + ASan/Windows).
+   - **חריגה חוצת־callback של Windows (דיוק בודק 3):** `libunwind` שב־`libc++_shared.so` קוראת DWARF `.eh_frame` דרך `dl_iterate_phdr`, **ולא** `RtlInstallFunctionTableCallback` (שמיועדת ל־SEH של Windows בלבד). לכן גשר ה־callback של הטוען יצויד ב־DWARF `.eh_frame` תקני רשום ב־`dl_iterate_phdr` (ו־`RtlInstallFunctionTableCallback` ישמש רק ל־SEH של Windows אם יידרש).
 5. **6 אתרי ה־`UNPROVEN` ב־`libc++_shared.so`:**
    - סגירתם תנאי חוסם לטעינת `libc++_shared.so` בשער G2; עדיפות להרחבת המנתח לתמיכה ב־`movzx` jump tables על פני allowlist נעול־hash, ובכל מקרה כפוף להסכמה בכתב של כל הבודקים (כלל 6).
 
@@ -294,26 +245,25 @@ static _Atomic uint64_t g_dn_state;
 
 | שלב | PR / ענף | תוכן | בודקים עיקריים |
 |---|---|---|---|
-| **G2-0** | PR #18 (`design/g2-plan`) | אישור מסמך התכנון לפני כתיבת קוד | בודק 3, בודק 2, בודק 1 |
-| **G2-1** | `exp/g2-pthread-probe` | ניסוי מדיד בלבד: syscalls של `pthread_create`/`detached`/`cond_broadcast`, trampoline אסמבלי על מחסנית Bionic, guard page, VEH + C++ unwind בחוט משני, וחזרה ל־Windows stack לפני `ExitThread` | בודק 3, בודק 2 |
-| **G2-2** | `g2-filemap` | `src/filemap.*` + `src/platform.c` + `VMA_FILEMAP` ב־`src/vma.c` (`MAP_SHARED|PROT_READ` + `MAP_PRIVATE|PROT_READ`, 64KB/4KB, קובץ 0 בתים, `munmap` חלקי טרנזקציוני עם הקצאה מראש + `PAGE_NOACCESS`, `unlink` בזמן מיפוי) + בדיקות Linux ASan & Windows | בודק 2, בודק 3 |
-| **G2-3** | `g2-vma-dontneed-mt` | `MADV_DONTNEED` מקבילי (C11 `_Atomic` double-buffered active window + Event קרנל מוקצה מראש `WaitForSingleObject(g_dn_event, 5000)` לעמידות מלאה ל־preemption + `g_lock` סביב כל החלון + שחרור חלון ב־OOM + הגבלה ל־`MAP_PRIVATE|MAP_ANONYMOUS`) + בדיקת עומס, הדמיית preemption של 50ms ובדיקות שליליות ב־`tools/vma_test.c` | בודק 3, בודק 2 |
-| **G2-4** | `g2-pthreads` | `SYS_clone` (או Fallback ליירוט `pthread_create` לפי G2-1) + `_exit_with_stack_teardown` + `SYS_set_tid_address` + חוזה C11 אטומי ל־`clear_child_tid` + הרחבת `SYS_futex` (`CMP_REQUEUE`/`REQUEUE`) + בדיקת `pthreads` מול `libc.so` | בודק 3, בודק 2 |
-| **G2-5** | `g2-cxx-dlopen-gate` | נעילת `dl_iterate_phdr`, `thread_local` dtors, `dlopen` עם `PT_TLS` דינמי, חריגות C++ חוצות־ספריות וחוצות־callback, ו־Gate G2 ב־Windows CI (או `G2a`/`G2b` אם יאושר בכתב לפי כלל 6) | בודק 1, בודק 2, בודק 3 |
+| **G2-0** | PR #18 (`design/g2-plan`) | אישור מסמך התכנון לפני כתיבת קוד (**בודק 3 אישר התחלת `G2-1`**) | בודק 3, בודק 2, בודק 1 |
+| **G2-1** | `exp/g2-pthread-probe` | ניסוי מדיד בלבד: syscalls של `pthread_create`/`detached`/`cond_broadcast`, trampoline אסמבלי על מחסנית Bionic, guard page, VEH + C++ unwind + קריאת Win32 עמוקה (`CreateFileW`/`VirtualQuery`) בחוט משני, וחזרה ל־Windows stack לפני `ExitThread` | בודק 3, בודק 2 |
+| **G2-2** | `g2-filemap` | `src/filemap.*` + `src/platform.c` + `VMA_FILEMAP` ב־`src/vma.c` (`MAP_SHARED|PROT_READ` + `MAP_PRIVATE|PROT_READ`, 64KB/4KB + `delta` `PAGE_NOACCESS`, קובץ 0 בתים, `munmap` חלקי טרנזקציוני עם הקצאה מראש + `PAGE_NOACCESS`, `unlink` בזמן מיפוי) + בדיקות Linux ASan & Windows | בודק 2, בודק 3 |
+| **G2-3** | `g2-vma-dontneed-mt` | `MADV_DONTNEED` מקבילי **ללא VEH** (`memset(0)` תחת `g_lock` על עמודים אנונימיים נגישים ב־`MEM_COMMIT`, `os_decommit` על `PROT_NONE`, no-op על `VMA_FILEMAP`/`MAP_SHARED`) + בדיקת עומס רב־חוטית ובדיקות שליליות ב־`tools/vma_test.c` | בודק 3, בודק 2 |
+| **G2-4** | `g2-pthreads` | `SYS_clone` (או Fallback ליירוט `pthread_create` לפי G2-1) + סדר `SYS_exit` בטוח (שחזור `host_rsp`/`NT_TIB` ו־`pending_stack_unmap` לפני `clear_child_tid`) + חוזה C11 אטומי ל־`clear_child_tid` + הרחבת `SYS_futex` (חלופה 1 מעל `WaitOnAddress`) + בדיקת `pthreads` מול `libc.so` | בודק 3, בודק 2 |
+| **G2-5** | `g2-cxx-dlopen-gate` | נעילת `dl_iterate_phdr`, `thread_local` dtors, DTV פנימי ב־`afw_tls_get_addr` ל־`dlopen`+`PT_TLS`, חריגות C++ חוצות־ספריות וחוצות־callback (`.eh_frame`), ו־Gate G2 ב־Windows CI (או `G2a`/`G2b` באישור כתוב של כל הבודקים לפי כלל 6) | בודק 1, בודק 2, בודק 3 |
 
 ---
 
-## 8. שאלות ממוקדות לאישור הבודקים
+## 8. סטטוס אישורים ושאלות פתוחות לבודקים
 
-### לבודק 3 (זיכרון, TLS, חוטים, VEH)
-1. **פרוטוקול `MADV_DONTNEED` האטומי ועמידות ל־Preemption (סעיף 4.2):** האם ה־double-buffered `_Atomic` state (`g_dn_slot[2]` + `g_dn_state`) + Event קרנל מוקצה מראש (`ResetEvent -> active_st -> decommit/commit -> idle_st -> SetEvent`, המתנת `WaitForSingleObject(g_dn_event, 5000)` ב־VEH ללא אף נעילת user-mode, עם `g_lock` סביב כל חלון הכותב וסגירה גם ב־OOM) עונה על כל דרישות הבטיחות שלך?
-2. **`SYS_clone`, `_exit_with_stack_teardown` ו־`clear_child_tid` (סעיפים 3.1–3.4):** האם 5 מדידות שלב 0, סימון מסלול ה־TLS כ־`[השערה]` עד שלב 0, חוזה ה־C11 האטומי ל־`clear_child_tid`, ותנאי ה־Fallback ליירוט `pthread_create` סוגרים את הסיכונים?
-3. **`SYS_futex` (`REQUEUE`/`CMP_REQUEUE`) ו־TLS דינמי:** האם להעדיף `WaitOnAddress` (חלופה 1) או טבלת waiters פנימית (חלופה 2), וב־TLS דינמי — DTV ב־`afw_tls_get_addr` או מילוי `libc_shared_globals->tls_modules` אחרי האורקל?
+### בודק 3 (זיכרון, TLS, חוטים, VEH)
+- **מאושר להתחיל מיד ב־`G2-1` (`exp/g2-pthread-probe`).**
+- שני החוסמים שלו טופלו בגרסה 5: (1) סעיף 4 הוחלף ל־`memset(0)` ללא VEH (למניעת השחתת Red Zone) + `os_decommit` על `PROT_NONE`; (2) סדר היציאה ב־`SYS_exit(60)` בסעיף 3.4א התהפך (שחזור `host_rsp`/`NT_TIB` + `pending_stack_unmap` **לפני** `afw_thread_clear_tid_once`), וכל הערות ההשלמה שולבו (קריאת Win32 עמוקה ב־`G2-1`, בדיקת `int32_t` חיובי ל־`tid`, בדיקת VMA ב־FLS חריג, `delta` ב־`VMA_FILEMAP`, ו־`.eh_frame` ב־cross-callback). תומך בפיצול `G2a`/`G2b` אם בודקים 1 ו־2 מסכימים בכתב.
 
-### לבודק 2 (Linux ABI, `filemap`, `futex`, אורקל `libc_shared_globals`)
-4. **בדיקה חוזרת של שלושת התיקונים מסבב `dd3e4e8`:** (1) המתנת `MADV_DONTNEED` ב־VEH מעל Event קרנל מוקצה מראש (עמיד ל־preemption, 0 נעילות user-mode, 5000ms watchdog, + הדמיית preemption של 50ms בבדיקה), (2) `munmap` חלקי טרנזקציוני (`split_range`/`ensure_ext_cap` לפני `VirtualProtect(PAGE_NOACCESS)`), (3) חוזה C11 אטומי מפורש ל־`clear_child_tid` (יישור 4 בתים, `atomic_store(..., seq_cst)` לפני `wake`, והחלפה ב־`SYS_set_tid_address`) + סימון מסלול `TlsSetValue` כ־`[השערה]` — האם הגרסה הזו סוגרת את כל הממצאים שלך לאישור `G2-PLAN.md`?
-5. **סטטוס אורקל `libc_shared_globals` ופיצול `G2a`/`G2b`:** מה מצב `tools/oracle/`, והאם לשמור על G2 מאוחד או להציע פיצול `G2a`/`G2b` בכתב לפי כלל 6?
+### בודק 2 (Linux ABI, `filemap`, `futex`, אורקל `libc_shared_globals`)
+1. **בדיקה חוזרת (גרסה 5):** החוסם של `MADV_DONTNEED` VEH נעלם כליל עם המעבר ל־`memset(0)` ללא VEH (על פי חוסם ה־Red Zone של בודק 3 — אפס חריגות, אפס preemption, אפס `SwitchToThread`), נוספה טרנזקציוניות מלאה ל־`munmap` חלקי ב־`VMA_FILEMAP` (`split_range`/`ensure_ext_cap` לפני `VirtualProtect(PAGE_NOACCESS)`), נוסח חוזה C11 אטומי מפורש ל־`clear_child_tid`, ומסלול ה־TLS סומן כ־`[השערה]` עד שלב 0 — האם המסמך מאושר כעת?
+2. **סטטוס אורקל `libc_shared_globals` ופיצול `G2a`/`G2b`:** מה מצב `tools/oracle/`, והאם אתה תומך בפיצול `G2a`/`G2b` בכתב לפי כלל 6 (בודק 3 כבר הביע תמיכה)?
 
-### לבודק 1 (שערי טעינה, 9 אתרי `UNPROVEN`, חריגות C++)
-6. **6 אתרי `UNPROVEN` ב־`libc++_shared.so` (PR #5 / PR #7):** האם אתה מסכים להעדיף תמיכה במנתח ב־`movzx` jump tables על פני allowlist נעול־hash לסגירת ה־6 ב־`libc++` תחת כלל 6?
-7. **שער `PROT_EXEC` ב־`filemap`, חריגות C++ ופיצול `G2a`/`G2b`:** האם דחיית `PROT_EXEC` על `filemap` ותנאי הקבלה של ה־unwinder בסעיף 6.2 תואמים את דרישות השער שלך?
+### בודק 1 (שערי טעינה, 9 אתרי `UNPROVEN`, חריגות C++)
+3. **6 אתרי `UNPROVEN` ב־`libc++_shared.so` (PR #5 / PR #7):** האם אתה מסכים להעדיף תמיכה במנתח ב־`movzx` jump tables על פני allowlist נעול־hash לסגירת ה־6 ב־`libc++` תחת כלל 6?
+4. **שער `PROT_EXEC` ב־`filemap`, תנאי הקבלה של ה־unwinder ופיצול `G2a`/`G2b`:** האם סעיפים 5 ו־6 תואמים את דרישות השער שלך, ומה עמדתך לגבי פיצול `G2a`/`G2b` בכתב לפי כלל 6?
