@@ -133,15 +133,23 @@ bionic: its constructor runs first, printf, malloc, `getenv`, `getprogname`, and
   `ReadFile`, `WriteFile`, `SetFilePointerEx`, `GetFileInformationByHandle`,
   `GetFileAttributesExW`, `DeleteFileW`, `RemoveDirectoryW`, `CloseHandle`) isolated in
   `src/platform.c` (Rule 8).
-- **Documented limits:** relative paths with a non-`AT_FDCWD` `dirfd` return `-ENOSYS`
-  (invalid `dirfd` returns `-EBADF`); `fcntl` implements `F_GETFD`/`F_SETFD`/`F_GETFL`/
-  `F_SETFL` and returns `-ENOSYS` for other commands; `/dev/null` maps to `NUL` on
-  Windows; file-backed `mmap` is G2 (`src/filemap.*`).
-- **Tests:** `tools/fd_test.c` (44 checks, Linux ASan+UBSan+`pointer-compare` and Windows)
-  and `test/g1_gate_exe.c` (required Windows CI step: ordinary NDK executable with real
-  bionic `libc.so` that prints, allocates 256KB via scudo, writes/stats/seeks/reads via
-  bionic `fopen`/`fwrite`/`fread`, tests POSIX `open(O_EXCL/O_APPEND/O_RDONLY)`/`fstat`/
-  `fcntl`/`unlink`, and exits `0`).
+- **Supported flags & documented limits:** `openat` explicitly accepts `O_RDONLY`/`O_WRONLY`/
+  `O_RDWR`, `O_CREAT`, `O_EXCL`, `O_NOCTTY`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`,
+  `O_NOFOLLOW` (`-ELOOP` on symlinks on both Linux and Windows), `O_LARGEFILE`, and
+  `O_CLOEXEC`, rejecting unsupported flags with `-EINVAL`; `lstat`/`newfstatat` with
+  `AT_SYMLINK_NOFOLLOW` reports `S_IFLNK` on symlinks (`FILE_FLAG_OPEN_REPARSE_POINT` on
+  Windows, `lstat` on Linux) while `stat` resolves to the target; relative paths with a
+  non-`AT_FDCWD` `dirfd` return `-ENOSYS` (invalid `dirfd` returns `-EBADF`); `fcntl`
+  implements `F_GETFD`/`F_SETFD`/`F_GETFL`/`F_SETFL` (toggling `O_APPEND` consistently on
+  Linux and Windows, rejecting unsupported status flags with `-EINVAL`) and returns
+  `-ENOSYS` for other commands; `/dev/null` maps to `NUL` on Windows; file-backed `mmap`
+  is G2 (`src/filemap.*`).
+- **Tests:** `tools/fd_test.c` (59 checks, Linux ASan+UBSan+`pointer-compare` and Windows,
+  including symlinks `lstat` vs `stat` + `O_NOFOLLOW`, rejected flags, `F_SETFL` `O_APPEND`
+  toggle, and `EMFILE`) and `test/g1_gate_exe.c` (required Windows CI step: ordinary NDK
+  executable with real bionic `libc.so` that prints, allocates 256KB via scudo,
+  writes/stats/seeks/reads via bionic `fopen`/`fwrite`/`fread`, tests POSIX
+  `open(O_EXCL/O_APPEND/O_RDONLY)`/`fstat`/`fcntl`/`unlink`, and exits `0`).
 
 ## Where it stood before
 

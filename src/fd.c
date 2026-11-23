@@ -29,7 +29,14 @@ _Static_assert(offsetof(afw_lnx_stat, st_ctime_s) == 104, "st_ctim offset");
 #define LNX_AT_REMOVEDIR        0x200
 #define LNX_AT_EMPTY_PATH       0x1000
 
-#define LNX_O_CLOEXEC 0x80000
+#define LNX_O_NOCTTY    0x100
+#define LNX_O_LARGEFILE 0x8000
+#define LNX_O_CLOEXEC   0x80000
+
+#define LNX_SUPPORTED_OPEN_FLAGS \
+    (AFW_O_ACCMODE | AFW_O_CREAT | AFW_O_EXCL | LNX_O_NOCTTY | \
+     AFW_O_TRUNC | AFW_O_APPEND | AFW_O_DIRECTORY | AFW_O_NOFOLLOW | \
+     LNX_O_LARGEFILE | LNX_O_CLOEXEC)
 
 #define LNX_F_GETFD 1
 #define LNX_F_SETFD 2
@@ -110,12 +117,14 @@ int64_t afw_fd_openat(int64_t dirfd, const char *path, int64_t flags, uint64_t m
 
     if (!path) return -LNX_EFAULT;
     if (path[0] == '\0') return -LNX_ENOENT;
-    if (acc == 3) return -LNX_EINVAL;
+    if (acc == 3 || (flags & ~(int64_t)LNX_SUPPORTED_OPEN_FLAGS) != 0)
+        return -LNX_EINVAL;
     rc = check_dirfd(dirfd, path);
     if (rc != 0) return rc;
 
     os_flags = (int)(flags & (AFW_O_ACCMODE | AFW_O_CREAT | AFW_O_EXCL |
-                              AFW_O_TRUNC | AFW_O_APPEND | AFW_O_DIRECTORY));
+                              AFW_O_TRUNC | AFW_O_APPEND | AFW_O_DIRECTORY |
+                              AFW_O_NOFOLLOW));
     rc = afw_os_open(path, os_flags, (uint32_t)mode, &f);
     if (rc != 0) return rc;
 
@@ -293,7 +302,7 @@ int64_t afw_fd_newfstatat(int64_t dirfd, const char *path, void *statbuf, int64_
     if (path[0] == '\0') return -LNX_ENOENT;
     rc = check_dirfd(dirfd, path);
     if (rc != 0) return rc;
-    rc = afw_os_stat(path, &info);
+    rc = afw_os_stat(path, (flags & LNX_AT_SYMLINK_NOFOLLOW) != 0, &info);
     if (rc != 0) return rc;
     fill_lnx_stat(&info, &st);
     memcpy(statbuf, &st, sizeof st);
@@ -327,6 +336,11 @@ int64_t afw_fd_fcntl(int64_t fd, int64_t cmd, int64_t arg) {
         r = g_fds[fd].flags;
         break;
     case LNX_F_SETFL:
+        if (arg & ~(int64_t)(AFW_O_ACCMODE | AFW_O_CREAT | AFW_O_EXCL |
+                             LNX_O_NOCTTY | AFW_O_TRUNC | AFW_O_APPEND | LNX_O_LARGEFILE)) {
+            r = -LNX_EINVAL;
+            break;
+        }
         g_fds[fd].flags = (g_fds[fd].flags & AFW_O_ACCMODE) | (int)(arg & AFW_O_APPEND);
         r = 0;
         break;

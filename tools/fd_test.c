@@ -17,15 +17,21 @@
 #define LNX_EMFILE   24
 #define LNX_ESPIPE   29
 #define LNX_ENOSYS   38
-#define LNX_AT_FDCWD (-100)
-#define LNX_AT_EMPTY_PATH 0x1000
+#define LNX_ELOOP    40
+#define LNX_AT_FDCWD            (-100)
+#define LNX_AT_SYMLINK_NOFOLLOW 0x100
+#define LNX_AT_EMPTY_PATH       0x1000
 #define LNX_O_CLOEXEC 0x80000
+#define LNX_O_NONBLOCK 0x800
+#define LNX_O_DIRECT   0x4000
+#define LNX_O_PATH     0x200000
 #define LNX_F_GETFD 1
 #define LNX_F_SETFD 2
 #define LNX_F_GETFL 3
 #define LNX_F_SETFL 4
 #define S_IFMT_  0170000u
 #define S_IFREG_ 0100000u
+#define S_IFLNK_ 0120000u
 
 static int g_pass, g_fail;
 static void chk(const char *name, int cond) {
@@ -130,6 +136,60 @@ int main(void) {
     chk("O_RDONLY rejects write with -EBADF", fd >= 3 && afw_fd_write(fd, "x", 1) == -LNX_EBADF && afw_fd_close(fd) == 0);
     fd = afw_fd_openat(LNX_AT_FDCWD, path, AFW_O_WRONLY, 0);
     chk("O_WRONLY rejects read with -EBADF", fd >= 3 && afw_fd_read(fd, buf, 1) == -LNX_EBADF && afw_fd_close(fd) == 0);
+
+    /* 6b. Unsupported openat flags must be rejected with -EINVAL (never silently ignored) */
+    chk("openat(O_DIRECT) -> -EINVAL", afw_fd_openat(LNX_AT_FDCWD, path, AFW_O_RDONLY | LNX_O_DIRECT, 0) == -LNX_EINVAL);
+    chk("openat(O_PATH) -> -EINVAL", afw_fd_openat(LNX_AT_FDCWD, path, AFW_O_RDONLY | LNX_O_PATH, 0) == -LNX_EINVAL);
+    chk("openat(O_NONBLOCK) -> -EINVAL", afw_fd_openat(LNX_AT_FDCWD, path, AFW_O_RDONLY | LNX_O_NONBLOCK, 0) == -LNX_EINVAL);
+    chk("openat(unknown bit 0x40000000) -> -EINVAL", afw_fd_openat(LNX_AT_FDCWD, path, AFW_O_RDONLY | 0x40000000, 0) == -LNX_EINVAL);
+
+    /* 6c. F_SETFL toggling O_APPEND on/off consistently on both Linux and Windows */
+    fd = afw_fd_openat(LNX_AT_FDCWD, path, AFW_O_RDWR | AFW_O_TRUNC | AFW_O_APPEND, 0);
+    chk("F_SETFL: open O_APPEND and write 4 bytes", fd >= 3 && afw_fd_write(fd, "1111", 4) == 4);
+    chk("F_SETFL: unsupported flag -> -EINVAL", afw_fd_fcntl(fd, LNX_F_SETFL, LNX_O_DIRECT) == -LNX_EINVAL);
+    chk("F_SETFL: clearing O_APPEND allows overwrite at offset 0",
+        afw_fd_fcntl(fd, LNX_F_SETFL, 0) == 0 &&
+        (afw_fd_fcntl(fd, LNX_F_GETFL, 0) & AFW_O_APPEND) == 0 &&
+        afw_fd_lseek(fd, 0, AFW_SEEK_SET) == 0 && afw_fd_write(fd, "22", 2) == 2 &&
+        afw_fd_lseek(fd, 0, AFW_SEEK_SET) == 0 && afw_fd_read(fd, buf, 16) == 4 &&
+        memcmp(buf, "2211", 4) == 0);
+    chk("F_SETFL: re-enabling O_APPEND writes at EOF after lseek(0)",
+        afw_fd_fcntl(fd, LNX_F_SETFL, AFW_O_APPEND) == 0 &&
+        (afw_fd_fcntl(fd, LNX_F_GETFL, 0) & AFW_O_APPEND) == AFW_O_APPEND &&
+        afw_fd_lseek(fd, 0, AFW_SEEK_SET) == 0 && afw_fd_write(fd, "33", 2) == 2 &&
+        afw_fd_lseek(fd, 0, AFW_SEEK_SET) == 0 && afw_fd_read(fd, buf, 16) == 6 &&
+        memcmp(buf, "221133", 6) == 0 && afw_fd_close(fd) == 0);
+
+    /* 6d. Symlinks: lstat (AT_SYMLINK_NOFOLLOW) vs stat, and openat(O_NOFOLLOW) -> -ELOOP */
+    {
+        const char *linkpath = "out/fd_test_link.dat";
+        int64_t lfd;
+        (void)afw_fd_unlinkat(LNX_AT_FDCWD, linkpath, 0);
+        chk("create symlink out/fd_test_link.dat -> fd_test_tmp.dat",
+            afw_os_symlink("fd_test_tmp.dat", linkpath) == 0);
+        memset(&st, 0, sizeof st);
+        chk("lstat (AT_SYMLINK_NOFOLLOW) reports S_IFLNK on symlink",
+            afw_fd_newfstatat(LNX_AT_FDCWD, linkpath, &st, LNX_AT_SYMLINK_NOFOLLOW) == 0 &&
+            (st.st_mode & S_IFMT_) == S_IFLNK_);
+        memset(&st, 0, sizeof st);
+        chk("stat (follow) reports S_IFREG and target size 6 on symlink",
+            afw_fd_newfstatat(LNX_AT_FDCWD, linkpath, &st, 0) == 0 &&
+            (st.st_mode & S_IFMT_) == S_IFREG_ && st.st_size == 6);
+        chk("openat(O_RDONLY|O_NOFOLLOW) on symlink -> -ELOOP",
+            afw_fd_openat(LNX_AT_FDCWD, linkpath, AFW_O_RDONLY | AFW_O_NOFOLLOW, 0) == -LNX_ELOOP);
+        chk("openat(O_RDWR|O_TRUNC|O_NOFOLLOW) on symlink -> -ELOOP without truncating target",
+            afw_fd_openat(LNX_AT_FDCWD, linkpath, AFW_O_RDWR | AFW_O_TRUNC | AFW_O_NOFOLLOW, 0) == -LNX_ELOOP &&
+            afw_fd_newfstatat(LNX_AT_FDCWD, path, &st, 0) == 0 && st.st_size == 6);
+        lfd = afw_fd_openat(LNX_AT_FDCWD, linkpath, AFW_O_RDONLY, 0);
+        memset(buf, 0, sizeof buf);
+        chk("openat(O_RDONLY) without O_NOFOLLOW follows symlink and reads target",
+            lfd >= 3 && afw_fd_read(lfd, buf, 16) == 6 && memcmp(buf, "221133", 6) == 0 &&
+            afw_fd_close(lfd) == 0);
+        chk("unlinkat removes symlink while keeping target file intact",
+            afw_fd_unlinkat(LNX_AT_FDCWD, linkpath, 0) == 0 &&
+            afw_fd_newfstatat(LNX_AT_FDCWD, linkpath, &st, LNX_AT_SYMLINK_NOFOLLOW) == -LNX_ENOENT &&
+            afw_fd_newfstatat(LNX_AT_FDCWD, path, &st, 0) == 0 && st.st_size == 6);
+    }
 
     /* 7. EMFILE: exhaust all AFW_MAX_FDS - 3 slots cleanly, then close and reopen */
     {

@@ -149,10 +149,21 @@ static void fill_stat_from_bhfi(const BY_HANDLE_FILE_INFORMATION *bi, afw_os_sta
     filetime_to_unix(bi->ftCreationTime,   &out->ctime_s, &out->ctime_ns);
 }
 
+static int win_is_symlink_handle(HANDLE h) {
+    FILE_ATTRIBUTE_TAG_INFO tag;
+    if (!GetFileInformationByHandleEx(h, FileAttributeTagInfo, &tag, sizeof tag))
+        return 0;
+    if (!(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+        return 0;
+    return tag.ReparseTag == IO_REPARSE_TAG_SYMLINK ||
+           tag.ReparseTag == IO_REPARSE_TAG_MOUNT_POINT;
+}
+
 int afw_os_open(const char *path, int flags, uint32_t mode, afw_os_file *out) {
     wchar_t wbuf[512], *wheap = NULL;
     const wchar_t *w;
     DWORD access, disp, share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    DWORD create_flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS;
     int acc = flags & AFW_O_ACCMODE;
     HANDLE h;
     BY_HANDLE_FILE_INFORMATION bi;
@@ -171,7 +182,22 @@ int afw_os_open(const char *path, int flags, uint32_t mode, afw_os_file *out) {
 
     w = utf8_to_wide(path, wbuf, sizeof wbuf / sizeof wbuf[0], &wheap);
     if (!w) return -22;
-    h = CreateFileW(w, access, share, NULL, disp, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+
+    if (flags & AFW_O_NOFOLLOW) {
+        /* Guard O_TRUNC | O_NOFOLLOW before CreateFileW can truncate a symlink. */
+        if (flags & AFW_O_TRUNC) {
+            HANDLE probe = CreateFileW(w, FILE_READ_ATTRIBUTES, share, NULL, OPEN_EXISTING,
+                                       FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+            if (probe != INVALID_HANDLE_VALUE) {
+                int is_lnk = win_is_symlink_handle(probe);
+                CloseHandle(probe);
+                if (is_lnk) { free(wheap); return -40; /* ELOOP */ }
+            }
+        }
+        create_flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+    }
+
+    h = CreateFileW(w, access, share, NULL, disp, create_flags, NULL);
     if (h == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
         if (err == ERROR_ACCESS_DENIED && (acc != AFW_O_RDONLY || (flags & (AFW_O_TRUNC | AFW_O_CREAT)))) {
@@ -184,6 +210,10 @@ int afw_os_open(const char *path, int flags, uint32_t mode, afw_os_file *out) {
         return win_err_to_lnx(err);
     }
     free(wheap);
+    if ((flags & AFW_O_NOFOLLOW) && win_is_symlink_handle(h)) {
+        CloseHandle(h);
+        return -40; /* ELOOP */
+    }
     if (GetFileInformationByHandle(h, &bi)) {
         int is_dir = (bi.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         if ((flags & AFW_O_DIRECTORY) && !is_dir) { CloseHandle(h); return -20; /* ENOTDIR */ }
@@ -265,29 +295,29 @@ int afw_os_fstat(afw_os_file f, afw_os_stat_info *out) {
     return 0;
 }
 
-int afw_os_stat(const char *path, afw_os_stat_info *out) {
+int afw_os_stat(const char *path, int nofollow, afw_os_stat_info *out) {
     wchar_t wbuf[512], *wheap = NULL;
     const wchar_t *w;
-    WIN32_FILE_ATTRIBUTE_DATA ad;
+    DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    DWORD attr_flags = FILE_FLAG_BACKUP_SEMANTICS | (nofollow ? FILE_FLAG_OPEN_REPARSE_POINT : 0);
+    HANDLE h;
+    BY_HANDLE_FILE_INFORMATION bi;
     if (!path || !out) return -14;
     w = utf8_to_wide(path, wbuf, sizeof wbuf / sizeof wbuf[0], &wheap);
     if (!w) return -22;
-    if (!GetFileAttributesExW(w, GetFileExInfoStandard, &ad)) {
+    h = CreateFileW(w, FILE_READ_ATTRIBUTES, share, NULL, OPEN_EXISTING, attr_flags, NULL);
+    free(wheap);
+    if (h == INVALID_HANDLE_VALUE)
+        return win_err_to_lnx(GetLastError());
+    if (!GetFileInformationByHandle(h, &bi)) {
         DWORD err = GetLastError();
-        free(wheap);
+        CloseHandle(h);
         return win_err_to_lnx(err);
     }
-    free(wheap);
-    memset(out, 0, sizeof *out);
-    out->nlink = 1;
-    if (ad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-        out->mode = 0040755u;
-    else
-        out->mode = (ad.dwFileAttributes & FILE_ATTRIBUTE_READONLY) ? 0100444u : 0100644u;
-    out->size = (int64_t)(((uint64_t)ad.nFileSizeHigh << 32) | ad.nFileSizeLow);
-    filetime_to_unix(ad.ftLastAccessTime, &out->atime_s, &out->atime_ns);
-    filetime_to_unix(ad.ftLastWriteTime,  &out->mtime_s, &out->mtime_ns);
-    filetime_to_unix(ad.ftCreationTime,   &out->ctime_s, &out->ctime_ns);
+    fill_stat_from_bhfi(&bi, out);
+    if (nofollow && win_is_symlink_handle(h))
+        out->mode = 0120777u; /* S_IFLNK | 0777 */
+    CloseHandle(h);
     return 0;
 }
 
@@ -311,6 +341,31 @@ int afw_os_unlink(const char *path, int rmdir_flag) {
         return win_err_to_lnx(err);
     }
     free(wheap);
+    return 0;
+}
+
+#ifndef SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
+#define SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE 0x2
+#endif
+
+int afw_os_symlink(const char *target, const char *linkpath) {
+    wchar_t tbuf[512], lbuf[512], *theap = NULL, *lheap = NULL;
+    const wchar_t *wt, *wl;
+    DWORD flags = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+    BOOL ok;
+    if (!target || !linkpath) return -14;
+    wt = utf8_to_wide(target, tbuf, sizeof tbuf / sizeof tbuf[0], &theap);
+    wl = utf8_to_wide(linkpath, lbuf, sizeof lbuf / sizeof lbuf[0], &lheap);
+    if (!wt || !wl) { free(theap); free(lheap); return -22; }
+    ok = CreateSymbolicLinkW(wl, wt, flags);
+    if (!ok && GetLastError() == ERROR_INVALID_PARAMETER)
+        ok = CreateSymbolicLinkW(wl, wt, 0);
+    if (!ok) {
+        DWORD err = GetLastError();
+        free(theap); free(lheap);
+        return win_err_to_lnx(err);
+    }
+    free(theap); free(lheap);
     return 0;
 }
 
@@ -406,8 +461,10 @@ int afw_os_open(const char *path, int flags, uint32_t mode, afw_os_file *out) {
     if (flags & AFW_O_CREAT) of |= O_CREAT;
     if (flags & AFW_O_EXCL) of |= O_EXCL;
     if (flags & AFW_O_TRUNC) of |= O_TRUNC;
-    if (flags & AFW_O_APPEND) of |= O_APPEND;
+    /* Do not set host O_APPEND: afw_os_write handles append under afw_fd_lock()
+     * so F_SETFL toggling O_APPEND on/off behaves identically on Linux and Windows. */
     if (flags & AFW_O_DIRECTORY) of |= O_DIRECTORY;
+    if (flags & AFW_O_NOFOLLOW) of |= O_NOFOLLOW;
     of |= O_CLOEXEC;
     fd = open(path, of, (mode_t)(mode & 0777u));
     if (fd < 0) return -errno;
@@ -462,10 +519,10 @@ int afw_os_fstat(afw_os_file f, afw_os_stat_info *out) {
     return 0;
 }
 
-int afw_os_stat(const char *path, afw_os_stat_info *out) {
+int afw_os_stat(const char *path, int nofollow, afw_os_stat_info *out) {
     struct stat st;
     if (!path || !out) return -EFAULT;
-    if (stat(path, &st) != 0) return -errno;
+    if ((nofollow ? lstat(path, &st) : stat(path, &st)) != 0) return -errno;
     fill_stat_from_posix(&st, out);
     return 0;
 }
@@ -474,6 +531,11 @@ int afw_os_unlink(const char *path, int rmdir_flag) {
     if (!path) return -EFAULT;
     if (rmdir_flag) return rmdir(path) == 0 ? 0 : -errno;
     return unlink(path) == 0 ? 0 : -errno;
+}
+
+int afw_os_symlink(const char *target, const char *linkpath) {
+    if (!target || !linkpath) return -EFAULT;
+    return symlink(target, linkpath) == 0 ? 0 : -errno;
 }
 
 int64_t afw_os_stdio_read(void *buf, size_t len) {

@@ -65,6 +65,7 @@ typedef intptr_t afw_os_file;
 #define AFW_O_TRUNC     0x0200
 #define AFW_O_APPEND    0x0400
 #define AFW_O_DIRECTORY 0x10000
+#define AFW_O_NOFOLLOW  0x20000
 
 #define AFW_SEEK_SET 0
 #define AFW_SEEK_CUR 1
@@ -86,8 +87,9 @@ int64_t afw_os_read(afw_os_file f, void *buf, size_t len);
 int64_t afw_os_write(afw_os_file f, const void *buf, size_t len, int append);
 int64_t afw_os_lseek(afw_os_file f, int64_t off, int whence);
 int     afw_os_fstat(afw_os_file f, afw_os_stat_info *out);
-int     afw_os_stat(const char *path, afw_os_stat_info *out);
+int     afw_os_stat(const char *path, int nofollow, afw_os_stat_info *out);
 int     afw_os_unlink(const char *path, int rmdir_flag);
+int     afw_os_symlink(const char *target, const char *linkpath);
 int64_t afw_os_stdio_read(void *buf, size_t len);
 int64_t afw_os_stdio_write(int std_fd, const void *buf, size_t len);
 int     afw_os_stdio_stat(int std_fd, afw_os_stat_info *out);
