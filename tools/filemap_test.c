@@ -68,28 +68,64 @@ static int64_t sc(int64_t nr, int64_t a0, int64_t a1, int64_t a2, int64_t a3, in
 
 /* ---- Fault probing (returns 1 if faulted, 0 if access succeeded) ---- */
 #if defined(_WIN32)
-static int try_read_byte(const volatile unsigned char *p, unsigned char *out) {
-    __try {
-        unsigned char v = *p;
-        if (out) *out = v;
-        return 0;
-    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ||
-                GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR
-                    ? EXCEPTION_EXECUTE_HANDLER
-                    : EXCEPTION_CONTINUE_SEARCH) {
-        return 1;
+extern char fm_read_fault[], fm_read_recover[], fm_write_fault[], fm_write_recover[];
+int fm_probe_read(const volatile unsigned char *p, unsigned char *out);
+int fm_probe_write(volatile unsigned char *p, unsigned char val);
+
+__asm__(
+    ".att_syntax prefix\n"
+    ".text\n"
+    ".globl fm_probe_read\n"
+    ".globl fm_read_fault\n"
+    ".globl fm_read_recover\n"
+    "fm_probe_read:\n\t"
+    "fm_read_fault:\n\t"
+    "movzbl (%rcx), %eax\n\t"
+    "test %rdx, %rdx\n\t"
+    "jz 1f\n\t"
+    "movb %al, (%rdx)\n"
+    "1:\n\t"
+    "xor %eax, %eax\n\t"
+    "ret\n"
+    "fm_read_recover:\n\t"
+    "mov $1, %eax\n\t"
+    "ret\n"
+
+    ".globl fm_probe_write\n"
+    ".globl fm_write_fault\n"
+    ".globl fm_write_recover\n"
+    "fm_probe_write:\n\t"
+    "fm_write_fault:\n\t"
+    "movb %dl, (%rcx)\n\t"
+    "xor %eax, %eax\n\t"
+    "ret\n"
+    "fm_write_recover:\n\t"
+    "mov $1, %eax\n\t"
+    "ret\n"
+    ".intel_syntax noprefix\n"
+);
+
+static LONG CALLBACK fm_veh_handler(EXCEPTION_POINTERS *ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_IN_PAGE_ERROR)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (ep->ContextRecord->Rip == (DWORD64)(uintptr_t)fm_read_fault) {
+        ep->ContextRecord->Rip = (DWORD64)(uintptr_t)fm_read_recover;
+        return EXCEPTION_CONTINUE_EXECUTION;
     }
+    if (ep->ContextRecord->Rip == (DWORD64)(uintptr_t)fm_write_fault) {
+        ep->ContextRecord->Rip = (DWORD64)(uintptr_t)fm_write_recover;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static int try_read_byte(const volatile unsigned char *p, unsigned char *out) {
+    return fm_probe_read(p, out);
 }
 
 static int try_write_byte(volatile unsigned char *p, unsigned char val) {
-    __try {
-        *p = val;
-        return 0;
-    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
-                    ? EXCEPTION_EXECUTE_HANDLER
-                    : EXCEPTION_CONTINUE_SEARCH) {
-        return 1;
-    }
+    return fm_probe_write(p, val);
 }
 #else
 static sigjmp_buf g_fault_jmp;
@@ -192,6 +228,13 @@ int main(void) {
     unsigned char ch = 0;
 
     setvbuf(stdout, NULL, _IONBF, 0);
+#if defined(_WIN32)
+    {
+        PVOID veh = AddVectoredExceptionHandler(1, fm_veh_handler);
+        if (!veh) { printf("ERROR: AddVectoredExceptionHandler failed\n"); return 1; }
+        (void)veh;
+    }
+#endif
     printf("=== filemap_test: Gate G2-2 read-only file-backed mmap ===\n");
 
     afw_fd_unlinkat(LNX_AT_FDCWD, f_data, 0);
