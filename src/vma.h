@@ -82,6 +82,24 @@ int afw_vma_adopt(uint64_t base, uint64_t size, const unsigned char *page_prot);
  */
 int afw_vma_forget(uint64_t base);
 
+/*
+ * Register an already-mapped read-only OS file view [view_base, view_base + view_span)
+ * in the VMA table. Any leading 64KB-alignment prefix [view_base, view_base + delta)
+ * is recorded as unmapped (not counted in mapped_bytes) and [view_base + delta,
+ * view_base + delta + logical_len) is recorded as mapped+committed with prot.
+ * Returns (int64_t)(view_base + delta) on success, or -errno on failure.
+ */
+int64_t afw_vma_register_filemap(uint64_t view_base, uint64_t view_span,
+                                 uint64_t delta, uint64_t logical_len, int prot);
+
+/*
+ * Allocate a PROT_NONE empty-filemap reservation of logical_len bytes (for
+ * 0-byte files where Windows CreateFileMappingW fails with ERROR_FILE_INVALID).
+ * Reads fault cleanly like Linux SIGBUS; madvise(DONTNEED) is a no-op; munmap
+ * releases the reservation. Returns address or -errno.
+ */
+int64_t afw_vma_alloc_empty_filemap(uint64_t logical_len, int prot);
+
 /* For tests: live Windows allocations, total metadata bytes, total extents,
  * and total OS memory calls made so far. */
 int afw_vma_alloc_count(void);
@@ -92,6 +110,8 @@ uint64_t afw_vma_os_call_count(void);
 #ifdef AFW_TEST
 /* Test hook: fail the nth next OS memory call (1 = very next, 0 = off). */
 void afw_vma_test_fail_os(int nth);
+/* Test hook: fail the nth next extent metadata growth (1 = very next, 0 = off). */
+void afw_vma_test_fail_meta(int nth);
 #endif
 
 #endif

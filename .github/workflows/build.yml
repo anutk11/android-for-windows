@@ -230,7 +230,9 @@ jobs:
           OUTBIN=out/afw-asan EXTRA_CFLAGS="-g -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined" bash tools/build_linux.sh
           OUTBIN=out/afw-asan-test EXTRA_CFLAGS="-g -DAFW_TEST -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined" bash tools/build_linux.sh
           cc -g -O1 -DAFW_TEST -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall \
-             -o out/vma_test tools/vma_test.c src/vma.c src/syscall.c src/fd.c src/platform.c
+             -o out/vma_test tools/vma_test.c src/vma.c src/filemap.c src/syscall.c src/fd.c src/platform.c
+          cc -g -O1 -DAFW_TEST -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined -Wall -Wextra \
+             -o out/filemap_test tools/filemap_test.c src/vma.c src/filemap.c src/syscall.c src/fd.c src/platform.c
           cc -g -O1 -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined -Wall -Wextra \
              -o out/fd_test tools/fd_test.c src/fd.c src/platform.c
           cc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall -Wextra \
@@ -240,10 +242,11 @@ jobs:
           set -euo pipefail
           export ASAN_OPTIONS=detect_invalid_pointer_pairs=2
           nm out/afw-asan > out/afw-asan.syms
-          if grep -Eq " (afw_vma_test_fail_os|afw_load_test_fail_adopt)$" out/afw-asan.syms; then
+          if grep -Eq " (afw_vma_test_fail_os|afw_vma_test_fail_meta|afw_load_test_fail_adopt)$" out/afw-asan.syms; then
             echo "fault injection present in non-test loader"; exit 1
           fi
           out/vma_test
+          out/filemap_test
           out/fd_test
           out/tls_layout_test
           out/afw-asan out/libhello.so
@@ -336,7 +339,7 @@ jobs:
           clang-cl /nologo /O2 /W3 /DAFW_TEST /D_CRT_SECURE_NO_WARNINGS -Wno-unused-function -Iout\zydis-amalg ^
               /Fe:out\afw-loader-test.exe /Foout\testobj\ ^
               src\main.c src\elf_loader.c src\bionic_shim.c src\platform.c src\tls_patch.c src\crash.c ^
-              src\patch.c src\syscall.c src\fd.c src\funcs.c src\vma.c src\tls_layout.c src\tls_static.c src\loader_api.c src\exec.c out\Zydis.obj ^
+              src\patch.c src\syscall.c src\fd.c src\filemap.c src\funcs.c src\vma.c src\tls_layout.c src\tls_static.c src\loader_api.c src\exec.c out\Zydis.obj ^
               /link dbghelp.lib
           if errorlevel 1 exit /b 1
           out\afw-loader-test.exe out\libhello.so --finish-fail-late=tls:out\libtls_test.so
@@ -422,8 +425,15 @@ jobs:
       - name: "VMA layer: mmap / munmap / mprotect / madvise on Windows"
         shell: cmd
         run: |
-          clang-cl /nologo /O2 /W3 /DAFW_TEST /D_CRT_SECURE_NO_WARNINGS /Fe:out\vma_test.exe /Foout\ tools\vma_test.c src\vma.c src\syscall.c src\fd.c src\platform.c
+          clang-cl /nologo /O2 /W3 /DAFW_TEST /D_CRT_SECURE_NO_WARNINGS /Fe:out\vma_test.exe /Foout\ tools\vma_test.c src\vma.c src\filemap.c src\syscall.c src\fd.c src\platform.c
           out\vma_test.exe
+      - name: "G2-2: Read-only file-backed mmap (MAP_SHARED/MAP_PRIVATE, 4KB delta, partial munmap) on Windows"
+        shell: cmd
+        run: |
+          if not exist out\fmobj mkdir out\fmobj
+          clang-cl /nologo /O2 /W3 /DAFW_TEST /D_CRT_SECURE_NO_WARNINGS /Fe:out\filemap_test.exe /Foout\fmobj\ tools\filemap_test.c src\vma.c src\filemap.c src\syscall.c src\fd.c src\platform.c
+          if errorlevel 1 exit /b 1
+          out\filemap_test.exe
       - name: "C++ exceptions: every landing pad found, nothing unproven (static)"
         shell: cmd
         run: out\afw-loader.exe out\libcxx_exception_test.so --patch-report --strict --min-landing-pads=1

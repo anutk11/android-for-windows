@@ -109,4 +109,14 @@ int afw_os_thread_join(afw_os_thread t);
 void afw_fd_lock(void);
 void afw_fd_unlock(void);
 
+/* Read-only OS file-mapping primitives (all Win32 calls stay in platform.c, Rule 8).
+ * aligned_off must be 64KB-aligned on Windows (4KB-aligned on Linux); view_len
+ * is non-zero and bounded to file_size - aligned_off by the caller.
+ * afw_os_filemap_protect accepts prot == 0 (PAGE_NOACCESS / PROT_NONE) or
+ * AFW_PROT_R (PAGE_READONLY / PROT_READ). Returns 0 or negative Linux errno. */
+int afw_os_filemap_ro(afw_os_file f, uint64_t aligned_off, size_t view_len,
+                      int shared, void **view_base_out);
+int afw_os_filemap_unmap(void *view_base, size_t view_len);
+int afw_os_filemap_protect(void *addr, size_t len, int prot);
+
 #endif

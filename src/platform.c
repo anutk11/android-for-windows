@@ -676,6 +676,42 @@ int afw_os_thread_join(afw_os_thread t) {
     return w == WAIT_OBJECT_0 ? 0 : -5;
 }
 
+int afw_os_filemap_ro(afw_os_file f, uint64_t aligned_off, size_t view_len,
+                      int shared, void **view_base_out) {
+    HANDLE hm;
+    void *view;
+    (void)shared; /* read-only view: MAP_SHARED and MAP_PRIVATE both use FILE_MAP_READ */
+    if (f == AFW_OS_FILE_INVALID || !view_len || !view_base_out) return -22;
+    hm = CreateFileMappingW((HANDLE)f, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!hm) return win_err_to_lnx(GetLastError());
+    view = MapViewOfFile(hm, FILE_MAP_READ,
+                         (DWORD)(aligned_off >> 32),
+                         (DWORD)(aligned_off & 0xffffffffu),
+                         (SIZE_T)view_len);
+    if (!view) {
+        DWORD err = GetLastError();
+        CloseHandle(hm);
+        return win_err_to_lnx(err);
+    }
+    CloseHandle(hm);
+    *view_base_out = view;
+    return 0;
+}
+
+int afw_os_filemap_unmap(void *view_base, size_t view_len) {
+    (void)view_len;
+    if (!view_base) return -22;
+    return UnmapViewOfFile(view_base) ? 0 : win_err_to_lnx(GetLastError());
+}
+
+int afw_os_filemap_protect(void *addr, size_t len, int prot) {
+    DWORD wp, old = 0;
+    if (!addr || !len) return -22;
+    if (prot & (AFW_PROT_W | AFW_PROT_X)) return -13; /* EACCES: read-only filemap */
+    wp = (prot & AFW_PROT_R) ? PAGE_READONLY : PAGE_NOACCESS;
+    return VirtualProtect(addr, (SIZE_T)len, wp, &old) ? 0 : win_err_to_lnx(GetLastError());
+}
+
 #else
 #include <errno.h>
 #include <fcntl.h>
@@ -907,5 +943,30 @@ int afw_os_thread_join(afw_os_thread t) {
     int rc = pthread_join(*pt, NULL);
     free(pt);
     return rc == 0 ? 0 : -rc;
+}
+
+int afw_os_filemap_ro(afw_os_file f, uint64_t aligned_off, size_t view_len,
+                      int shared, void **view_base_out) {
+    void *p;
+    int flags;
+    if (f == AFW_OS_FILE_INVALID || !view_len || !view_base_out) return -EINVAL;
+    flags = shared ? MAP_SHARED : MAP_PRIVATE;
+    p = mmap(NULL, view_len, PROT_READ, flags, (int)f, (off_t)aligned_off);
+    if (p == MAP_FAILED) return -errno;
+    *view_base_out = p;
+    return 0;
+}
+
+int afw_os_filemap_unmap(void *view_base, size_t view_len) {
+    if (!view_base || !view_len) return -EINVAL;
+    return munmap(view_base, view_len) == 0 ? 0 : -errno;
+}
+
+int afw_os_filemap_protect(void *addr, size_t len, int prot) {
+    int lp;
+    if (!addr || !len) return -EINVAL;
+    if (prot & (AFW_PROT_W | AFW_PROT_X)) return -EACCES;
+    lp = (prot & AFW_PROT_R) ? PROT_READ : PROT_NONE;
+    return mprotect(addr, len, lp) == 0 ? 0 : -errno;
 }
 #endif

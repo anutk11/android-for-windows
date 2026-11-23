@@ -16,6 +16,8 @@
  * All operations hold one lock (SRWLOCK on Windows, pthread mutex on host).
  */
 #include "vma.h"
+#include "filemap.h"
+#include "platform.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,13 +27,21 @@
 #define GRAN (64 * 1024ull)
 #define LNX_EINVAL 22
 #define LNX_ENOMEM 12
+#define LNX_EACCES 13
 #define LNX_ENODEV 19
 #define LNX_EEXIST 17
+#define LNX_ENOSYS 38
 
 /* per-extent state bits */
 #define P_MAPPED 0x08
 #define P_COMMIT 0x10
 #define P_PROT   0x07   /* Linux PROT_* bits */
+
+enum {
+    VMA_ANON          = 0,
+    VMA_FILEMAP       = 1,
+    VMA_FILEMAP_EMPTY = 2
+};
 
 typedef struct {
     uint64_t start;          /* inclusive, page-aligned */
@@ -40,12 +50,13 @@ typedef struct {
 } vma_ext;
 
 typedef struct {
-    uint64_t base, size;     /* the Windows reservation [base, base + size) */
+    uint64_t base, size;     /* OS reservation / file view [base, base + size) */
     uint64_t mapped_bytes;   /* sum of (end - start) over P_MAPPED extents */
     vma_ext *ext;            /* sorted partition of [base, base + size) */
     size_t next, cap;
-    unsigned char owned;         /* 1 = VMA owns the OS reservation; 0 = adopted */
+    unsigned char owned;         /* 1 = VMA owns the OS reservation/view; 0 = adopted */
     unsigned char linux_touched; /* 1 = a Linux VMA call touched this region */
+    unsigned char kind;          /* VMA_ANON / VMA_FILEMAP / VMA_FILEMAP_EMPTY */
 } winalloc;
 
 /* Sorted by base, pairwise disjoint. */
@@ -54,6 +65,7 @@ static size_t g_n, g_cap;
 static uint64_t g_os_calls;
 #ifdef AFW_TEST
 static int g_fail_os;
+static int g_fail_meta;
 #endif
 
 #if defined(_WIN32)
@@ -108,6 +120,12 @@ uint64_t afw_vma_os_call_count(void) {
 void afw_vma_test_fail_os(int nth) {
     LOCK();
     g_fail_os = nth > 0 ? nth : 0;
+    UNLOCK();
+}
+
+void afw_vma_test_fail_meta(int nth) {
+    LOCK();
+    g_fail_meta = nth > 0 ? nth : 0;
     UNLOCK();
 }
 #endif
@@ -195,6 +213,9 @@ static int ensure_ext_cap(winalloc *w, size_t need) {
  */
 static int split_range(winalloc *w, uint64_t a, uint64_t b, size_t *out_first, size_t *out_end) {
     size_t i;
+#ifdef AFW_TEST
+    if (g_fail_meta > 0 && --g_fail_meta == 0) return -1;
+#endif
     if (w->next > SIZE_MAX - 2 || ensure_ext_cap(w, w->next + 2) != 0) return -1;
     i = find_ext(w, a);
     if (w->ext[i].start < a) {
@@ -281,6 +302,7 @@ static winalloc *add(uint64_t base, uint64_t size) {
     w->cap = 8;
     w->owned = 1;
     w->linux_touched = 0;
+    w->kind = VMA_ANON;
     w->ext[0].start = base;
     w->ext[0].end = base + size;
     w->ext[0].state = 0;
@@ -389,14 +411,29 @@ static int os_protect(uint64_t a, uint64_t n, int prot) {
 static int os_free_range(uint64_t addr, uint64_t size) { (void)addr; (void)size; return 1; }
 #endif
 
-/* Release a VMA-owned Windows allocation once nothing in it is mapped.
- * Adopted library regions (owned == 0) are never released here: the loader
- * owns the VirtualAlloc (and its trailing stub reserve) and frees it after
- * afw_vma_forget(). If the OS call fails, the entry stays (still reserved). */
+/* Filemap OS wrappers routed through platform.c (Rule 8) and counted by os_tick(). */
+static int os_filemap_unmap(uint64_t base, uint64_t size) {
+    if (os_tick() != 0) return -1;
+    return afw_os_filemap_unmap((void *)(uintptr_t)base, (size_t)size) == 0 ? 0 : -1;
+}
+
+static int os_filemap_protect(uint64_t a, uint64_t n, int prot) {
+    int p = (prot & LNX_PROT_READ) ? AFW_PROT_R : 0;
+    if (os_tick() != 0) return -1;
+    return afw_os_filemap_protect((void *)(uintptr_t)a, (size_t)n, p) == 0 ? 0 : -1;
+}
+
+/* Release a VMA-owned Windows allocation or file view once nothing in it is
+ * mapped. Adopted library regions (owned == 0) are never released here: the
+ * loader owns the VirtualAlloc (and its trailing stub reserve) and frees it
+ * after afw_vma_forget(). If the OS call fails, the entry stays tracked. */
 static void release_if_empty(winalloc *w) {
+    int rc;
     if (!w->owned || w->mapped_bytes) return;
-    if (os_release(w->base, w->size) != 0) {
-        fprintf(stderr, "[vma] could not release 0x%llx (kept as reserved)\n", (unsigned long long)w->base);
+    rc = (w->kind == VMA_FILEMAP) ? os_filemap_unmap(w->base, w->size)
+                                  : os_release(w->base, w->size);
+    if (rc != 0) {
+        fprintf(stderr, "[vma] could not release 0x%llx (kept tracked)\n", (unsigned long long)w->base);
         return;
     }
     remove_alloc(w);
@@ -451,9 +488,9 @@ static int64_t mmap_locked(uint64_t addr, uint64_t len, int prot, int flags, int
     uint64_t n, base;
     int fixed = (flags & (LNX_MAP_FIXED | LNX_MAP_FIXED_NOREPLACE)) != 0;
     winalloc *w;
-    (void)off;   /* file offset: kept in the interface for file mappings (not yet) */
+    (void)off;
     if (!len || range(fixed ? addr : 0, len, &n) != 0) return -LNX_EINVAL;
-    if (!(flags & LNX_MAP_ANONYMOUS) || fd != -1) return -LNX_ENODEV;   /* files: not yet */
+    if (!(flags & LNX_MAP_ANONYMOUS) || fd != -1) return -LNX_ENODEV;
     prot &= P_PROT;
     if (fixed) {
         size_t idx;
@@ -467,6 +504,8 @@ static int64_t mmap_locked(uint64_t addr, uint64_t len, int prot, int flags, int
             }
             if ((flags & LNX_MAP_FIXED_NOREPLACE) && range_any_mapped(w, addr, addr + n))
                 return -LNX_EEXIST;
+            if (w->kind != VMA_ANON)
+                return -LNX_ENOSYS; /* documented G2 limit: cannot overlay/split a live filemap view */
             return map_extents(w, addr, n, prot) == 0 ? (int64_t)addr : -LNX_ENOMEM;
         }
         /* Reject ranges in free space that would collide with a later allocation. */
@@ -499,7 +538,8 @@ static int64_t mmap_locked(uint64_t addr, uint64_t len, int prot, int flags, int
     return (int64_t)base;
 }
 
-/* Apply fn to the parts of [addr, addr+n) that lie in Windows allocations. */
+/* Apply fn to the parts of [addr, addr+n) that lie in Windows allocations.
+ * fn returns 0 on success, or a negative Linux errno (or -1 -> -ENOMEM). */
 typedef int (*range_fn)(winalloc *w, uint64_t a, uint64_t n, int arg);
 
 static int each(uint64_t addr, uint64_t n, range_fn fn, int arg, int need_mapped) {
@@ -519,6 +559,7 @@ static int each(uint64_t addr, uint64_t n, range_fn fn, int arg, int need_mapped
         size_t idx = lower_bound_alloc(a);
         winalloc *w;
         uint64_t stop;
+        int rc;
         if (idx >= g_n || g_a[idx].base >= end)
             return need_mapped ? -LNX_ENOMEM : 0;
         w = &g_a[idx];
@@ -527,7 +568,8 @@ static int each(uint64_t addr, uint64_t n, range_fn fn, int arg, int need_mapped
             a = w->base;
         }
         stop = w->base + w->size < end ? w->base + w->size : end;
-        if (fn(w, a, stop - a, arg) != 0) return -LNX_ENOMEM;
+        rc = fn(w, a, stop - a, arg);
+        if (rc != 0) return rc < -1 ? rc : -LNX_ENOMEM;
         a = stop;   /* w may have been released by fn: never reused */
     }
     return 0;
@@ -537,30 +579,58 @@ static int do_unmap(winalloc *w, uint64_t a, uint64_t n, int arg) {
     size_t i0, i1, i, j, k;
     int rc = 0;
     (void)arg;
-    if (split_range(w, a, a + n, &i0, &i1) != 0) return -1;
+    /* Phase 1: pre-allocate metadata split capacity before any OS call. */
+    if (split_range(w, a, a + n, &i0, &i1) != 0) return -LNX_ENOMEM;
 
-    for (i = i0; i < i1;) {
-        if (w->ext[i].state & P_COMMIT) {
+    if (w->kind == VMA_FILEMAP) {
+        /* Phase 2: VirtualProtect(PAGE_NOACCESS) on mapped runs; Phase 3: update metadata. */
+        for (i = i0; i < i1;) {
+            if (!(w->ext[i].state & P_MAPPED)) { i++; continue; }
             j = i + 1;
-            while (j < i1 && (w->ext[j].state & P_COMMIT)) j++;
-            if (os_decommit(w->ext[i].start, w->ext[j - 1].end - w->ext[i].start) != 0) {
-                rc = -1;
+            while (j < i1 && (w->ext[j].state & P_MAPPED)) j++;
+            if (os_filemap_protect(w->ext[i].start, w->ext[j - 1].end - w->ext[i].start, 0) != 0) {
+                rc = -LNX_ENOMEM;
                 break;
             }
             for (k = i; k < j; k++) {
-                if (w->ext[k].state & P_MAPPED)
-                    w->mapped_bytes -= w->ext[k].end - w->ext[k].start;
+                w->mapped_bytes -= w->ext[k].end - w->ext[k].start;
                 w->ext[k].state = 0;
             }
             w->linux_touched = 1;
             i = j;
-        } else {
+        }
+    } else if (w->kind == VMA_FILEMAP_EMPTY) {
+        for (i = i0; i < i1; i++) {
             if (w->ext[i].state & P_MAPPED) {
                 w->mapped_bytes -= w->ext[i].end - w->ext[i].start;
                 w->linux_touched = 1;
             }
             w->ext[i].state = 0;
-            i++;
+        }
+    } else {
+        for (i = i0; i < i1;) {
+            if (w->ext[i].state & P_COMMIT) {
+                j = i + 1;
+                while (j < i1 && (w->ext[j].state & P_COMMIT)) j++;
+                if (os_decommit(w->ext[i].start, w->ext[j - 1].end - w->ext[i].start) != 0) {
+                    rc = -LNX_ENOMEM;
+                    break;
+                }
+                for (k = i; k < j; k++) {
+                    if (w->ext[k].state & P_MAPPED)
+                        w->mapped_bytes -= w->ext[k].end - w->ext[k].start;
+                    w->ext[k].state = 0;
+                }
+                w->linux_touched = 1;
+                i = j;
+            } else {
+                if (w->ext[i].state & P_MAPPED) {
+                    w->mapped_bytes -= w->ext[i].end - w->ext[i].start;
+                    w->linux_touched = 1;
+                }
+                w->ext[i].state = 0;
+                i++;
+            }
         }
     }
 
@@ -573,7 +643,36 @@ static int do_protect(winalloc *w, uint64_t a, uint64_t n, int prot) {
     size_t i0, i1, i, j, k;
     int rc = 0;
     prot &= P_PROT;
-    if (split_range(w, a, a + n, &i0, &i1) != 0) return -1;
+
+    if (w->kind != VMA_ANON) {
+        if (prot & LNX_PROT_EXEC) return -LNX_EACCES;
+        if (prot & LNX_PROT_WRITE) return -LNX_ENOSYS;
+        if (split_range(w, a, a + n, &i0, &i1) != 0) return -LNX_ENOMEM;
+        if (w->kind == VMA_FILEMAP) {
+            for (i = i0; i < i1;) {
+                if ((w->ext[i].state & P_PROT) == prot) { i++; continue; }
+                j = i + 1;
+                while (j < i1 && (w->ext[j].state & P_PROT) != prot) j++;
+                if (os_filemap_protect(w->ext[i].start, w->ext[j - 1].end - w->ext[i].start, prot) != 0) {
+                    rc = -LNX_ENOMEM;
+                    break;
+                }
+                for (k = i; k < j; k++)
+                    w->ext[k].state = (unsigned char)(P_MAPPED | P_COMMIT | prot);
+                w->linux_touched = 1;
+                i = j;
+            }
+        } else {
+            /* VMA_FILEMAP_EMPTY: keep OS PAGE_NOACCESS so reads still fault like Linux SIGBUS. */
+            for (i = i0; i < i1; i++)
+                w->ext[i].state = (unsigned char)(P_MAPPED | prot);
+            w->linux_touched = 1;
+        }
+        coalesce_around(w, i0, i1);
+        return rc;
+    }
+
+    if (split_range(w, a, a + n, &i0, &i1) != 0) return -LNX_ENOMEM;
 
     for (i = i0; i < i1;) {
         if (w->ext[i].state & P_COMMIT) {
@@ -582,7 +681,7 @@ static int do_protect(winalloc *w, uint64_t a, uint64_t n, int prot) {
             while (j < i1 && (w->ext[j].state & P_COMMIT) && (w->ext[j].state & P_PROT) != prot) j++;
             /* PROT_NONE keeps contents: VirtualProtect(PAGE_NOACCESS), never decommit */
             if (os_protect(w->ext[i].start, w->ext[j - 1].end - w->ext[i].start, prot) != 0) {
-                rc = -1;
+                rc = -LNX_ENOMEM;
                 break;
             }
             for (k = i; k < j; k++)
@@ -593,7 +692,7 @@ static int do_protect(winalloc *w, uint64_t a, uint64_t n, int prot) {
             j = i + 1;
             while (j < i1 && !(w->ext[j].state & P_COMMIT)) j++;
             if (os_commit(w->ext[i].start, w->ext[j - 1].end - w->ext[i].start, prot) != 0) {
-                rc = -1;
+                rc = -LNX_ENOMEM;
                 break;
             }
             for (k = i; k < j; k++)
@@ -615,21 +714,23 @@ static int do_dontneed(winalloc *w, uint64_t a, uint64_t n, int arg) {
     size_t i0, i1, i;
     int rc = 0;
     (void)arg;
-    if (split_range(w, a, a + n, &i0, &i1) != 0) return -1;
+    /* MADV_DONTNEED on file-backed / shared mappings is a safe no-op (never zeroes file data). */
+    if (w->kind != VMA_ANON) return 0;
+    if (split_range(w, a, a + n, &i0, &i1) != 0) return -LNX_ENOMEM;
 
     for (i = i0; i < i1; i++) {
         uint64_t len = w->ext[i].end - w->ext[i].start;
         int prot = w->ext[i].state & P_PROT;
         if (!(w->ext[i].state & P_COMMIT)) continue;      /* reserved stays reserved */
         if (os_decommit(w->ext[i].start, len) != 0) {     /* drop contents */
-            rc = -1;
+            rc = -LNX_ENOMEM;
             break;
         }
         w->ext[i].state = P_MAPPED;                       /* now truthfully reserved */
         w->linux_touched = 1;
         if (prot) {                                       /* accessible: zeros back now */
             if (os_commit(w->ext[i].start, len, prot) != 0) {
-                rc = -1;
+                rc = -LNX_ENOMEM;
                 break;
             }
             w->ext[i].state = (unsigned char)(P_MAPPED | P_COMMIT | prot);
@@ -644,6 +745,8 @@ static int do_dontneed(winalloc *w, uint64_t a, uint64_t n, int arg) {
 
 int64_t afw_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, int64_t off) {
     int64_t r;
+    if (!(flags & LNX_MAP_ANONYMOUS))
+        return afw_filemap_mmap(addr, len, prot, flags, fd, off);
     LOCK();
     r = mmap_locked(addr, len, prot, flags, fd, off);
     UNLOCK();
@@ -664,6 +767,7 @@ int64_t afw_mprotect(uint64_t addr, uint64_t len, int prot) {
     uint64_t n;
     int64_t r;
     if ((addr & (PG - 1)) || range(addr, len, &n) != 0) return -LNX_EINVAL;
+    if (prot & ~P_PROT) return -LNX_EINVAL;
     if (!len) return 0;
     LOCK();
     r = each(addr, n, do_protect, prot, 1);
@@ -761,6 +865,7 @@ int afw_vma_adopt(uint64_t base, uint64_t size, const unsigned char *page_prot) 
     w->cap = cap;
     w->owned = 0;
     w->linux_touched = 0;
+    w->kind = VMA_ANON;
     UNLOCK();
     return 0;
 }
@@ -775,4 +880,76 @@ int afw_vma_forget(uint64_t base) {
     remove_alloc(w);
     UNLOCK();
     return 0;
+}
+
+int64_t afw_vma_register_filemap(uint64_t view_base, uint64_t view_span,
+                                 uint64_t delta, uint64_t logical_len, int prot) {
+    size_t idx;
+    winalloc *w;
+    if (!view_base || (view_base & (PG - 1)) || !logical_len || (logical_len & (PG - 1)) ||
+        (delta & (PG - 1)) || delta + logical_len != view_span ||
+        view_base > UINT64_MAX - view_span)
+        return -LNX_EINVAL;
+    prot &= P_PROT;
+
+    LOCK();
+    idx = lower_bound_alloc(view_base);
+    if (idx < g_n && g_a[idx].base < view_base + view_span) {
+        UNLOCK();
+        return -LNX_ENOMEM;
+    }
+    w = add(view_base, view_span);
+    if (!w) {
+        UNLOCK();
+        return -LNX_ENOMEM;
+    }
+    w->kind = VMA_FILEMAP;
+    w->owned = 1;
+    w->mapped_bytes = logical_len;
+    if (delta == 0) {
+        w->next = 1;
+        w->ext[0].start = view_base;
+        w->ext[0].end = view_base + logical_len;
+        w->ext[0].state = (unsigned char)(P_MAPPED | P_COMMIT | prot);
+    } else {
+        /* Prefix [view_base, view_base + delta) is unmapped (PAGE_NOACCESS) and
+         * excluded from mapped_bytes so full munmap(addr, len) releases view_base. */
+        w->next = 2;
+        w->ext[0].start = view_base;
+        w->ext[0].end = view_base + delta;
+        w->ext[0].state = 0;
+        w->ext[1].start = view_base + delta;
+        w->ext[1].end = view_base + view_span;
+        w->ext[1].state = (unsigned char)(P_MAPPED | P_COMMIT | prot);
+    }
+    UNLOCK();
+    return (int64_t)(view_base + delta);
+}
+
+int64_t afw_vma_alloc_empty_filemap(uint64_t logical_len, int prot) {
+    uint64_t base;
+    winalloc *w;
+    if (!logical_len || (logical_len & (PG - 1))) return -LNX_EINVAL;
+    prot &= P_PROT;
+
+    LOCK();
+    if (os_reserve(0, logical_len, &base) != 0) {
+        UNLOCK();
+        return -LNX_ENOMEM;
+    }
+    w = add(base, logical_len);
+    if (!w) {
+        os_release(base, logical_len);
+        UNLOCK();
+        return -LNX_ENOMEM;
+    }
+    w->kind = VMA_FILEMAP_EMPTY;
+    w->owned = 1;
+    w->mapped_bytes = logical_len;
+    w->next = 1;
+    w->ext[0].start = base;
+    w->ext[0].end = base + logical_len;
+    w->ext[0].state = (unsigned char)(P_MAPPED | prot); /* not P_COMMIT -> stays PAGE_NOACCESS */
+    UNLOCK();
+    return (int64_t)base;
 }
