@@ -87,6 +87,22 @@ What it took, in the order the measurements showed:
 Diagnosis tools that came out of this: `--watchdog=N` (native stack by name, last
 syscall and caller), and safe crash reports.
 
+## An executable up to main (PR #16)
+
+An ordinary NDK executable (`test/hello_exe.c`) runs `main` on Windows with the real
+bionic: its constructor runs first, printf and malloc work, `atexit` runs after `main`,
+and the exit code (42) goes out through `exit_group`. This is a required CI step.
+
+- `src/exec.c` builds the initial stack exactly as the kernel leaves it (argc | argv |
+  NULL | envp | NULL | auxv) on the thread's real stack (`alloca`, which probes pages
+  downward the way Windows grows a stack), passes libc the same auxv, environment and
+  name through the shared globals, then jumps to `_start` with rbp = rdx = 0.
+- `test/exec_min.c` (no libc) checks every field of the stack, with a separate exit code
+  for each wrong field.
+- Syscalls still answered with ENOSYS along this path: faccessat, newfstatat, openat (the
+  property area `/dev/__properties__`), rt_sigaction, sched_getaffinity, fstat. libc lives
+  with all of them; they're next in line (files, signals).
+
 ## Where it stood before
 
 With the TCB fixed (below) and `writev` in place, the constructors no longer crash. libc
