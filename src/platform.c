@@ -379,6 +379,7 @@ int afw_os_unlink(const char *path, int rmdir_flag) {
     wchar_t wbuf[512], *wheap = NULL;
     const wchar_t *w;
     BOOL ok;
+    DWORD err = 0;
     if (!path) return -14;
     w = utf8_to_wide(path, wbuf, sizeof wbuf / sizeof wbuf[0], &wheap);
     if (!w) return -22;
@@ -388,13 +389,18 @@ int afw_os_unlink(const char *path, int rmdir_flag) {
             return -20; /* ENOTDIR: rmdir on symlink */
         }
         ok = RemoveDirectoryW(w);
+        if (!ok) err = GetLastError();
     } else {
         ok = DeleteFileW(w);
-        if (!ok && GetLastError() == ERROR_ACCESS_DENIED && win_probe_is_symlink(w))
-            ok = RemoveDirectoryW(w); /* directory symlink: unlink removes link */
+        if (!ok) {
+            err = GetLastError();
+            if (err == ERROR_ACCESS_DENIED && win_probe_is_symlink(w)) {
+                ok = RemoveDirectoryW(w); /* directory symlink: unlink removes link */
+                if (!ok) err = GetLastError();
+            }
+        }
     }
     if (!ok) {
-        DWORD err = GetLastError();
         if (!rmdir_flag && err == ERROR_ACCESS_DENIED) {
             DWORD a = GetFileAttributesW(w);
             if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) {
@@ -412,13 +418,15 @@ int afw_os_mkdir(const char *path, uint32_t mode) {
     wchar_t wbuf[512], *wheap = NULL;
     const wchar_t *w;
     BOOL ok;
+    DWORD err;
     (void)mode;
     if (!path) return -14;
     w = utf8_to_wide(path, wbuf, sizeof wbuf / sizeof wbuf[0], &wheap);
     if (!w) return -22;
     ok = CreateDirectoryW(w, NULL);
+    err = ok ? 0 : GetLastError();
     free(wheap);
-    return ok ? 0 : win_err_to_lnx(GetLastError());
+    return ok ? 0 : win_err_to_lnx(err);
 }
 
 #ifndef SYMBOLIC_LINK_FLAG_DIRECTORY
