@@ -748,8 +748,9 @@ int main(void) {
 
     /* Item 2 */
     if (!run_thread_test(item2_thread, &r2, NULL)) r2 = 0;
-    printf("VERDICT Item 2 (Trampoline stack switch + non-ret jmp resume + NT_TIB/DeallocationStack restore): %s\n",
+    printf("VERDICT Item 2a (Generic trampoline stack switch + non-ret jmp resume + NT_TIB/DeallocationStack restore): %s\n",
            r2 ? "PASS" : "FAIL");
+    printf("VERDICT Item 2b (Full live Bionic __bionic_clone child_stack/rbp+16 resume path): NOT TESTED (blocked by Item 1b static_tls_layout prerequisite)\n");
     fails += !r2;
 
     /* Item 3 */
@@ -816,7 +817,7 @@ int main(void) {
 
     if (hdll) FreeLibrary(hdll);
     RemoveVectoredExceptionHandler(veh);
-    printf("\nG2-1 Windows probe summary: %s (failures=%d; Items 3b and 4c-dwarf explicitly NOT TESTED)\n",
+    printf("\nG2-1 Windows probe summary: %s (failures=%d; Items 2b, 3b, and 4c-dwarf explicitly NOT TESTED)\n",
            fails ? "FAIL" : "ALL EXECUTED WINDOWS ITEMS PASSED", fails);
     return fails ? 1 : 0;
 }
