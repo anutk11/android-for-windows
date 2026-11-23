@@ -293,14 +293,18 @@ jobs:
           out\afw-loader.exe out\exec_min --exec hello > nul 2>&1
           if not %errorlevel% equ 11 (echo wrong argc exited %errorlevel%, not 11 & exit /b 1)
           exit /b 0
-      - name: "G1: an ordinary Android executable runs main() with the real libc - informational"
-        continue-on-error: true
+      - name: "G1: an ordinary Android executable runs main() with the real libc (required)"
         timeout-minutes: 3
         shell: cmd
         run: |
           set AFW_LIB_PATH=out\bionic
-          out\afw-loader.exe out\hello_exe --with-deps --watchdog=60 --exec world 2>&1
-          echo exit code %errorlevel%
+          out\afw-loader.exe out\hello_exe --with-deps --watchdog=60 --exec world > out\hello-exe.txt 2>&1
+          set rc=%errorlevel%
+          type out\hello-exe.txt
+          if not "%rc%"=="42" (echo hello_exe exited %rc%, not 42 & exit /b 1)
+          findstr /c:"constructor=1" out\hello-exe.txt >nul || (echo main did not run after the constructor & exit /b 1)
+          findstr /c:"atexit handler ran" out\hello-exe.txt >nul || (echo atexit did not run & exit /b 1)
+          exit /b 0
       - name: "G1: Android code calling the REAL libc.so on Windows (required)"
         timeout-minutes: 3
         shell: cmd
