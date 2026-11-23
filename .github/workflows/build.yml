@@ -206,15 +206,20 @@ jobs:
           path: out
       - name: Build loader and VMA tests with ASan + UBSan
         run: |
-          OUTBIN=out/afw-asan EXTRA_CFLAGS="-g -fsanitize=address,undefined -fno-sanitize-recover=undefined" bash tools/build_linux.sh
+          OUTBIN=out/afw-asan EXTRA_CFLAGS="-g -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined" bash tools/build_linux.sh
+          OUTBIN=out/afw-asan-test EXTRA_CFLAGS="-g -DAFW_TEST -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined" bash tools/build_linux.sh
           cc -g -O1 -DAFW_TEST -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall \
              -o out/vma_test tools/vma_test.c src/vma.c src/syscall.c src/platform.c
           cc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall -Wextra \
              -o out/tls_layout_test tools/tls_layout_test.c src/tls_layout.c
       - name: Run all tests under ASan
         run: |
-          set -e
-          if nm out/afw-asan | grep -q afw_vma_test_fail_os; then echo "fault injection present in non-test loader"; exit 1; fi
+          set -euo pipefail
+          export ASAN_OPTIONS=detect_invalid_pointer_pairs=2
+          nm out/afw-asan > out/afw-asan.syms
+          if grep -Eq " (afw_vma_test_fail_os|afw_load_test_fail_adopt)$" out/afw-asan.syms; then
+            echo "fault injection present in non-test loader"; exit 1
+          fi
           out/vma_test
           out/tls_layout_test
           out/afw-asan out/libhello.so
@@ -222,7 +227,17 @@ jobs:
           out/afw-asan out/libredzone_test.so
           out/afw-asan out/libtls_test.so
           out/afw-asan out/libifunc_test.so
-          out/afw-asan out/libdeps_user.so --with-deps
+          out/afw-asan out/libdeps_user.so --with-deps --finish-fail=out/libdeps_user.so | tee out/finish-fail.txt
+          grep -q "lib_finish failure cleaned up cleanly" out/finish-fail.txt
+          # late lib_finish() failures (after TLS close / IFUNC): quarantine cleanly, no UAF/orphan TLS/leak
+          out/afw-asan-test out/libhello.so --finish-fail-late=tls:out/libtls_test.so | tee out/finish-fail-late-tls.txt
+          grep -q "late TLS lib_finish failure quarantined cleanly" out/finish-fail-late-tls.txt
+          out/afw-asan-test out/libhello.so --finish-fail-late=ifunc:out/libifunc_test.so | tee out/finish-fail-late-ifunc.txt
+          grep -q "late IFUNC lib_finish failure quarantined cleanly" out/finish-fail-late-ifunc.txt
+          out/afw-asan-test out/libhello.so --finish-fail-late=dep:out/libdeps_user.so | tee out/finish-fail-late-dep.txt
+          grep -q "late dep-set lib_finish failure kept base loaded and quarantined user" out/finish-fail-late-dep.txt
+          out/afw-asan-test out/libhello.so --finish-fail-late=stress:out/libifunc_test.so | tee out/finish-fail-late-stress.txt
+          grep -q "stress test: 70 late lib_finish failures quarantined cleanly" out/finish-fail-late-stress.txt
           # a refused library (PT_TLS + fs:[reg], refused on Linux) leaves nothing behind
           out/afw-asan out/libtls_test.so --preload-fail=out/libtls_ie_test.so | tee out/preload.txt
           grep -q "refused, and nothing left behind" out/preload.txt
@@ -281,7 +296,25 @@ jobs:
           exit /b 0
       - name: "Dependencies: a library's import resolves to its loaded DT_NEEDED library"
         shell: cmd
-        run: out\afw-loader.exe out\libdeps_user.so --with-deps
+        run: out\afw-loader.exe out\libdeps_user.so --with-deps --finish-fail=out\libdeps_user.so
+      - name: "Late lib_finish failures (after TLS close / IFUNC): quarantine cleanly"
+        shell: cmd
+        run: |
+          if not exist out\testobj mkdir out\testobj
+          clang-cl /nologo /O2 /W3 /DAFW_TEST /D_CRT_SECURE_NO_WARNINGS -Wno-unused-function -Iout\zydis-amalg ^
+              /Fe:out\afw-loader-test.exe /Foout\testobj\ ^
+              src\main.c src\elf_loader.c src\bionic_shim.c src\platform.c src\tls_patch.c src\crash.c ^
+              src\patch.c src\syscall.c src\funcs.c src\vma.c src\tls_layout.c src\tls_static.c src\loader_api.c out\Zydis.obj ^
+              /link dbghelp.lib
+          if errorlevel 1 exit /b 1
+          out\afw-loader-test.exe out\libhello.so --finish-fail-late=tls:out\libtls_test.so
+          if errorlevel 1 exit /b 1
+          out\afw-loader-test.exe out\libhello.so --finish-fail-late=ifunc:out\libifunc_test.so
+          if errorlevel 1 exit /b 1
+          out\afw-loader-test.exe out\libhello.so --finish-fail-late=dep:out\libdeps_user.so
+          if errorlevel 1 exit /b 1
+          out\afw-loader-test.exe out\libhello.so --finish-fail-late=stress:out\libifunc_test.so
+          if errorlevel 1 exit /b 1
       - name: "G1: extract the real bionic on this Windows runner (never uploaded)"
         shell: bash
         run: python -I tools/fetch_bionic.py out/bionic

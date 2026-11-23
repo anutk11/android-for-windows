@@ -58,6 +58,9 @@ typedef struct afw_lib_s {
 
     /* phase A done, phase B (TLS close, IFUNC, RELRO, constructors) not yet */
     int pending;
+    int code_ran;               /* IFUNC resolver or constructor started: past rollback point */
+    int quarantined;            /* retained past point of no return (never freed/unmapped) */
+    struct afw_lib_s *quarantine_next;   /* intrusive quarantine list (zero-alloc, unbounded) */
     int vma_adopted;            /* the image is registered with the VMA layer (6e) */
     unsigned char *pageprot;
     size_t npages, relro_first, relro_last;
@@ -82,6 +85,10 @@ extern int afw_load_patch_only;
 extern int afw_load_allow_unproven;
 /* How many libraries are registered (tests: a failed load must not count). */
 int afw_loaded_count(void);
+/* How many failed libraries are quarantined (past point of no return: TLS
+ * already closed or code already ran, so mapping/TLS/struct stay live). */
+int afw_quarantined_count(void);
+const afw_lib *afw_quarantined_at(int k);
 
 /* The load gate: 1 if patching left the library provably safe to run.
  * Blocks on: unproven look-alikes, undecodable exception tables, syscall
@@ -102,6 +109,7 @@ int afw_load_with_deps(const char *path, afw_lib *lib, afw_lib *deps, int maxdep
 afw_lib *afw_lib_at(int k);                        /* k-th in load order, or NULL */
 afw_lib *afw_find_loaded(const char *name);        /* by soname or file name */
 int afw_is_loaded(const void *handle);
+int afw_is_retained(const void *handle);           /* loaded OR quarantined: do not free */
 void *afw_global_sym(const char *name);            /* RTLD_DEFAULT */
 int afw_find_lib(const char *name, char *out, size_t outsz);
 
@@ -114,5 +122,10 @@ int afw_describe_address(uintptr_t addr, char *out, size_t outsz);
 
 /* Run destructors. */
 void afw_unload(afw_lib *lib);
+
+#ifdef AFW_TEST
+/* Test hook: fail the nth next afw_vma_adopt() in lib_finish() with -ENOMEM (0 = off). */
+void afw_load_test_fail_adopt(int nth);
+#endif
 
 #endif

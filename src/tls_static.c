@@ -91,6 +91,8 @@ void afw_tls_static_free(void *block) {
 
 int afw_tls_static_finish(void) {
     int m;
+    const void *orig[AFW_TLS_MAX_MODULES] = {0};
+    void *copy[AFW_TLS_MAX_MODULES] = {0};
     if (g_finished) return 0;
     if (afw_tls_layout_finish(&g_layout) != 0) {
         fprintf(stderr, "error: static TLS layout overflow\n");
@@ -99,24 +101,30 @@ int afw_tls_static_finish(void) {
     /* Own copies of the (relocated) .tdata images from now on: a library
      * whose load fails later may release its mapping, and threads created
      * later must not read from it (reviewer 4, PR #9). */
-    {   /* all copies first, then swap: a failed malloc halfway leaves g_image
-         * untouched and frees what was copied (reviewer 4, PR #9 note) */
-        void *copy[AFW_TLS_MAX_MODULES] = {0};
-        for (m = 0; m < g_layout.nmod; m++) {
-            if (!g_seg[m].p_filesz) continue;
-            copy[m] = malloc((size_t)g_seg[m].p_filesz);
-            if (!copy[m]) {
-                while (m-- > 0) free(copy[m]);
-                fprintf(stderr, "error: out of memory copying TLS images\n");
-                return -1;
-            }
-            memcpy(copy[m], g_image[m], (size_t)g_seg[m].p_filesz);
+    /* All copies first, then swap; if thread_rebuild fails, roll back cleanly
+     * and keep g_finished = 0 so failed loads can unregister and retry works. */
+    for (m = 0; m < g_layout.nmod; m++) {
+        orig[m] = g_image[m];
+        if (!g_seg[m].p_filesz) continue;
+        copy[m] = malloc((size_t)g_seg[m].p_filesz);
+        if (!copy[m]) {
+            while (m-- > 0) free(copy[m]);
+            fprintf(stderr, "error: out of memory copying TLS images\n");
+            return -1;
         }
-        for (m = 0; m < g_layout.nmod; m++) g_image[m] = copy[m];
+        memcpy(copy[m], g_image[m], (size_t)g_seg[m].p_filesz);
+    }
+    for (m = 0; m < g_layout.nmod; m++) g_image[m] = copy[m];
+    if (afw_tls_thread_rebuild() != 0) {
+        for (m = 0; m < g_layout.nmod; m++) { g_image[m] = orig[m]; free(copy[m]); }
+        return -1;
     }
     g_finished = 1;
-    return afw_tls_thread_rebuild();
+    return 0;
 }
+
+int afw_tls_static_is_finished(void) { return g_finished; }
+int afw_tls_static_count(void) { return g_layout.nmod; }
 
 uint64_t afw_tls_static_memsz(int mod) {
     return (mod >= 1 && mod <= g_layout.nmod) ? g_seg[mod - 1].p_memsz : 0;

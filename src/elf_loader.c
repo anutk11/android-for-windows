@@ -43,6 +43,13 @@ int afw_gate_ok(const afw_lib *lib) {
 #define MAX_LIBS 64
 static afw_lib *g_libs[MAX_LIBS];
 static int g_nlibs;
+static afw_lib *g_quarantine_head;   /* intrusive list: unbounded, zero-alloc, fail-safe under OOM */
+static int g_nquarantine;
+
+#ifdef AFW_TEST
+static int g_fail_adopt;
+void afw_load_test_fail_adopt(int nth) { g_fail_adopt = nth; }
+#endif
 
 int afw_describe_address(uintptr_t addr, char *out, size_t outsz) {
     int k;
@@ -52,7 +59,7 @@ int afw_describe_address(uintptr_t addr, char *out, size_t outsz) {
         const char *best = NULL;
         uint64_t best_v = 0, off;
         size_t i;
-        if (addr < b || addr >= b + lib->size) continue;
+        if (!lib->base || addr < b || addr - b >= lib->size) continue;
         off = (uint64_t)(addr - (uintptr_t)lib->bias);
         for (i = 1; i < lib->nsyms; i++) {
             const Elf64_Sym *s = &lib->symtab[i];
@@ -325,6 +332,7 @@ static void read_build_id(const unsigned char *f, size_t n, const Elf64_Phdr *p,
 static int g_defer_finish;
 static int lib_finish(afw_lib *lib, int verbose);
 static void discard(afw_lib *lib);
+static void retire_failed(afw_lib *lib);
 
 static int load_inner(const char *path, afw_lib *lib, int verbose) {
     size_t fsize = 0, i;
@@ -736,7 +744,6 @@ static int lib_finish(afw_lib *lib, int verbose) {
     unsigned char *pageprot = lib->pageprot;
     size_t npages = lib->npages;
     lib->pageprot = NULL;
-    lib->pending = 0;
 
     if (!afw_load_patch_only) {
         /* 6b. Static TLS layout is final now: every thread block, including this
@@ -746,6 +753,7 @@ static int lib_finish(afw_lib *lib, int verbose) {
         /* 6c. IFUNC resolvers (this library's and imported ones): the first
          *     library code to run, on patched, executable code, writing into
          *     pages that are still writable */
+        if (lib->nirel) lib->code_ran = 1;
         for (i = 0; i < lib->nirel; i++) {
             typedef SYSV uint64_t (*resolver_fn)(void);
             resolver_fn r = (resolver_fn)(uintptr_t)lib->irel[i].resolver;
@@ -776,7 +784,12 @@ static int lib_finish(afw_lib *lib, int verbose) {
                                       ((pageprot[i] & PF_W) ? LNX_PROT_WRITE : 0) |
                                       ((pageprot[i] & PF_X) ? LNX_PROT_EXEC : 0));
     {
-        int rc = afw_vma_adopt((uint64_t)(uintptr_t)lib->base, (uint64_t)lib->size, pageprot);
+        int rc;
+#ifdef AFW_TEST
+        if (g_fail_adopt > 0 && --g_fail_adopt == 0) rc = -12;   /* simulated -ENOMEM */
+        else
+#endif
+        rc = afw_vma_adopt((uint64_t)(uintptr_t)lib->base, (uint64_t)lib->size, pageprot);
         if (rc != 0) {
             fprintf(stderr, "error: the VMA layer refused %s's image (%d)\n",
                     lib->soname ? lib->soname : lib->path, rc);
@@ -785,12 +798,14 @@ static int lib_finish(afw_lib *lib, int verbose) {
         lib->vma_adopted = 1;
     }
     free(pageprot);
+    lib->pending = 0;
 
     if (afw_load_patch_only) return 0;
 
     /* 7. Constructors ------------------------------------------------ */
     if (verbose) printf("Running %zu constructor(s) of %s...\n",
                         lib->init_array_count + (lib->init ? 1 : 0), lib->soname ? lib->soname : lib->path);
+    if (lib->init || lib->init_array_count) lib->code_ran = 1;
     if (lib->init) ((init_fn)(uintptr_t)lib->init)();
     for (i = 0; i < lib->init_array_count; i++) {
         uint64_t f = lib->init_array[i];
@@ -802,6 +817,14 @@ static int lib_finish(afw_lib *lib, int verbose) {
 /* A failed load leaves nothing behind (reviewer 4, #8): no entry in the
  * library list (main's lib is on its stack), no mapping, no TLS module. */
 int afw_loaded_count(void) { return g_nlibs; }
+int afw_quarantined_count(void) { return g_nquarantine; }
+const afw_lib *afw_quarantined_at(int k) {
+    const afw_lib *q;
+    if (k < 0) return NULL;
+    for (q = g_quarantine_head; q; q = q->quarantine_next)
+        if (k-- == 0) return q;
+    return NULL;
+}
 
 /* DT_NEEDED names of an ELF file on disk (without mapping it). Returns the
  * count (<= max), or -1. names point into *buf, which the caller frees. */
@@ -862,6 +885,14 @@ afw_lib *afw_find_loaded(const char *name) {
 int afw_is_loaded(const void *handle) {
     int k;
     for (k = 0; k < g_nlibs; k++) if ((const void *)g_libs[k] == handle) return 1;
+    return 0;
+}
+
+int afw_is_retained(const void *handle) {
+    const afw_lib *q;
+    if (afw_is_loaded(handle)) return 1;
+    for (q = g_quarantine_head; q; q = q->quarantine_next)
+        if ((const void *)q == handle) return 1;
     return 0;
 }
 
@@ -973,30 +1004,62 @@ int afw_load_with_deps(const char *path, afw_lib *lib, afw_lib *deps, int maxdep
     rc = prepare_with_deps(path, lib, deps, maxdeps, ndeps, verbose);
     g_defer_finish = 0;
     if (rc != 0) {                       /* nothing of the set ran: undo it, newest first */
-        for (k = g_nlibs - 1; k >= first; k--) discard(g_libs[k]);
+        for (k = g_nlibs - 1; k >= first; k--) retire_failed(g_libs[k]);
         return -1;
     }
     if (verbose) printf("\n== all %d libraries mapped and relocated; TLS layout closes now\n", g_nlibs - first);
     for (k = first; k < g_nlibs; k++)    /* dependency order: a library after the ones it needs */
         if (g_libs[k]->pending && lib_finish(g_libs[k], verbose) != 0) {
-            fprintf(stderr, "error: %s failed after library code ran; the set stays loaded\n",
-                    g_libs[k]->soname ? g_libs[k]->soname : g_libs[k]->path);
+            int j;
+            const char *who = g_libs[k]->soname ? g_libs[k]->soname : g_libs[k]->path;
+            int late = g_libs[k]->code_ran || afw_tls_static_is_finished();
+            fprintf(stderr, "error: %s failed to finish (%s); retiring it and %d unfinished library(ies)\n",
+                    who, late ? "after point of no return" : "before TLS close", g_nlibs - k - 1);
+            /* Retire [k..g_nlibs) newest first:
+             *  - Before the point of no return (no code ran and TLS module not
+             *    locked in a closed layout): discard() rolls back completely.
+             *  - After the point of no return (IFUNC ran or TLS module locked in
+             *    the closed layout): quarantine() removes the library from active
+             *    g_libs[] while keeping its mapping, TLS module, and struct alive.
+             * Earlier libraries [first..k-1] whose constructors already ran stay
+             * loaded in g_libs[] (callers check afw_is_retained()). */
+            for (j = g_nlibs - 1; j >= k; j--) retire_failed(g_libs[j]);
             return -1;
         }
     return 0;
 }
 
-static void discard(afw_lib *lib) {
+static void remove_from_registry(afw_lib *lib) {
     int k;
     for (k = 0; k < g_nlibs; k++)
-        if (g_libs[k] == lib) { memmove(&g_libs[k], &g_libs[k + 1], (size_t)(g_nlibs - k - 1) * sizeof *g_libs); g_nlibs--; break; }
-    if (lib->tls_module && afw_tls_static_unregister(lib->tls_module) != 0)
-        fprintf(stderr, "warning: TLS module of the failed library stays registered\n");
-    lib->tls_module = 0;
+        if (g_libs[k] == lib) {
+            memmove(&g_libs[k], &g_libs[k + 1], (size_t)(g_nlibs - k - 1) * sizeof *g_libs);
+            g_nlibs--;
+            break;
+        }
+}
+
+static int can_discard(const afw_lib *lib) {
+    if (lib->code_ran) return 0;
+    if (lib->tls_module && afw_tls_static_is_finished()) return 0;
+    return 1;
+}
+
+static void discard(afw_lib *lib) {
+    remove_from_registry(lib);
+    if (lib->tls_module) {
+        if (afw_tls_static_unregister(lib->tls_module) != 0)
+            fprintf(stderr, "warning: TLS module of the failed library stays registered\n");
+        else
+            lib->tls_module = 0;
+    }
     free(lib->irel); lib->irel = NULL; lib->nirel = lib->capirel = 0;
-    if (lib->vma_adopted && afw_vma_forget((uint64_t)(uintptr_t)lib->base) != 0)
-        fprintf(stderr, "warning: the VMA layer still lists the failed library\n");
-    lib->vma_adopted = 0;
+    if (lib->vma_adopted) {
+        if (afw_vma_forget((uint64_t)(uintptr_t)lib->base) != 0)
+            fprintf(stderr, "warning: the VMA layer still lists the failed library\n");
+        else
+            lib->vma_adopted = 0;
+    }
     if (lib->base) afw_mem_free(lib->base, lib->size + AFW_STUB_RESERVE);
     lib->base = NULL; lib->stub_area = NULL;
     free(lib->pageprot); lib->pageprot = NULL; lib->pending = 0;
@@ -1004,9 +1067,32 @@ static void discard(afw_lib *lib) {
     if (lib->path_owned) { free((void *)lib->path); lib->path = NULL; lib->path_owned = 0; }
 }
 
+/* Past the point of no return (IFUNC/constructors ran, or static TLS layout
+ * closed with this library's module in it): remove from active g_libs[] so no
+ * lookup returns a failed library, and link onto the unbounded intrusive
+ * quarantine list (zero allocation: cannot fail even under OOM). Keeps the
+ * mapping, TLS module, path, and afw_lib struct alive (no UAF, no orphan TLS
+ * module, reachable for LSan). */
+static void quarantine(afw_lib *lib) {
+    remove_from_registry(lib);
+    free(lib->irel); lib->irel = NULL; lib->nirel = lib->capirel = 0;
+    free(lib->pageprot); lib->pageprot = NULL;
+    free(lib->phdr); lib->phdr = NULL; lib->phnum = 0;
+    if (lib->quarantined) return;
+    lib->quarantined = 1;
+    lib->quarantine_next = g_quarantine_head;
+    g_quarantine_head = lib;
+    g_nquarantine++;
+}
+
+static void retire_failed(afw_lib *lib) {
+    if (can_discard(lib)) discard(lib);
+    else quarantine(lib);
+}
+
 int afw_load(const char *path, afw_lib *lib, int verbose) {
     int rc = load_inner(path, lib, verbose);
-    if (rc != 0) discard(lib);
+    if (rc != 0) retire_failed(lib);
     return rc;
 }
 
