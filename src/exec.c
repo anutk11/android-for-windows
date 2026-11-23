@@ -48,8 +48,9 @@
 
 /* Jump to `entry` with rsp = sp, rbp = 0, rdx = 0 (no rtld fini). Never returns. */
 #if defined(_WIN32)
-__asm__(".text\n.globl afw_enter\nafw_enter:\n\t"   /* Windows x64: rcx = entry, rdx = sp */
-        "mov %rdx, %rsp\n\txor %ebp, %ebp\n\txor %edx, %edx\n\tjmp *%rcx\n");
+/* clang-cl reads top-level asm as Intel syntax: say AT&T here, then restore */
+__asm__(".att_syntax prefix\n.text\n.globl afw_enter\nafw_enter:\n\t"   /* Windows x64: rcx = entry, rdx = sp */
+        "mov %rdx, %rsp\n\txor %ebp, %ebp\n\txor %edx, %edx\n\tjmp *%rcx\n.intel_syntax noprefix\n");
 #else
 __asm__(".text\n.globl afw_enter\n.type afw_enter,@function\nafw_enter:\n\t"   /* SysV: rdi, rsi */
         "mov %rsi, %rsp\n\txor %ebp, %ebp\n\tmov %rdi, %rax\n\txor %edx, %edx\n\tjmp *%rax\n");
