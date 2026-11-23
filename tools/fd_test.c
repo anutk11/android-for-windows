@@ -44,6 +44,26 @@ static void chk(const char *name, int cond) {
     else      { g_fail++; printf("  [FAIL] %s\n", name); }
 }
 
+typedef struct {
+    afw_os_file osf;
+    int         iters;
+    int         ok;
+} atomic_append_arg;
+
+static void atomic_append_worker(void *p) {
+    atomic_append_arg *a = (atomic_append_arg *)p;
+    char rec[64];
+    int i;
+    memset(rec, 'B', sizeof rec);
+    a->ok = 1;
+    for (i = 0; i < a->iters; i++) {
+        if (afw_os_write(a->osf, rec, sizeof rec, 1) != (int64_t)sizeof rec) {
+            a->ok = 0;
+            return;
+        }
+    }
+}
+
 int main(void) {
     const char *path = "out/fd_test_tmp.dat";
     int64_t fd, fd2, r;
@@ -370,6 +390,81 @@ int main(void) {
         chk("stderr F_SETFL(O_APPEND) appends at EOF of redirected file (\"OVER+APP+ERR\")",
             w3 == 4 && n3 == 12 && memcmp(b3, "OVER+APP+ERR", 12) == 0);
         chk("stdio append cleanup", afw_fd_unlinkat(LNX_AT_FDCWD, spath, 0) == 0);
+    }
+
+    /* 6h. Kernel-atomic O_APPEND across independent OS handles (bypasses afw_fd_lock) */
+    {
+        const char *apath = "out/fd_test_atomic_append.dat";
+        const int iters = 300;
+        const size_t rsz = 64;
+        const size_t expect_bytes = (size_t)(iters * 2) * rsz;
+        int64_t fda;
+        afw_os_file osb = AFW_OS_FILE_INVALID;
+        afw_os_thread thr = 0;
+        atomic_append_arg arg;
+        char rec_a[64];
+        int i, main_ok = 1, started = 0, joined = 0, intact = 1, cnt_a = 0, cnt_b = 0;
+        int64_t pos_after = -1;
+
+        (void)afw_fd_unlinkat(LNX_AT_FDCWD, apath, 0);
+        fda = afw_fd_openat(LNX_AT_FDCWD, apath, AFW_O_RDWR | AFW_O_CREAT | AFW_O_TRUNC | AFW_O_APPEND, 0644);
+        memset(rec_a, 'A', sizeof rec_a);
+        if (fda >= 3 && afw_os_open(apath, AFW_O_WRONLY | AFW_O_APPEND, 0, &osb) == 0) {
+            arg.osf = osb;
+            arg.iters = iters;
+            arg.ok = 0;
+            started = (afw_os_thread_start(atomic_append_worker, &arg, &thr) == 0);
+            if (started) {
+                for (i = 0; i < iters; i++) {
+                    if (afw_fd_lseek(fda, 0, AFW_SEEK_SET) != 0 ||
+                        afw_fd_write(fda, rec_a, rsz) != (int64_t)rsz) {
+                        main_ok = 0;
+                        break;
+                    }
+                }
+                joined = (afw_os_thread_join(thr) == 0);
+            }
+            (void)afw_os_close(osb);
+        } else {
+            main_ok = 0;
+        }
+        memset(&st, 0, sizeof st);
+        chk("atomic O_APPEND: 2 independent handles x 300 x 64B -> exact 38400 bytes, zero lost writes",
+            fda >= 3 && started && joined && main_ok && arg.ok &&
+            afw_fd_fstat(fda, &st) == 0 && (size_t)st.st_size == expect_bytes);
+        if (fda >= 3) {
+            char *all = (char *)malloc(expect_bytes);
+            size_t got = 0;
+            if (all && afw_fd_lseek(fda, 0, AFW_SEEK_SET) == 0) {
+                while (got < expect_bytes) {
+                    int64_t n = afw_fd_read(fda, all + got, expect_bytes - got);
+                    if (n <= 0) break;
+                    got += (size_t)n;
+                }
+                if (got != expect_bytes) intact = 0;
+                for (i = 0; intact && i < iters * 2; i++) {
+                    char ch = all[(size_t)i * rsz];
+                    size_t j;
+                    if (ch != 'A' && ch != 'B') { intact = 0; break; }
+                    for (j = 1; j < rsz; j++) {
+                        if (all[(size_t)i * rsz + j] != ch) { intact = 0; break; }
+                    }
+                    if (ch == 'A') cnt_a++; else cnt_b++;
+                }
+            } else {
+                intact = 0;
+            }
+            free(all);
+            /* Also verify O_APPEND updates file offset to new EOF after lseek(0)+write. */
+            if (afw_fd_lseek(fda, 0, AFW_SEEK_SET) == 0 && afw_fd_write(fda, "Z", 1) == 1)
+                pos_after = afw_fd_lseek(fda, 0, AFW_SEEK_CUR);
+            (void)afw_fd_close(fda);
+        }
+        chk("atomic O_APPEND: all 600 records intact (300 A + 300 B, zero torn/overwritten blocks)",
+            intact && cnt_a == iters && cnt_b == iters);
+        chk("atomic O_APPEND: SEEK_CUR advances to new EOF after lseek(0)+write",
+            pos_after == (int64_t)(expect_bytes + 1));
+        chk("atomic O_APPEND cleanup", afw_fd_unlinkat(LNX_AT_FDCWD, apath, 0) == 0);
     }
 
     /* 7. EMFILE: exhaust all AFW_MAX_FDS - 3 slots cleanly, then close and reopen */

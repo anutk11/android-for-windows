@@ -284,17 +284,22 @@ int64_t afw_os_read(afw_os_file f, void *buf, size_t len) {
 
 int64_t afw_os_write(afw_os_file f, const void *buf, size_t len, int append) {
     DWORD chunk, done = 0;
+    OVERLAPPED ov;
+    LPOVERLAPPED pov = NULL;
     if (f == AFW_OS_FILE_INVALID) return -9;
     if (len == 0) return 0;
     if (!buf) return -14;
     if (append && GetFileType((HANDLE)f) == FILE_TYPE_DISK) {
-        LARGE_INTEGER z;
-        z.QuadPart = 0;
-        if (!SetFilePointerEx((HANDLE)f, z, NULL, FILE_END))
-            return win_err_to_lnx(GetLastError());
+        /* Single-syscall kernel-atomic EOF append (NT FILE_WRITE_TO_END_OF_FILE):
+         * Microsoft WriteFile spec guarantees atomic seek-to-EOF + write when
+         * Offset == OffsetHigh == 0xFFFFFFFF on a synchronous disk handle. */
+        memset(&ov, 0, sizeof ov);
+        ov.Offset = 0xFFFFFFFFu;
+        ov.OffsetHigh = 0xFFFFFFFFu;
+        pov = &ov;
     }
     chunk = len > 0x7ffff000u ? 0x7ffff000u : (DWORD)len;
-    if (!WriteFile((HANDLE)f, buf, chunk, &done, NULL))
+    if (!WriteFile((HANDLE)f, buf, chunk, &done, pov))
         return win_err_to_lnx(GetLastError());
     return (int64_t)done;
 }
@@ -614,6 +619,19 @@ int afw_os_stdio_stat(int std_fd, afw_os_stat_info *out) {
     return afw_os_fstat((afw_os_file)h, out);
 }
 
+int afw_os_set_append(afw_os_file f, int append) {
+    (void)append;
+    return f == AFW_OS_FILE_INVALID ? -9 : 0;
+}
+
+int afw_os_stdio_set_append(int std_fd, int append) {
+    HANDLE h;
+    (void)append;
+    if (std_fd < 0 || std_fd > 2) return -9;
+    h = std_handle(std_fd);
+    return (!h || h == INVALID_HANDLE_VALUE) ? -9 : 0;
+}
+
 int afw_os_stdio_swap(int std_fd, afw_os_file new_f, afw_os_file *saved) {
     DWORD id = (std_fd == 1) ? STD_OUTPUT_HANDLE : (std_fd == 2) ? STD_ERROR_HANDLE : 0;
     HANDLE cur;
@@ -628,6 +646,34 @@ int afw_os_stdio_restore(int std_fd, afw_os_file saved) {
     DWORD id = (std_fd == 1) ? STD_OUTPUT_HANDLE : (std_fd == 2) ? STD_ERROR_HANDLE : 0;
     if (!id) return -22;
     return SetStdHandle(id, (HANDLE)saved) ? 0 : win_err_to_lnx(GetLastError());
+}
+
+typedef struct { void (*fn)(void *); void *arg; } afw_win_thr;
+static DWORD WINAPI afw_win_thr_entry(LPVOID p) {
+    afw_win_thr t = *(afw_win_thr *)p;
+    free(p);
+    t.fn(t.arg);
+    return 0;
+}
+
+int afw_os_thread_start(void (*fn)(void *), void *arg, afw_os_thread *out) {
+    afw_win_thr *p;
+    HANDLE h;
+    if (!fn || !out) return -22;
+    p = (afw_win_thr *)malloc(sizeof *p);
+    if (!p) return -12;
+    p->fn = fn; p->arg = arg;
+    h = CreateThread(NULL, 0, afw_win_thr_entry, p, 0, NULL);
+    if (!h) { DWORD e = GetLastError(); free(p); return win_err_to_lnx(e); }
+    *out = (afw_os_thread)h;
+    return 0;
+}
+
+int afw_os_thread_join(afw_os_thread t) {
+    HANDLE h = (HANDLE)t;
+    DWORD w = WaitForSingleObject(h, INFINITE);
+    CloseHandle(h);
+    return w == WAIT_OBJECT_0 ? 0 : -5;
 }
 
 #else
@@ -696,8 +742,7 @@ int afw_os_open(const char *path, int flags, uint32_t mode, afw_os_file *out) {
     if (flags & AFW_O_CREAT) of |= O_CREAT;
     if (flags & AFW_O_EXCL) of |= O_EXCL;
     if (flags & AFW_O_TRUNC) of |= O_TRUNC;
-    /* Do not set host O_APPEND: afw_os_write handles append under afw_fd_lock()
-     * so F_SETFL toggling O_APPEND on/off behaves identically on Linux and Windows. */
+    if (flags & AFW_O_APPEND) of |= O_APPEND;
     if (flags & AFW_O_DIRECTORY) of |= O_DIRECTORY;
     if (flags & AFW_O_NOFOLLOW) of |= O_NOFOLLOW;
     of |= O_CLOEXEC;
@@ -724,11 +769,11 @@ int64_t afw_os_read(afw_os_file f, void *buf, size_t len) {
 
 int64_t afw_os_write(afw_os_file f, const void *buf, size_t len, int append) {
     ssize_t r;
+    (void)append; /* Kernel O_APPEND is synced via open() and afw_os_set_append(). */
     if (f == AFW_OS_FILE_INVALID) return -EBADF;
     if (len == 0) return 0;
     if (!buf) return -EFAULT;
     if (len > 0x7ffff000u) len = 0x7ffff000u;
-    if (append && lseek((int)f, 0, SEEK_END) < 0 && errno != ESPIPE) return -(int64_t)errno;
     r = write((int)f, buf, len);
     return r < 0 ? -(int64_t)errno : (int64_t)r;
 }
@@ -797,6 +842,21 @@ int afw_os_stdio_stat(int std_fd, afw_os_stat_info *out) {
     return afw_os_fstat((afw_os_file)std_fd, out);
 }
 
+int afw_os_set_append(afw_os_file f, int append) {
+    int fl;
+    if (f == AFW_OS_FILE_INVALID) return -EBADF;
+    fl = fcntl((int)f, F_GETFL);
+    if (fl < 0) return -errno;
+    if (append) fl |= O_APPEND;
+    else        fl &= ~O_APPEND;
+    return fcntl((int)f, F_SETFL, fl) == 0 ? 0 : -errno;
+}
+
+int afw_os_stdio_set_append(int std_fd, int append) {
+    if (std_fd < 0 || std_fd > 2) return -EBADF;
+    return afw_os_set_append((afw_os_file)std_fd, append);
+}
+
 int afw_os_stdio_swap(int std_fd, afw_os_file new_f, afw_os_file *saved) {
     int dup_old;
     if ((std_fd != 1 && std_fd != 2) || new_f == AFW_OS_FILE_INVALID || !saved) return -EINVAL;
@@ -817,5 +877,35 @@ int afw_os_stdio_restore(int std_fd, afw_os_file saved) {
     rc = dup2((int)saved, std_fd) < 0 ? -errno : 0;
     close((int)saved);
     return rc;
+}
+
+typedef struct { void (*fn)(void *); void *arg; } afw_posix_thr;
+static void *afw_posix_thr_entry(void *p) {
+    afw_posix_thr t = *(afw_posix_thr *)p;
+    free(p);
+    t.fn(t.arg);
+    return NULL;
+}
+
+int afw_os_thread_start(void (*fn)(void *), void *arg, afw_os_thread *out) {
+    afw_posix_thr *p;
+    pthread_t *pt;
+    int rc;
+    if (!fn || !out) return -EINVAL;
+    p = (afw_posix_thr *)malloc(sizeof *p);
+    pt = (pthread_t *)malloc(sizeof *pt);
+    if (!p || !pt) { free(p); free(pt); return -ENOMEM; }
+    p->fn = fn; p->arg = arg;
+    rc = pthread_create(pt, NULL, afw_posix_thr_entry, p);
+    if (rc != 0) { free(p); free(pt); return -rc; }
+    *out = (afw_os_thread)(uintptr_t)pt;
+    return 0;
+}
+
+int afw_os_thread_join(afw_os_thread t) {
+    pthread_t *pt = (pthread_t *)(uintptr_t)t;
+    int rc = pthread_join(*pt, NULL);
+    free(pt);
+    return rc == 0 ? 0 : -rc;
 }
 #endif

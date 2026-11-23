@@ -340,14 +340,24 @@ int64_t afw_fd_fcntl(int64_t fd, int64_t cmd, int64_t arg) {
     case LNX_F_GETFL:
         r = g_fds[fd].flags;
         break;
-    case LNX_F_SETFL:
+    case LNX_F_SETFL: {
+        int want_append, rc;
         if (arg & ~(int64_t)LNX_SUPPORTED_OPEN_FLAGS) {
             r = -LNX_EINVAL;
+            break;
+        }
+        want_append = (arg & AFW_O_APPEND) != 0;
+        rc = (g_fds[fd].kind == FD_FILE)
+             ? afw_os_set_append(g_fds[fd].os, want_append)
+             : afw_os_stdio_set_append(g_fds[fd].std_fd, want_append);
+        if (rc != 0) {
+            r = rc;
             break;
         }
         g_fds[fd].flags = (g_fds[fd].flags & ~AFW_O_APPEND) | (int)(arg & AFW_O_APPEND);
         r = 0;
         break;
+    }
     default:
         r = -LNX_ENOSYS;
         break;
