@@ -280,6 +280,98 @@ int main(void) {
             afw_fd_unlinkat(LNX_AT_FDCWD, dirp, LNX_AT_REMOVEDIR) == 0);
     }
 
+    /* 6f. Relative symlink resolves against linkpath's parent dir, not CWD (even when shadowed) */
+    {
+        const char *cwd_file = "fd_test_shadow";
+        const char *out_dir  = "out/fd_test_shadow";
+        const char *slink    = "out/fd_test_shadow_link";
+        int64_t ffd, dfd;
+        (void)afw_fd_unlinkat(LNX_AT_FDCWD, slink, 0);
+        (void)afw_fd_unlinkat(LNX_AT_FDCWD, out_dir, LNX_AT_REMOVEDIR);
+        (void)afw_fd_unlinkat(LNX_AT_FDCWD, cwd_file, 0);
+        ffd = afw_fd_openat(LNX_AT_FDCWD, cwd_file, AFW_O_RDWR | AFW_O_CREAT | AFW_O_TRUNC, 0644);
+        chk("shadow symlink setup: create CWD file + out/ directory with same name",
+            ffd >= 3 && afw_fd_write(ffd, "file", 4) == 4 && afw_fd_close(ffd) == 0 &&
+            afw_os_mkdir(out_dir, 0755) == 0);
+        chk("shadow symlink: afw_os_symlink(\"fd_test_shadow\", \"out/fd_test_shadow_link\") succeeds",
+            afw_os_symlink("fd_test_shadow", slink) == 0);
+        memset(&st, 0, sizeof st);
+        chk("shadow symlink: lstat -> S_IFLNK and stat (follow) -> S_IFDIR (not CWD file)",
+            afw_fd_newfstatat(LNX_AT_FDCWD, slink, &st, LNX_AT_SYMLINK_NOFOLLOW) == 0 &&
+            (st.st_mode & S_IFMT_) == S_IFLNK_ &&
+            afw_fd_newfstatat(LNX_AT_FDCWD, slink, &st, 0) == 0 &&
+            (st.st_mode & S_IFMT_) == S_IFDIR_);
+        dfd = afw_fd_openat(LNX_AT_FDCWD, slink, AFW_O_RDONLY | AFW_O_DIRECTORY, 0);
+        memset(&st, 0, sizeof st);
+        chk("shadow symlink: openat(O_RDONLY|O_DIRECTORY) follows dir symlink cleanly",
+            dfd >= 3 && afw_fd_fstat(dfd, &st) == 0 && (st.st_mode & S_IFMT_) == S_IFDIR_ &&
+            afw_fd_close(dfd) == 0);
+        chk("shadow symlink cleanup",
+            afw_fd_unlinkat(LNX_AT_FDCWD, slink, 0) == 0 &&
+            afw_fd_unlinkat(LNX_AT_FDCWD, out_dir, LNX_AT_REMOVEDIR) == 0 &&
+            afw_fd_unlinkat(LNX_AT_FDCWD, cwd_file, 0) == 0);
+    }
+
+    /* 6g. F_SETFL(O_APPEND) applies to redirected stdout (1) and stderr (2) */
+    {
+        const char *spath = "out/fd_test_stdio.dat";
+        afw_os_file osf = AFW_OS_FILE_INVALID, saved = AFW_OS_FILE_INVALID;
+        int64_t fl1 = -1, fl2 = -1, w1 = -1, w2 = -1, w3 = -1, n1 = -1, n2 = -1, n3 = -1;
+        char b1[32] = {0}, b2[32] = {0}, b3[32] = {0};
+        int sw_ok = 0, rs_ok = 0;
+
+        (void)afw_fd_unlinkat(LNX_AT_FDCWD, spath, 0);
+        fd2 = afw_fd_openat(LNX_AT_FDCWD, spath, AFW_O_RDWR | AFW_O_CREAT | AFW_O_TRUNC, 0644);
+        chk("stdio append setup: seed out/fd_test_stdio.dat with \"BASE\"",
+            fd2 >= 3 && afw_fd_write(fd2, "BASE", 4) == 4 && afw_fd_close(fd2) == 0);
+
+        if (afw_os_open(spath, AFW_O_RDWR, 0, &osf) == 0) {
+            fflush(stdout);
+            fflush(stderr);
+            /* Step 1: stdout redirected at offset 0 with F_SETFL(O_APPEND) must append at EOF */
+            if (afw_os_stdio_swap(1, osf, &saved) == 0) {
+                sw_ok = 1;
+                (void)afw_fd_fcntl(1, LNX_F_SETFL, AFW_O_APPEND);
+                fl1 = afw_fd_fcntl(1, LNX_F_GETFL, 0);
+                w1 = afw_fd_write(1, "+APP", 4);
+                rs_ok = (afw_os_stdio_restore(1, saved) == 0);
+            }
+            if (afw_os_lseek(osf, 0, AFW_SEEK_SET) == 0)
+                n1 = afw_os_read(osf, b1, sizeof b1 - 1);
+
+            /* Step 2: clearing O_APPEND on stdout writes at offset 0 (overwrites "BASE") */
+            if (afw_os_lseek(osf, 0, AFW_SEEK_SET) == 0 && afw_os_stdio_swap(1, osf, &saved) == 0) {
+                (void)afw_fd_fcntl(1, LNX_F_SETFL, 0);
+                fl2 = afw_fd_fcntl(1, LNX_F_GETFL, 0);
+                w2 = afw_fd_write(1, "OVER", 4);
+                (void)afw_os_stdio_restore(1, saved);
+            }
+            if (afw_os_lseek(osf, 0, AFW_SEEK_SET) == 0)
+                n2 = afw_os_read(osf, b2, sizeof b2 - 1);
+
+            /* Step 3: stderr redirected at offset 0 with F_SETFL(O_APPEND) appends at EOF */
+            if (afw_os_lseek(osf, 0, AFW_SEEK_SET) == 0 && afw_os_stdio_swap(2, osf, &saved) == 0) {
+                (void)afw_fd_fcntl(2, LNX_F_SETFL, AFW_O_APPEND);
+                w3 = afw_fd_write(2, "+ERR", 4);
+                (void)afw_fd_fcntl(2, LNX_F_SETFL, 0);
+                (void)afw_os_stdio_restore(2, saved);
+            }
+            if (afw_os_lseek(osf, 0, AFW_SEEK_SET) == 0)
+                n3 = afw_os_read(osf, b3, sizeof b3 - 1);
+
+            (void)afw_os_close(osf);
+        }
+        chk("stdout F_SETFL(O_APPEND) writes at EOF of redirected file (\"BASE+APP\")",
+            sw_ok && rs_ok && fl1 == (AFW_O_WRONLY | AFW_O_APPEND | LNX_O_LARGEFILE) &&
+            w1 == 4 && n1 == 8 && memcmp(b1, "BASE+APP", 8) == 0);
+        chk("stdout F_SETFL(0) clears O_APPEND and overwrites at offset 0 (\"OVER+APP\")",
+            fl2 == (AFW_O_WRONLY | LNX_O_LARGEFILE) &&
+            w2 == 4 && n2 == 8 && memcmp(b2, "OVER+APP", 8) == 0);
+        chk("stderr F_SETFL(O_APPEND) appends at EOF of redirected file (\"OVER+APP+ERR\")",
+            w3 == 4 && n3 == 12 && memcmp(b3, "OVER+APP+ERR", 12) == 0);
+        chk("stdio append cleanup", afw_fd_unlinkat(LNX_AT_FDCWD, spath, 0) == 0);
+    }
+
     /* 7. EMFILE: exhaust all AFW_MAX_FDS - 3 slots cleanly, then close and reopen */
     {
         int64_t opened[AFW_MAX_FDS];

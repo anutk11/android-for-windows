@@ -93,8 +93,10 @@ int     afw_os_mkdir(const char *path, uint32_t mode);
 int     afw_os_symlink(const char *target, const char *linkpath);
 int     afw_os_junction(const char *target, const char *linkpath);
 int64_t afw_os_stdio_read(void *buf, size_t len);
-int64_t afw_os_stdio_write(int std_fd, const void *buf, size_t len);
+int64_t afw_os_stdio_write(int std_fd, const void *buf, size_t len, int append);
 int     afw_os_stdio_stat(int std_fd, afw_os_stat_info *out);
+int     afw_os_stdio_swap(int std_fd, afw_os_file new_f, afw_os_file *saved);
+int     afw_os_stdio_restore(int std_fd, afw_os_file saved);
 
 /* Process-global FD table lock (SRWLOCK on Windows, pthread_mutex on Linux). */
 void afw_fd_lock(void);

@@ -219,9 +219,10 @@ int64_t afw_fd_write(int64_t fd, const void *buf, uint64_t len) {
         afw_fd_unlock();
         return r;
     }
+    if (std_fd != 1 && std_fd != 2) { afw_fd_unlock(); return -LNX_EBADF; }
+    r = chunk ? afw_os_stdio_write(std_fd, buf, chunk, append) : 0;
     afw_fd_unlock();
-    if (std_fd != 1 && std_fd != 2) return -LNX_EBADF;
-    return chunk ? afw_os_stdio_write(std_fd, buf, chunk) : 0;
+    return r;
 }
 
 int64_t afw_fd_readv(int64_t fd, const uint64_t *iov, int64_t cnt) {

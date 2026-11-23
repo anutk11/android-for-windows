@@ -287,7 +287,7 @@ int64_t afw_os_write(afw_os_file f, const void *buf, size_t len, int append) {
     if (f == AFW_OS_FILE_INVALID) return -9;
     if (len == 0) return 0;
     if (!buf) return -14;
-    if (append) {
+    if (append && GetFileType((HANDLE)f) == FILE_TYPE_DISK) {
         LARGE_INTEGER z;
         z.QuadPart = 0;
         if (!SetFilePointerEx((HANDLE)f, z, NULL, FILE_END))
@@ -440,16 +440,9 @@ static int win_target_is_dir(const char *target, const char *linkpath) {
     wchar_t wbuf[512], *wheap = NULL;
     const wchar_t *w;
     DWORD attr;
-    w = utf8_to_wide(target, wbuf, sizeof wbuf / sizeof wbuf[0], &wheap);
-    if (w) {
-        attr = GetFileAttributesW(w);
-        free(wheap);
-        wheap = NULL;
-        if (attr != INVALID_FILE_ATTRIBUTES)
-            return (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
-    }
-    /* Resolve relative target against linkpath's parent directory. */
-    if (target[0] != '/' && target[0] != '\\' && !(target[0] && target[1] == ':')) {
+    int is_rel = target[0] != '/' && target[0] != '\\' && !(target[0] && target[1] == ':');
+    if (is_rel) {
+        /* Windows resolves relative symlink targets relative to linkpath's parent directory. */
         const char *slash = strrchr(linkpath, '/');
         const char *bslash = strrchr(linkpath, '\\');
         const char *sep = (!slash || (bslash && bslash > slash)) ? bslash : slash;
@@ -457,21 +450,22 @@ static int win_target_is_dir(const char *target, const char *linkpath) {
             size_t dir_len = (size_t)(sep - linkpath) + 1;
             size_t tgt_len = strlen(target);
             char *joined = (tgt_len <= SIZE_MAX - dir_len - 1) ? (char *)malloc(dir_len + tgt_len + 1) : NULL;
-            if (joined) {
-                memcpy(joined, linkpath, dir_len);
-                memcpy(joined + dir_len, target, tgt_len + 1);
-                w = utf8_to_wide(joined, wbuf, sizeof wbuf / sizeof wbuf[0], &wheap);
-                free(joined);
-                if (w) {
-                    attr = GetFileAttributesW(w);
-                    free(wheap);
-                    if (attr != INVALID_FILE_ATTRIBUTES)
-                        return (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
-                }
-            }
+            if (!joined) return 0;
+            memcpy(joined, linkpath, dir_len);
+            memcpy(joined + dir_len, target, tgt_len + 1);
+            w = utf8_to_wide(joined, wbuf, sizeof wbuf / sizeof wbuf[0], &wheap);
+            free(joined);
+            if (!w) return 0;
+            attr = GetFileAttributesW(w);
+            free(wheap);
+            return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
         }
     }
-    return 0;
+    w = utf8_to_wide(target, wbuf, sizeof wbuf / sizeof wbuf[0], &wheap);
+    if (!w) return 0;
+    attr = GetFileAttributesW(w);
+    free(wheap);
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
 
 int afw_os_symlink(const char *target, const char *linkpath) {
@@ -607,17 +601,33 @@ int64_t afw_os_stdio_read(void *buf, size_t len) {
     return afw_os_read((afw_os_file)h, buf, len);
 }
 
-int64_t afw_os_stdio_write(int std_fd, const void *buf, size_t len) {
+int64_t afw_os_stdio_write(int std_fd, const void *buf, size_t len, int append) {
     HANDLE h = std_handle(std_fd);
     if (std_fd != 1 && std_fd != 2) return -9;
     if (!h || h == INVALID_HANDLE_VALUE) return -9;
-    return afw_os_write((afw_os_file)h, buf, len, 0);
+    return afw_os_write((afw_os_file)h, buf, len, append);
 }
 
 int afw_os_stdio_stat(int std_fd, afw_os_stat_info *out) {
     HANDLE h = std_handle(std_fd);
     if (!h || h == INVALID_HANDLE_VALUE) return -9;
     return afw_os_fstat((afw_os_file)h, out);
+}
+
+int afw_os_stdio_swap(int std_fd, afw_os_file new_f, afw_os_file *saved) {
+    DWORD id = (std_fd == 1) ? STD_OUTPUT_HANDLE : (std_fd == 2) ? STD_ERROR_HANDLE : 0;
+    HANDLE cur;
+    if (!id || new_f == AFW_OS_FILE_INVALID || !saved) return -22;
+    cur = GetStdHandle(id);
+    if (!SetStdHandle(id, (HANDLE)new_f)) return win_err_to_lnx(GetLastError());
+    *saved = (afw_os_file)cur;
+    return 0;
+}
+
+int afw_os_stdio_restore(int std_fd, afw_os_file saved) {
+    DWORD id = (std_fd == 1) ? STD_OUTPUT_HANDLE : (std_fd == 2) ? STD_ERROR_HANDLE : 0;
+    if (!id) return -22;
+    return SetStdHandle(id, (HANDLE)saved) ? 0 : win_err_to_lnx(GetLastError());
 }
 
 #else
@@ -777,13 +787,35 @@ int64_t afw_os_stdio_read(void *buf, size_t len) {
     return afw_os_read((afw_os_file)0, buf, len);
 }
 
-int64_t afw_os_stdio_write(int std_fd, const void *buf, size_t len) {
+int64_t afw_os_stdio_write(int std_fd, const void *buf, size_t len, int append) {
     if (std_fd != 1 && std_fd != 2) return -EBADF;
-    return afw_os_write((afw_os_file)std_fd, buf, len, 0);
+    return afw_os_write((afw_os_file)std_fd, buf, len, append);
 }
 
 int afw_os_stdio_stat(int std_fd, afw_os_stat_info *out) {
     if (std_fd < 0 || std_fd > 2) return -EBADF;
     return afw_os_fstat((afw_os_file)std_fd, out);
+}
+
+int afw_os_stdio_swap(int std_fd, afw_os_file new_f, afw_os_file *saved) {
+    int dup_old;
+    if ((std_fd != 1 && std_fd != 2) || new_f == AFW_OS_FILE_INVALID || !saved) return -EINVAL;
+    dup_old = dup(std_fd);
+    if (dup_old < 0) return -errno;
+    if (dup2((int)new_f, std_fd) < 0) {
+        int e = errno;
+        close(dup_old);
+        return -e;
+    }
+    *saved = (afw_os_file)dup_old;
+    return 0;
+}
+
+int afw_os_stdio_restore(int std_fd, afw_os_file saved) {
+    int rc;
+    if ((std_fd != 1 && std_fd != 2) || saved == AFW_OS_FILE_INVALID) return -EINVAL;
+    rc = dup2((int)saved, std_fd) < 0 ? -errno : 0;
+    close((int)saved);
+    return rc;
 }
 #endif
