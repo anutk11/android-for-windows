@@ -125,3 +125,7 @@ long afw_switch_syscall(int k) {
     default: return -1;
     }
 }
+
+/* A page of this library's own .bss, like libc's WriteProtected<libc_globals>:
+ * mprotect on it must work (issue #12). */
+__attribute__((aligned(4096))) char afw_sys_bss_page[2 * 4096];

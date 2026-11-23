@@ -17,6 +17,7 @@
 #define TLS_SLOT_SELF 0
 #define TLS_SLOT_THREAD_ID 1
 #define TLS_SLOT_STACK_GUARD 5
+#define TLS_SLOT_BIONIC_TLS 9
 
 /* Install the fault handler and set up the calling thread. */
 int afw_tls_init(void);

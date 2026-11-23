@@ -24,6 +24,8 @@ int afw_tls_static_unregister(int mod);
 /* Fix the layout. After this, register() refuses (dynamic TLS is G2).
  * Rebuilds the calling thread's block. Idempotent. Returns 0 or -1. */
 int afw_tls_static_finish(void);
+int afw_tls_static_is_finished(void);
+int afw_tls_static_count(void);
 
 /* Offset of module `mod` (1-based) below tp, or 0 if unknown. */
 uint64_t afw_tls_static_off(int mod);
@@ -32,7 +34,18 @@ uint64_t afw_tls_static_off(int mod);
  * array), or NULL; *block gets the allocation, which is what
  * afw_tls_static_free() takes (tp's offset in it depends on the layout at
  * the time of allocation, so tp alone is not enough). */
-uintptr_t *afw_tls_static_alloc(void **block);
+uintptr_t *afw_tls_static_alloc(void **block, unsigned char **area);
+
+/* Per-thread bionic state that bionic reaches through the thread pointer
+ * (docs/design/G1-LIBC-INIT.md), zeroed, in the same allocation as the TLS
+ * block (*area above, page-aligned):
+ *   [0, 64KB)     pthread_internal_t  (tp[1]; tid at +0x10, errno at +0x300 measured)
+ *   [64KB, 128KB) bionic_tls          (tp[9])
+ * Both sizes are generous upper bounds until the real sizes are measured. */
+#define AFW_THREAD_AREA_SIZE   (128u * 1024u)
+#define AFW_PTHREAD_INTERNAL_OFF 0u
+#define AFW_BIONIC_TLS_OFF     (64u * 1024u)
+#define AFW_PTI_TID            0x10   /* int: gettid() reads it (measured) */
 void afw_tls_static_free(void *block);
 
 /* Address of byte `offset` of module `module` (1-based) for the calling

@@ -3,7 +3,12 @@
  */
 #include "platform.h"
 
+#if defined(_WIN32)
+#define _CRT_RAND_S        /* rand_s: the OS's cryptographic generator */
+#endif
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #if defined(_WIN32)
 #ifndef _WIN32_WINNT
@@ -55,10 +60,28 @@ void afw_flush_icache(void *addr, size_t size) {
     FlushInstructionCache(GetCurrentProcess(), addr, size);
 }
 
+int afw_random_bytes(void *buf, size_t n) {
+    unsigned char *b = (unsigned char *)buf;
+    while (n) {
+        unsigned int v;
+        size_t k = n < sizeof v ? n : sizeof v;
+        if (rand_s(&v) != 0) return -1;
+        memcpy(b, &v, k); b += k; n -= k;
+    }
+    return 0;
+}
+
 #else
 #include <sys/mman.h>
 
 int afw_check_security(void) { return 0; }
+
+int afw_random_bytes(void *buf, size_t n) {
+    FILE *f = fopen("/dev/urandom", "rb");
+    size_t got = f ? fread(buf, 1, n, f) : 0;
+    if (f) fclose(f);
+    return got == n ? 0 : -1;
+}
 
 void *afw_mem_alloc(size_t size) {
     void *p = mmap(NULL, size, PROT_READ | PROT_WRITE,

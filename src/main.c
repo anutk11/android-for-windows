@@ -6,6 +6,9 @@
  *
  * If the library is test/hello.c (libhello.so), the M0 tests run as well.
  */
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE   /* pthread_timedjoin_np: a bounded join in the futex test */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,12 +20,15 @@
 #include "crash.h"
 #include "syscall.h"
 #include "tls_static.h"
+#include "vma.h"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
 #include <pthread.h>
+#include <time.h>
+#include <unistd.h>
 #endif
 
 #define AFW_VERSION "0.2.0-M1-dev"
@@ -104,6 +110,133 @@ typedef double (SYSV *xmm_fn)(double);
 #define host_pid() ((long)getpid())
 #endif
 
+/* A second thread waits on *w (futex WAIT, no timeout) until it is 1; this
+ * thread sets it and wakes. The join is bounded: a lost wake fails, never hangs. */
+static volatile int32_t *g_fw;
+static volatile int g_fw_done;
+static void futex_waiter(void) {
+    int64_t g[6];
+    while (*g_fw == 0) {
+        g[0] = (int64_t)(uintptr_t)g_fw; g[1] = 128; g[2] = 0; g[3] = 0; g[4] = 0; g[5] = 0;
+        afw_syscall_dispatch(202, g);
+    }
+    g_fw_done = 1;
+}
+#if defined(_WIN32)
+static DWORD WINAPI futex_waiter_w(LPVOID p) { (void)p; futex_waiter(); return 0; }
+#else
+static void *futex_waiter_p(void *p) { (void)p; futex_waiter(); return NULL; }
+#endif
+static int run_futex_threads(volatile int32_t *w) {
+    int64_t g[6] = {0};
+    int ok;
+    *w = 0; g_fw = w; g_fw_done = 0;
+#if defined(_WIN32)
+    {
+        HANDLE h = CreateThread(NULL, 0, futex_waiter_w, NULL, 0, NULL);
+        if (!h) return 0;
+        Sleep(50);                                   /* let it block */
+        *w = 1;
+        g[0] = (int64_t)(uintptr_t)w; g[1] = 128 | 1; g[2] = 1;
+        afw_syscall_dispatch(202, g);
+        ok = WaitForSingleObject(h, 5000) == WAIT_OBJECT_0 && g_fw_done;
+        if (!ok) TerminateThread(h, 1);
+        CloseHandle(h);
+    }
+#else
+    {
+        pthread_t t;
+        struct timespec dl;
+        if (pthread_create(&t, NULL, futex_waiter_p, NULL) != 0) return 0;
+        usleep(50000);
+        *w = 1;
+        g[0] = (int64_t)(uintptr_t)w; g[1] = 128 | 1; g[2] = 1;
+        afw_syscall_dispatch(202, g);
+        clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += 5;
+        ok = pthread_timedjoin_np(t, NULL, &dl) == 0 && g_fw_done;
+        if (!ok) pthread_cancel(t);
+    }
+#endif
+    return ok;
+}
+
+/* The linker API libdl.so forwards to (loader_api.c), called the way libdl
+ * calls it: through the shims, System V ABI. */
+static int g_phdr_libs, g_phdr_ok, g_phdr_tls_ok;
+static SYSV int phdr_cb(void *vi, size_t size, void *data) {
+    struct { uint64_t addr; const char *name; const Elf64_Phdr *phdr; uint16_t phnum;
+             unsigned long long adds, subs; size_t tls_modid; void *tls_data; } *i = vi;
+    int k, has_load = 0;
+    const afw_lib *user = (const afw_lib *)data;
+    if (size < sizeof *i) return 1;
+    g_phdr_libs++;
+    for (k = 0; k < i->phnum; k++) if (i->phdr[k].p_type == PT_LOAD) has_load = 1;
+    if (has_load && i->name) g_phdr_ok++;
+    if (i->addr == (uint64_t)user->bias)
+        g_phdr_tls_ok = i->tls_modid == (size_t)user->tls_module && i->tls_data != NULL;
+    return 0;
+}
+static void run_loader_api_tests(const afw_lib *user) {
+    typedef SYSV void *(*dlopen_fn)(const char *, int, const void *);
+    typedef SYSV void *(*dlsym_fn)(void *, const char *, const void *);
+    typedef SYSV char *(*dlerror_fn)(void);
+    typedef SYSV int (*iter_fn)(SYSV int (*)(void *, size_t, void *), void *);
+    typedef SYSV int (*dladdr_fn)(const void *, void *);
+    typedef SYSV int (*ifn)(void);
+    dlopen_fn dlo = (dlopen_fn)afw_shim_lookup("__loader_dlopen");
+    dlsym_fn dls = (dlsym_fn)afw_shim_lookup("__loader_dlsym");
+    dlerror_fn dle = (dlerror_fn)afw_shim_lookup("__loader_dlerror");
+    iter_fn it = (iter_fn)afw_shim_lookup("__loader_dl_iterate_phdr");
+    dladdr_fn dla = (dladdr_fn)afw_shim_lookup("__loader_dladdr");
+    void *main_h, *base_h, *f;
+    char *e;
+    struct { const char *fname; void *fbase; const char *sname; void *saddr; } info;
+    printf("  the linker API (__loader_*, what libdl.so forwards to):\n");
+    check("every __loader_* function libdl.so imports is provided", dlo && dls && dle && it && dla);
+    if (!(dlo && dls && dle && it && dla)) return;
+    main_h = dlo(NULL, 2, NULL);
+    f = main_h ? dls(main_h, "afw_deps_check", NULL) : NULL;
+    check("dlopen(NULL) + dlsym finds a symbol in any loaded library", f && ((ifn)f)() == 42);
+    base_h = dlo("libdeps_base.so", 2, NULL);
+    check("dlopen of a loaded library returns it, no second copy", base_h && base_h == afw_find_loaded("libdeps_base.so"));
+    f = base_h ? dls(base_h, "afw_base_value", NULL) : NULL;
+    check("dlsym on that handle", f && ((ifn)f)() == 30);
+    f = base_h ? dls(base_h, "afw_base_pick", NULL) : NULL;
+    check("dlsym of an IFUNC returns the resolved function", f && ((ifn)f)() == 5);
+    check("dlsym(RTLD_DEFAULT)", dls(NULL, "afw_base_value", NULL) != NULL);
+    {   /* RTLD_NEXT: only libraries loaded after the caller's (base, then user) */
+        const void *in_base = afw_sym(afw_find_loaded("libdeps_base.so"), "afw_base_value");
+        const void *in_user = afw_sym(user, "afw_deps_check");
+        void *nx = (void *)(intptr_t)-1;
+        check("dlsym(RTLD_NEXT) from the dependency finds the library loaded after it",
+              dls(nx, "afw_deps_check", in_base) == in_user);
+        check("dlsym(RTLD_NEXT) never returns the caller's own library",
+              dls(nx, "afw_base_value", in_base) == NULL);
+        check("dlsym(RTLD_NEXT) from the last library -> NULL", dls(nx, "afw_base_value", in_user) == NULL);
+        while (dle()) {}
+    }
+    while (dle()) {}
+    check("dlopen of a missing library -> NULL", dlo("libdoes_not_exist.so", 2, NULL) == NULL);
+    e = dle();
+    check("... dlerror says which, as bionic does", e && strstr(e, "\"libdoes_not_exist.so\" not found"));
+    check("... and only once", dle() == NULL);
+    check("dlsym of a missing symbol -> NULL", base_h && dls(base_h, "no_such_symbol", NULL) == NULL);
+    e = dle();
+    check("... dlerror: undefined symbol", e && strstr(e, "undefined symbol: no_such_symbol"));
+    check("dlsym on an invalid handle -> NULL, not a crash", dls((void *)(uintptr_t)0x1234, "x", NULL) == NULL);
+    e = dle();
+    check("... dlerror: invalid handle", e && strstr(e, "invalid handle"));
+    g_phdr_libs = g_phdr_ok = g_phdr_tls_ok = 0;
+    check("dl_iterate_phdr visits every library", it(phdr_cb, (void *)user) == 0 && g_phdr_libs == 2 && g_phdr_ok == 2);
+    check("... with the TLS module and this thread's block", g_phdr_tls_ok);
+    memset(&info, 0, sizeof info);
+    check("dladdr names the library an address belongs to",
+          dla((const void *)afw_sym(user, "afw_deps_check"), &info) == 1 && info.fbase == user->base &&
+          info.fname && strstr(info.fname, "libdeps_user.so"));
+    check("dladdr on a non-library address (stack) returns 0; NULL info returns 0",
+          dla(&info, &info) == 0 && dla((const void *)afw_sym(user, "afw_deps_check"), NULL) == 0);
+}
+
 static int run_syscall_tests(const afw_lib *lib) {
     getpid_fn gp = (getpid_fn)afw_sym(lib, "afw_sys_getpid");
     write_fn wr = (write_fn)afw_sym(lib, "afw_sys_write");
@@ -121,6 +254,12 @@ static int run_syscall_tests(const afw_lib *lib) {
      * function pointer (afw_apply, crtbegin): undecided, but harmless as long
      * as no syscall/fs: look-alike sits in the bytes nothing reaches. */
     check("no unproven syscall/fs: look-alikes left", lib->patch.unproven == 0);
+    {   /* the watchdog's record of the last syscall points back into the caller */
+        uintptr_t gpa = (uintptr_t)gp;
+        gp();
+        check("last-syscall record: number 39, return address just after the site in afw_sys_getpid",
+              afw_last_syscall_nr == 39 && afw_last_syscall_ret > gpa && afw_last_syscall_ret < gpa + 64);
+    }
     check("both other sites patched by moving instructions (generic syscall, mov rax)",
           lib->patch.sys_patched_moved == 2);
     check("the site with a branch into its middle was REFUSED", lib->patch.sys_refused_branch == 1);
@@ -153,20 +292,37 @@ static int run_syscall_tests(const afw_lib *lib) {
     }
 
     {
-        typedef long (SYSV *gen_fn)(long, long, long, long, long, long, long);
+        /* int64_t, not long: long is 32 bits on Windows and would cut pointers */
+        typedef int64_t (SYSV *gen_fn)(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
         gen_fn gen = (gen_fn)afw_sym(lib, "afw_generic_syscall");
         getpid_fn rax = (getpid_fn)afw_sym(lib, "afw_sys_getpid_rax");
         check("form B functions found", gen && rax);
         if (gen && rax) {
             before = afw_syscall_counts[39];
-            r = gen(39, 0, 0, 0, 0, 0, 0);
+            r = (long)gen(39, 0, 0, 0, 0, 0, 0);
             printf("  generic syscall(39) -> %ld\n", r);
             check("generic syscall(): number passed at run time reached the dispatcher",
                   r == host_pid() && afw_syscall_counts[39] == before + 1);
-            r = gen(1, 1, (long)(uintptr_t)msg, (long)(sizeof msg - 1), 0, 0, 0);
+            r = (long)gen(1, 1, (int64_t)(uintptr_t)msg, (int64_t)(sizeof msg - 1), 0, 0, 0);
             check("generic syscall(): 3 arguments shifted correctly (write)", r == (long)(sizeof msg - 1));
             r = rax();
             check("'mov rax, 39; syscall' (the __restore_rt form) works", r == host_pid());
+        }
+        if (gen && afw_sym(lib, "afw_sys_bss_page")) {
+            /* libc's WriteProtected<libc_globals> (issue #12): mprotect on the
+             * library's own .bss, through a patched site, as libc does it */
+            volatile char *pg = (volatile char *)afw_sym(lib, "afw_sys_bss_page");
+            int64_t a = (int64_t)(uintptr_t)pg, mr;
+            pg[0] = 5;
+            mr = gen(10, a, 4096, 1, 0, 0, 0);
+            printf("  mprotect(.bss page at image+0x%llx, PROT_READ) -> %lld\n",
+                   (unsigned long long)((uintptr_t)pg - (uintptr_t)lib->base), (long long)mr);
+            check("mprotect(PROT_READ) on the library's own .bss succeeds", mr == 0);
+            check("... the contents are kept", pg[0] == 5);
+            check("mprotect(PROT_READ|PROT_WRITE) back succeeds, and the page is writable",
+                  gen(10, a, 4096, 3, 0, 0, 0) == 0 && (pg[0] = 6, pg[0] == 6));
+            check("mprotect on the stub area after the image -> -ENOMEM (not Linux memory)",
+                  gen(10, (int64_t)(uintptr_t)lib->stub_area, 4096, 7, 0, 0, 0) == -12);
         }
     }
 
@@ -187,6 +343,58 @@ static int run_syscall_tests(const afw_lib *lib) {
         v = sw ? sw(4) : 0;
         check("syscall reached only through a switch table was patched and works",
               sw && v == host_pid() && afw_syscall_counts[39] == before + 1 && sw(6) == 16);
+    }
+
+    {   /* writev: libc's abort message goes through it (measured on Windows, PR #11) */
+        static const char p1[] = "  writev: ", p2[] = "two parts\n";
+        uint64_t iov[6] = {(uint64_t)(uintptr_t)p1, sizeof p1 - 1, 0, 0, (uint64_t)(uintptr_t)p2, sizeof p2 - 1};
+        int64_t a[6] = {1, (int64_t)(uintptr_t)iov, 3, 0, 0, 0};
+        int64_t bad[6] = {1, (int64_t)(uintptr_t)iov, 1025, 0, 0, 0};
+        int64_t badfd[6] = {7, (int64_t)(uintptr_t)iov, 3, 0, 0, 0};
+        fflush(stdout);
+        check("writev writes every iovec (an empty one included) and returns the total",
+              afw_syscall_dispatch(20, a) == (int64_t)(sizeof p1 - 1 + sizeof p2 - 1));
+        check("writev: more than IOV_MAX iovecs -> -EINVAL", afw_syscall_dispatch(20, bad) == -22);
+        check("writev: unknown fd -> -EBADF", afw_syscall_dispatch(20, badfd) == -9)   /* EBADF */;
+    }
+
+    {   /* futex, clock_gettime, getrandom, uid: where the real libc stopped (PR #11) */
+        static volatile int32_t word;
+        int64_t ts[2], t0, t1, now[2];
+        int64_t g[6] = {0};
+        unsigned char rnd[32] = {0};
+        int k, nz = 0;
+#define SC(nr, A0, A1, A2, A3, A4, A5) (g[0] = (int64_t)(A0), g[1] = (int64_t)(A1), g[2] = (int64_t)(A2), \
+                                        g[3] = (int64_t)(A3), g[4] = (int64_t)(A4), g[5] = (int64_t)(A5), \
+                                        afw_syscall_dispatch(nr, g))
+        word = 0;
+        check("futex WAIT on a changed value -> -EAGAIN at once", SC(202, &word, 128, 1, 0, 0, 0) == -11);
+        ts[0] = 0; ts[1] = 20000000;    /* 20ms, relative */
+        SC(228, 1, now, 0, 0, 0, 0); t0 = now[0] * 1000000000LL + now[1];
+        check("futex WAIT, nobody wakes, 20ms -> -ETIMEDOUT", SC(202, &word, 128, 0, ts, 0, 0) == -110);
+        SC(228, 1, now, 0, 0, 0, 0); t1 = now[0] * 1000000000LL + now[1];
+        check("... and it waited at least 20ms (never returns early)", t1 - t0 >= 20000000);
+        ts[0] = now[0]; ts[1] = now[1] + 20000000;
+        if (ts[1] >= 1000000000) { ts[0]++; ts[1] -= 1000000000; }
+        check("futex WAIT_BITSET with an absolute MONOTONIC deadline -> -ETIMEDOUT",
+              SC(202, &word, 128 | 9, 0, ts, 0, 0xffffffffu) == -110);
+        SC(228, 1, now, 0, 0, 0, 0);
+        check("... not before the deadline",
+              now[0] > ts[0] || (now[0] == ts[0] && now[1] >= ts[1]));
+        ts[0] = 0; ts[1] = 1000000000;
+        check("futex WAIT with tv_nsec = 1e9 -> -EINVAL", SC(202, &word, 128, 0, ts, 0, 0) == -22);
+        check("futex WAKE with nobody waiting -> 0", SC(202, &word, 128 | 1, 1, 0, 0, 0) == 0);
+        check("futex wait/wake between two threads", run_futex_threads(&word));
+        check("clock_gettime(REALTIME) is after 2020", SC(228, 0, now, 0, 0, 0, 0) == 0 && now[0] > 1577836800);
+        check("clock_gettime: unknown clock -> -EINVAL", SC(228, 99, now, 0, 0, 0, 0) == -22);
+        check("getrandom fills the buffer", SC(318, rnd, sizeof rnd, 0, 0, 0, 0) == (int64_t)sizeof rnd);
+        for (k = 0; k < (int)sizeof rnd; k++) nz |= rnd[k];
+        check("... with not-all-zero bytes", nz != 0);
+#if defined(_WIN32)
+        check("getuid / geteuid: the app uid 10000, as AT_UID says",
+              SC(102, 0, 0, 0, 0, 0, 0) == 10000 && SC(107, 0, 0, 0, 0, 0, 0) == 10000);
+#endif
+#undef SC
     }
 
     printf("\n");
@@ -332,6 +540,17 @@ static int run_tls_tests(const afw_lib *lib) {
     check("aligned(64) variable is 64-byte aligned", (aligned() & 63) == 0);
     check("aligned variable has its initial value", first() == 7);
     check("general-dynamic address lies below tp", (uintptr_t)gd() < (uintptr_t)afw_tls_block());
+    {   /* what bionic's __errno does (measured): [[tp] + 8] + 0x300; gettid reads +0x10 */
+        uintptr_t *tp = afw_tls_block();
+        unsigned char *pti = (unsigned char *)tp[TLS_SLOT_THREAD_ID];
+        int32_t tid;
+        check("tp[1] points at this thread's pthread_internal_t, inside its allocation",
+              pti && (uintptr_t)pti > (uintptr_t)tp && tp[TLS_SLOT_BIONIC_TLS] == (uintptr_t)(pti + AFW_BIONIC_TLS_OFF));
+        memcpy(&tid, pti + AFW_PTI_TID, 4);
+        check("pthread_internal_t holds the thread id where gettid reads it", tid != 0);
+        *(volatile int *)(pti + 0x300) = 34;
+        check("errno, written the way bionic writes it, reads back", *(volatile int *)(pti + 0x300) == 34);
+    }
 #if defined(_WIN32)
     check("initial-exec (fs:[0] + TPOFF64) == general-dynamic", ie() == gd());
     check("two threads, initial-exec: private copies", run_tls_threads(worker, 1, 0));
@@ -358,6 +577,13 @@ static int run_tls_tests(const afw_lib *lib) {
         check("... the same through afw_tls_init(): fails, then a retry really sets the thread up",
               run_fail_init_thread(1));
         check("a rebuild that succeeds still works afterwards", afw_tls_thread_rebuild() == 0 && *gd() == before);
+        {   /* the old allocation is freed by now: slots 1 and 9 must name the new one */
+            uintptr_t *tp = afw_tls_block();
+            unsigned char *pti = (unsigned char *)tp[TLS_SLOT_THREAD_ID];
+            check("... tp[1] moved with the block (not into the freed one) and errno carried over",
+                  (uintptr_t)pti > (uintptr_t)tp && *(volatile int *)(pti + 0x300) == 34 &&
+                  afw_tls_published_slot(TLS_SLOT_THREAD_ID) == (uintptr_t)pti);
+        }
     }
     {
         afw_tls_index bad;
@@ -442,9 +668,17 @@ static int run_redzone_tests(const afw_lib *lib) {
 }
 
 int main(int argc, char **argv) {
-    afw_lib lib;
+    static afw_lib lib;   /* loaded libraries stay loaded: the registry points at it */
     int verbose = 1, rc = 0, strict = 0, min_pads = 0, call_trap = 0;
     const char *preload_fail = NULL;
+    const char *finish_fail = NULL;
+#ifdef AFW_TEST
+    const char *finish_fail_late = NULL;
+#endif
+    int with_deps = 0;
+    int call_bad_ip = 0;   /* test: execute address 0x28 - must be a crash report, never a hang */
+    static afw_lib deps[32];
+    int ndeps = 0;
 
     setvbuf(stdout, NULL, _IONBF, 0); /* never lose output on a crash */
     afw_crash_init();
@@ -465,6 +699,19 @@ int main(int argc, char **argv) {
             else if (strcmp(argv[a], "--call-trap") == 0) call_trap = 1;
             else if (strncmp(argv[a], "--min-landing-pads=", 19) == 0) min_pads = atoi(argv[a] + 19);
             else if (strncmp(argv[a], "--preload-fail=", 15) == 0) preload_fail = argv[a] + 15;
+            else if (strncmp(argv[a], "--finish-fail=", 14) == 0) finish_fail = argv[a] + 14;
+#ifdef AFW_TEST
+            else if (strncmp(argv[a], "--finish-fail-late=", 19) == 0) finish_fail_late = argv[a] + 19;
+#endif
+            else if (strcmp(argv[a], "--with-deps") == 0) with_deps = 1;
+            else if (strcmp(argv[a], "--call-bad-ip") == 0) call_bad_ip = 1;
+            else if (strncmp(argv[a], "--watchdog=", 11) == 0) {
+                int sec = atoi(argv[a] + 11);
+                if (sec <= 0 || afw_watchdog_start((unsigned)sec) != 0) {
+                    fprintf(stderr, "error: --watchdog=SECONDS needs a positive number\n");
+                    return 2;
+                }
+            }
         }
     }
     if (afw_check_security() != 0) return 1;
@@ -483,7 +730,139 @@ int main(int argc, char **argv) {
         printf("  [ OK ] refused, and nothing left behind (libraries registered: %d)\n", afw_loaded_count());
     }
 
-    if (afw_load(argv[1], &lib, verbose) != 0) {
+    /* test (PR #11, reviewer 2): dlopen fails inside lib_finish() BEFORE TLS closes.
+     * Must roll back completely: zero dangling g_libs[], zero quarantined libs,
+     * zero orphan TLS modules, and TLS layout still open for subsequent loads. */
+    if (finish_fail) {
+        typedef SYSV void *(*dlopen_fn)(const char *, int, const void *);
+        typedef SYSV int (*dladdr_fn)(const void *, void *);
+        dlopen_fn dlo = (dlopen_fn)afw_shim_lookup("__loader_dlopen");
+        dladdr_fn dla = (dladdr_fn)afw_shim_lookup("__loader_dladdr");
+        struct { const char *fname; void *fbase; const char *sname; void *saddr; } info;
+        int before = afw_loaded_count(), before_q = afw_quarantined_count(), before_tls = afw_tls_static_count();
+        printf("Loading %s via dlopen with a forced early lib_finish() failure...\n", finish_fail);
+        afw_tls_test_fail_publish(3);
+        if (!dlo || !dla || dlo(finish_fail, 2, NULL) != NULL) {
+            printf("FAIL: dlopen did not fail as expected\n"); return 1;
+        }
+        /* Touch the registry immediately under ASan: catches dangling g_libs[] entries. */
+        if (afw_loaded_count() != before || afw_quarantined_count() != before_q ||
+            afw_tls_static_count() != before_tls || afw_tls_static_is_finished() != 0 ||
+            afw_find_loaded(finish_fail) != NULL ||
+            afw_global_sym("afw_deps_check") != NULL || dla(&info, &info) != 0) {
+            printf("FAIL: early lib_finish failure left state behind (loaded=%d quar=%d tls=%d fin=%d)\n",
+                   afw_loaded_count(), afw_quarantined_count(), afw_tls_static_count(), afw_tls_static_is_finished());
+            return 1;
+        }
+        printf("  [ OK ] lib_finish failure cleaned up cleanly (no UAF, libraries registered: %d)\n",
+               afw_loaded_count());
+    }
+
+#ifdef AFW_TEST
+    /* test (PR #11, reviewer 2): dlopen fails inside lib_finish() AFTER the point
+     * of no return (afw_tls_static_finish() succeeded and/or IFUNC ran), forced at
+     * afw_vma_adopt(). Verifies quarantine (no UAF, no orphan TLS module, consistent
+     * registry, and subsequent loads still work). */
+    if (finish_fail_late) {
+        typedef SYSV void *(*dlopen_fn)(const char *, int, const void *);
+        typedef SYSV int (*dladdr_fn)(const void *, void *);
+        dlopen_fn dlo = (dlopen_fn)afw_shim_lookup("__loader_dlopen");
+        dladdr_fn dla = (dladdr_fn)afw_shim_lookup("__loader_dladdr");
+        struct { const char *fname; void *fbase; const char *sname; void *saddr; } info;
+        int before = afw_loaded_count(), before_q = afw_quarantined_count(), before_tls = afw_tls_static_count();
+        const char *libpath = NULL;
+        int mode = 0;   /* 1=tls, 2=ifunc, 3=dep, 4=stress (>64 late failures) */
+        if (strncmp(finish_fail_late, "tls:", 4) == 0) { mode = 1; libpath = finish_fail_late + 4; }
+        else if (strncmp(finish_fail_late, "ifunc:", 6) == 0) { mode = 2; libpath = finish_fail_late + 6; }
+        else if (strncmp(finish_fail_late, "dep:", 4) == 0) { mode = 3; libpath = finish_fail_late + 4; }
+        else if (strncmp(finish_fail_late, "stress:", 7) == 0) { mode = 4; libpath = finish_fail_late + 7; }
+        else { printf("FAIL: bad --finish-fail-late mode: %s\n", finish_fail_late); return 1; }
+
+        if (mode == 4) {
+            /* >64 accumulated late failures in one process: verifies unbounded
+             * intrusive quarantine list (would overflow and UAF at #65 on a
+             * fixed 64-entry table). */
+            int iter, total = 70;
+            printf("Running %d consecutive late lib_finish() failures on %s...\n", total, libpath);
+            for (iter = 0; iter < total; iter++) {
+                afw_load_test_fail_adopt(1);
+                if (!dlo || !dla || dlo(libpath, 2, NULL) != NULL) {
+                    printf("FAIL: stress late dlopen #%d did not fail as expected\n", iter + 1);
+                    return 1;
+                }
+                afw_load_test_fail_adopt(0);
+            }
+            if (afw_loaded_count() != before || afw_quarantined_count() != before_q + total ||
+                afw_find_loaded(libpath) != NULL || afw_global_sym("afw_ifunc_call") != NULL ||
+                dla(&info, &info) != 0) {
+                printf("FAIL: stress quarantine counts mismatch (loaded=%d quar=%d)\n",
+                       afw_loaded_count(), afw_quarantined_count());
+                return 1;
+            }
+            /* Walk every quarantined entry under ASan: dereferences lib, path, and mapping. */
+            for (iter = 0; iter < total; iter++) {
+                const afw_lib *q = afw_quarantined_at(iter);
+                if (!q || !afw_is_retained(q) || afw_is_loaded(q) || !q->quarantined ||
+                    !q->code_ran || !q->base || q->size == 0 ||
+                    !q->path || !strstr(q->path, "libifunc_test.so")) {
+                    printf("FAIL: quarantined entry %d invalid or corrupted\n", iter);
+                    return 1;
+                }
+            }
+            printf("  [ OK ] stress test: %d late lib_finish failures quarantined cleanly (no UAF, loaded: %d, quarantined: %d)\n",
+                   total, afw_loaded_count(), afw_quarantined_count());
+        } else {
+            printf("Loading %s via dlopen with a forced late lib_finish() failure (mode=%d)...\n", libpath, mode);
+            afw_load_test_fail_adopt(mode == 3 ? 2 : 1);
+            if (!dlo || !dla || dlo(libpath, 2, NULL) != NULL) {
+                printf("FAIL: late dlopen did not fail as expected\n"); return 1;
+            }
+            afw_load_test_fail_adopt(0);
+
+            if (mode == 1) {
+                /* TLS module was already committed in finished layout -> quarantined, never unregistered */
+                if (afw_loaded_count() != before || afw_quarantined_count() != before_q + 1 ||
+                    afw_tls_static_is_finished() != 1 || afw_tls_static_count() != before_tls + 1 ||
+                    afw_find_loaded(libpath) != NULL || afw_global_sym("afw_tls_worker") != NULL ||
+                    dla(&info, &info) != 0) {
+                    printf("FAIL: late TLS quarantine mismatch (loaded=%d quar=%d tls=%d fin=%d)\n",
+                           afw_loaded_count(), afw_quarantined_count(), afw_tls_static_count(), afw_tls_static_is_finished());
+                    return 1;
+                }
+                printf("  [ OK ] late TLS lib_finish failure quarantined cleanly (loaded: %d, quarantined: %d, tls mods: %d)\n",
+                       afw_loaded_count(), afw_quarantined_count(), afw_tls_static_count());
+            } else if (mode == 2) {
+                /* IFUNC resolver ran (code_ran=1) before adopt failed -> quarantined */
+                if (afw_loaded_count() != before || afw_quarantined_count() != before_q + 1 ||
+                    afw_tls_static_is_finished() != 1 || afw_find_loaded(libpath) != NULL ||
+                    afw_global_sym("afw_ifunc_call") != NULL || dla(&info, &info) != 0) {
+                    printf("FAIL: late IFUNC quarantine mismatch (loaded=%d quar=%d fin=%d)\n",
+                           afw_loaded_count(), afw_quarantined_count(), afw_tls_static_is_finished());
+                    return 1;
+                }
+                printf("  [ OK ] late IFUNC lib_finish failure quarantined cleanly (loaded: %d, quarantined: %d)\n",
+                       afw_loaded_count(), afw_quarantined_count());
+            } else {
+                /* Dependency (libdeps_base.so) ran constructors -> stays loaded in g_libs[];
+                 * dependent (libdeps_user.so, with PT_TLS in closed layout) -> quarantined. */
+                if (afw_loaded_count() != before + 1 || afw_quarantined_count() != before_q + 1 ||
+                    afw_tls_static_is_finished() != 1 || afw_tls_static_count() != before_tls + 1 ||
+                    afw_find_loaded("libdeps_base.so") == NULL || afw_global_sym("afw_base_value") == NULL ||
+                    afw_find_loaded(libpath) != NULL || afw_global_sym("afw_deps_check") != NULL ||
+                    dla(&info, &info) != 0) {
+                    printf("FAIL: late dep-set quarantine mismatch (loaded=%d quar=%d tls=%d fin=%d)\n",
+                           afw_loaded_count(), afw_quarantined_count(), afw_tls_static_count(), afw_tls_static_is_finished());
+                    return 1;
+                }
+                printf("  [ OK ] late dep-set lib_finish failure kept base loaded and quarantined user (loaded: %d, quarantined: %d, tls mods: %d)\n",
+                       afw_loaded_count(), afw_quarantined_count(), afw_tls_static_count());
+            }
+        }
+    }
+#endif
+
+    if ((with_deps ? afw_load_with_deps(argv[1], &lib, deps, 32, &ndeps, verbose)
+                   : afw_load(argv[1], &lib, verbose)) != 0) {
         printf("\nLoad failed.\n");
         return 1;
     }
@@ -491,7 +870,7 @@ int main(int argc, char **argv) {
     printf("\nLoaded at %p (%zu KB)\n", (void *)lib.base, lib.size / 1024);
     printf("  relocations applied: %d\n", lib.nrelocs);
     printf("  exports:             %d\n", lib.nexports);
-    printf("  imports linked:      %d\n", lib.nimports_shimmed);
+    printf("  imports linked:      %d (to bionic-win), %d (to other loaded libraries)\n", lib.nimports_shimmed, lib.nimports_linked);
     printf("  imports missing:     %d\n", lib.nimports_missing);
     printf("  weak imports empty:  %d\n", lib.nimports_weak_null);
 
@@ -513,6 +892,13 @@ int main(int argc, char **argv) {
     if (afw_load_patch_only)
         printf("GATE %s: %s\n", lib.soname ? lib.soname : argv[1],
                afw_gate_ok(&lib) ? "would RUN" : "would REFUSE");
+    if (afw_load_patch_only && !afw_gate_ok(&lib))
+            printf("GATE reasons: unproven %d, lsda failures %d, syscall untouched %d, syscall outside %d, "
+                   "fs unsupported %d, fs outside %d, gs unsupported %d, gs outside %d, fs:[reg] %d/%d\n",
+                   lib.patch.unproven, lib.patch.lsda_failures, lib.patch.sys_untouched,
+                   lib.patch.sys_outside_functions, lib.patch.fs_unsupported, lib.patch.fs_outside_functions,
+                   lib.patch.gs_unsupported, lib.patch.gs_outside_functions,
+                   lib.patch.fs_reg_trampolined, lib.patch.fs_reg_feasible);
     if (afw_load_patch_only && strict) {
         int bad = lib.patch.unproven || lib.patch.lsda_failures ||
                   lib.patch.landing_pads < min_pads;
@@ -546,6 +932,30 @@ int main(int argc, char **argv) {
     if (afw_sym(&lib, "afw_rz_safe")) rc |= run_redzone_tests(&lib);
     if (afw_sym(&lib, "afw_tls_worker")) rc |= run_tls_tests(&lib);
     if (afw_sym(&lib, "afw_ie_read_b")) rc |= run_ie_tests(&lib);
+    if (afw_sym(&lib, "afw_deps_check")) {
+        typedef int (SYSV *dfn)(void);
+        printf("\nDependency test (--with-deps):\n");
+        check("imports, an imported IFUNC and TLS: 30 + 5 + 7, constructor of the dependency first",
+              ((dfn)afw_sym(&lib, "afw_deps_check"))() == 42);
+        check("it was linked to a library, not to bionic-win", lib.nimports_linked >= 3);
+        check("it has TLS although the dependency loaded first has none", lib.tls_module >= 1);
+        run_loader_api_tests(&lib);
+        printf("%s\n", g_failed ? "DEPS TEST FAILED" : "DEPS TEST PASSED");
+        rc |= g_failed;
+    }
+    if (afw_sym(&lib, "afw_real_libc_check")) {
+        typedef int (SYSV *rfn)(void);
+        static const char *what[] = {"snprintf", "malloc/free (scudo)", "qsort", "errno (strtol ERANGE)",
+                                     "pthread_self", "getpid", "clock_gettime", "strdup",
+                                     "malloc 8MB (mmap)", "printf", "strerror"};
+        int bits, k;
+        printf("\nReal bionic libc test (Android code calling the real libc.so):\n");
+        fflush(stdout);
+        bits = ((rfn)afw_sym(&lib, "afw_real_libc_check"))();
+        for (k = 0; k < 11; k++) check(what[k], (bits >> k) & 1);
+        printf("%s\n", g_failed ? "REAL LIBC TEST FAILED" : "REAL LIBC TEST PASSED");
+        rc |= g_failed;
+    }
     if (afw_sym(&lib, "afw_ifunc_call")) {
         typedef int (SYSV *ifn)(void);
         printf("\nIFUNC test (resolver runs after patching, reads the stack guard):\n");
@@ -554,6 +964,14 @@ int main(int argc, char **argv) {
               ((ifn)afw_sym(&lib, "afw_ifunc_call_hidden"))() == 42);
         printf("%s\n", g_failed ? "IFUNC TEST FAILED" : "IFUNC TEST PASSED");
         rc |= g_failed;
+    }
+    if (call_bad_ip) {
+        typedef void (*bad_fn)(void);
+        volatile uintptr_t where = 0x28;   /* low, like an fs: fault address - but an EXECUTE fault */
+        printf("\nCalling address 0x28 on purpose (expect a crash report, not a hang)...\n");
+        ((bad_fn)where)();
+        printf("ERROR: executing 0x28 did not crash\n");
+        return 99;
     }
     if (call_trap) {
         typedef long (SYSV *f1)(int);

@@ -11,16 +11,27 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
 #include <unistd.h>
+#include <sys/syscall.h>
+#include <time.h>
 #endif
 
 #define LNX_ENOSYS 38
 #define LNX_EBADF 9
+#define LNX_EAGAIN 11
+#define LNX_EINVAL 22
+#define LNX_EFAULT 14
+#define LNX_ETIMEDOUT 110
+
+#if defined(_WIN32)
+#pragma comment(lib, "synchronization.lib")   /* WaitOnAddress / WakeByAddress* */
+#endif
 
 long afw_syscall_counts[AFW_MAX_SYSCALL];
 static long g_unimplemented[AFW_MAX_SYSCALL];
@@ -74,7 +85,7 @@ __attribute__((naked)) void afw_syscall_entry(void) {
         "and $-16, %rsp\n\t"
         "sub $32, %rsp\n\t"
         DISPATCH_ARGS
-        "call afw_syscall_dispatch\n\t"
+        "call afw_syscall_from_entry\n\t"
         "movdqu -304(%rbp), %xmm0\n\t"
         "movdqu -288(%rbp), %xmm1\n\t"
         "movdqu -272(%rbp), %xmm2\n\t"
@@ -122,6 +133,168 @@ static int64_t sys_write(int64_t fd, const void *buf, uint64_t len) {
 #endif
 }
 
+/* writev: each iovec in order through write(); stops at the first short or
+ * failed write, like Linux returns the bytes written so far. */
+static int64_t sys_writev(int64_t fd, const uint64_t *iov, int64_t cnt) {
+    int64_t total = 0, i;
+    if (cnt < 0 || cnt > 1024) return -22;          /* EINVAL beyond IOV_MAX */
+    for (i = 0; i < cnt; i++) {
+        uint64_t len = iov[2 * i + 1];
+        int64_t r;
+        if (!len) continue;
+        r = sys_write(fd, (const void *)(uintptr_t)iov[2 * i], len);
+        if (r < 0) return total ? total : r;
+        total += r;
+        if ((uint64_t)r < len) break;
+    }
+    return total;
+}
+
+static int64_t sys_gettid(void) {   /* the same id the thread area holds (tls_patch.c) */
+#if defined(_WIN32)
+    return (int64_t)GetCurrentThreadId();
+#else
+    return (int64_t)syscall(SYS_gettid);
+#endif
+}
+
+/* ---- time --------------------------------------------------------------- */
+struct lnx_timespec { int64_t tv_sec, tv_nsec; };
+#define LNX_CLOCK_REALTIME 0
+#define LNX_CLOCK_MONOTONIC 1
+#define LNX_CLOCK_PROCESS_CPUTIME_ID 2
+#define LNX_CLOCK_THREAD_CPUTIME_ID 3
+#define LNX_CLOCK_MONOTONIC_RAW 4
+#define LNX_CLOCK_REALTIME_COARSE 5
+#define LNX_CLOCK_MONOTONIC_COARSE 6
+#define LNX_CLOCK_BOOTTIME 7
+
+/* Nanoseconds on one clock; -1 for a clock we do not have. */
+static int64_t clock_ns(int64_t clk) {
+#if defined(_WIN32)
+    switch (clk) {
+    case LNX_CLOCK_REALTIME: case LNX_CLOCK_REALTIME_COARSE: {
+        FILETIME ft;   /* 100ns since 1601 */
+        uint64_t t;
+        GetSystemTimePreciseAsFileTime(&ft);
+        t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+        return (int64_t)(t - 116444736000000000ULL) * 100;
+    }
+    case LNX_CLOCK_MONOTONIC: case LNX_CLOCK_MONOTONIC_RAW:
+    case LNX_CLOCK_MONOTONIC_COARSE: case LNX_CLOCK_BOOTTIME: {
+        static LARGE_INTEGER f;
+        LARGE_INTEGER c;
+        if (!f.QuadPart) QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&c);
+        return (int64_t)(c.QuadPart / f.QuadPart) * 1000000000LL +
+               (int64_t)(c.QuadPart % f.QuadPart) * 1000000000LL / f.QuadPart;
+    }
+    case LNX_CLOCK_PROCESS_CPUTIME_ID: case LNX_CLOCK_THREAD_CPUTIME_ID: {
+        FILETIME c, e, k, u;
+        BOOL ok = clk == LNX_CLOCK_PROCESS_CPUTIME_ID ? GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)
+                                                      : GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u);
+        if (!ok) return -1;
+        return (int64_t)((((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime) +
+                         (((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime)) * 100;
+    }
+    default: return -1;
+    }
+#else
+    struct timespec ts;
+    if (clock_gettime((clockid_t)clk, &ts) != 0) return -1;
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+#endif
+}
+
+static int64_t sys_clock_gettime(int64_t clk, struct lnx_timespec *tp) {
+    int64_t ns = clock_ns(clk);
+    if (ns < 0) return -LNX_EINVAL;
+    if (!tp) return -LNX_EFAULT;
+    tp->tv_sec = ns / 1000000000LL;
+    tp->tv_nsec = ns % 1000000000LL;
+    return 0;
+}
+
+/* ---- futex (one process: WaitOnAddress / WakeByAddress*) ---------------- */
+#define FUTEX_WAIT 0
+#define FUTEX_WAKE 1
+#define FUTEX_WAIT_BITSET 9
+#define FUTEX_WAKE_BITSET 10
+#define FUTEX_PRIVATE_FLAG 128
+#define FUTEX_CLOCK_REALTIME 256
+#define FUTEX_BITSET_MATCH_ANY 0xffffffffu
+
+#if defined(_WIN32)
+/* The deadline in ns on clock clk: a relative timeout becomes absolute on
+ * MONOTONIC now. 0 = none (wait forever); -1 = a malformed timespec. */
+static int64_t deadline_ns(const struct lnx_timespec *t, int absolute, int64_t *clk) {
+    int64_t ns;
+    if (!t) return 0;
+    if (t->tv_sec < 0 || t->tv_nsec < 0 || t->tv_nsec >= 1000000000LL) return -1;
+    if (t->tv_sec > (INT64_MAX / 2) / 1000000000LL) return 0;          /* centuries: forever */
+    ns = t->tv_sec * 1000000000LL + t->tv_nsec;
+    if (!absolute) { *clk = LNX_CLOCK_MONOTONIC; ns += clock_ns(LNX_CLOCK_MONOTONIC); }
+    return ns > 0 ? ns : 1;
+}
+#endif
+
+static int64_t sys_futex(int64_t uaddr, int64_t op_full, int64_t val, int64_t ts, int64_t uaddr2, int64_t val3) {
+    int op = (int)(op_full & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME));
+    volatile int32_t *p = (volatile int32_t *)(uintptr_t)uaddr;
+    (void)uaddr2;
+    if (!p || (uaddr & 3)) return -LNX_EINVAL;
+    if ((op == FUTEX_WAIT_BITSET || op == FUTEX_WAKE_BITSET) && (uint32_t)val3 != FUTEX_BITSET_MATCH_ANY) {
+        if ((uint32_t)val3 == 0) return -LNX_EINVAL;
+        return -LNX_ENOSYS;      /* partial bitsets: not used by bionic; refused loudly */
+    }
+#if defined(_WIN32)
+    if (op == FUTEX_WAIT || op == FUTEX_WAIT_BITSET) {
+        int32_t expect = (int32_t)val;
+        int64_t clk = (op_full & FUTEX_CLOCK_REALTIME) ? LNX_CLOCK_REALTIME : LNX_CLOCK_MONOTONIC;
+        int64_t dl = deadline_ns((const struct lnx_timespec *)(uintptr_t)ts, op == FUTEX_WAIT_BITSET, &clk);
+        if (dl < 0) return -LNX_EINVAL;
+        if (*p != expect) return -LNX_EAGAIN;           /* the value already changed */
+        for (;;) {
+            DWORD ms = INFINITE;
+            if (dl) {
+                int64_t left = dl - clock_ns(clk);
+                if (left <= 0) return -LNX_ETIMEDOUT;
+                left = (left + 999999) / 1000000;       /* round up */
+                ms = left >= (int64_t)INFINITE ? INFINITE - 1 : (DWORD)left;
+            }
+            if (WaitOnAddress((volatile VOID *)p, &expect, sizeof expect, ms)) return 0;
+            /* a return of 0 may be spurious: futex callers re-check, as on Linux */
+            if (GetLastError() != ERROR_TIMEOUT) return -LNX_EINVAL;
+            /* Windows timers may fire up to a tick early: never report a
+             * timeout before the deadline (measured: a test failed on CI) */
+        }
+    }
+    if (op == FUTEX_WAKE || op == FUTEX_WAKE_BITSET) {
+        /* WakeByAddress* does not say how many woke; bionic ignores the count.
+         * Report 0, never more than were asked. */
+        if (val <= 0) return 0;
+        if (val == 1) WakeByAddressSingle((PVOID)p);
+        else WakeByAddressAll((PVOID)p);
+        return 0;
+    }
+    return -LNX_ENOSYS;
+#else
+    if (op != FUTEX_WAIT && op != FUTEX_WAKE && op != FUTEX_WAIT_BITSET && op != FUTEX_WAKE_BITSET)
+        return -LNX_ENOSYS;
+    {   /* host build: the real futex, same semantics */
+        long r = syscall(SYS_futex, p, (int)op_full, (int)val, (void *)(uintptr_t)ts, (void *)(uintptr_t)uaddr2, (int)val3);
+        return r < 0 ? -(int64_t)errno : r;
+    }
+#endif
+}
+
+static int64_t sys_getrandom(void *buf, uint64_t len, int64_t flags) {
+    (void)flags;   /* GRND_NONBLOCK / GRND_RANDOM: the OS generator never blocks */
+    if (!buf) return -LNX_EFAULT;
+    if (len > 33554431) len = 33554431;      /* Linux caps one call at 32MB-1 */
+    return afw_random_bytes(buf, (size_t)len) == 0 ? (int64_t)len : -LNX_EAGAIN;
+}
+
 static int64_t sys_getpid(void) {
 #if defined(_WIN32)
     return (int64_t)GetCurrentProcessId();
@@ -130,11 +303,34 @@ static int64_t sys_getpid(void) {
 #endif
 }
 
+/* The last syscall the process made (diagnosis: the watchdog). The
+ * entry frame holds the return address into the patched wrapper at
+ * rbp+16, 64 bytes above args (rbp-48). Only set when called through the
+ * entry (afw_syscall_entry_frame), never from tests calling dispatch. */
+volatile int64_t afw_last_syscall_nr = -1;
+volatile int64_t afw_last_syscall_args[6];
+volatile uint64_t afw_last_syscall_ret;
+
+int64_t afw_syscall_from_entry(int64_t nr, int64_t *a) {
+    int i;
+    afw_last_syscall_nr = nr;
+    for (i = 0; i < 6; i++) afw_last_syscall_args[i] = a[i];
+    afw_last_syscall_ret = ((uint64_t *)a)[8];
+    return afw_syscall_dispatch(nr, a);
+}
+
 int64_t afw_syscall_dispatch(int64_t nr, int64_t *a) {
     if (nr >= 0 && nr < AFW_MAX_SYSCALL) afw_syscall_counts[nr]++;
     switch (nr) {
     case 1:   return sys_write(a[0], (const void *)(uintptr_t)a[1], (uint64_t)a[2]);
     case 39:  return sys_getpid();
+    case 20:  return sys_writev(a[0], (const uint64_t *)(uintptr_t)a[1], a[2]);
+    case 202: return sys_futex(a[0], a[1], a[2], a[3], a[4], a[5]);
+    case 228: return sys_clock_gettime(a[0], (struct lnx_timespec *)(uintptr_t)a[1]);
+    case 318: return sys_getrandom((void *)(uintptr_t)a[0], (uint64_t)a[1], a[2]);
+    /* one app user, as AT_UID/AT_GID say (bionic_shim.c): uid 10000 */
+    case 102: case 104: case 107: case 108: return 10000;   /* getuid getgid geteuid getegid */
+    case 186: return sys_gettid();
     case 9:   return afw_mmap((uint64_t)a[0], (uint64_t)a[1], (int)a[2], (int)a[3], (int)a[4], a[5]);
     case 10:  return afw_mprotect((uint64_t)a[0], (uint64_t)a[1], (int)a[2]);
     case 11:  return afw_munmap((uint64_t)a[0], (uint64_t)a[1]);

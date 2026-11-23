@@ -26,4 +26,9 @@ cc -O2 -Wall -o "$OUT/syscall_scan" "$ROOT/tools/syscall_scan.c" \
    -I"$ROOT/third_party/zydis/dependencies/zycore/include" \
    -I"$OUT/zydis" -I"$OUT/zydis/zycore" \
    "$OUT/zydis/libZydis.a"
-echo "built $OUT/syscall_scan"
+cc -O2 -Wall -o "$OUT/gs_count" "$ROOT/tools/gs_count.c" \
+   -I"$ROOT/third_party/zydis/include" \
+   -I"$ROOT/third_party/zydis/dependencies/zycore/include" \
+   -I"$OUT/zydis" -I"$OUT/zydis/zycore" \
+   "$OUT/zydis/libZydis.a"
+echo "built $OUT/syscall_scan $OUT/gs_count"

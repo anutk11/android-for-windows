@@ -71,6 +71,8 @@ typedef struct {
     int fs_reg_trampolined;    /* fs:[reg] rewritten through a jmp trampoline (Windows) */
     int fs_reg_feasible;       /* fs:[reg] a trampoline can handle (counted on every platform) */
     int fs_unsupported;        /* reachable fs: access other than a read of fs:[0] / fs:[0x28]: blocks loading */
+    int gs_unsupported;        /* reachable gs: access (ART's Thread*; on Windows gs is the TEB): blocks loading */
+    int gs_outside_functions;  /* gs: look-alikes outside .eh_frame: blocks loading, like fs: */
     int redzone_direct;        /* refusals by reason: [rsp-N] */
     int redzone_via_copy;      /* [reg-N] beyond what sub rsp allocated */
     /* every reachable fs:[disp32] access by (offset, instruction, read/write) */
