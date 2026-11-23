@@ -9,6 +9,7 @@
 #include <time.h>
 #endif
 
+#include "../src/platform.h"
 #include "../src/syscall.h"
 #include "../src/vma.h"
 
@@ -27,6 +28,7 @@ static const char *state(uint64_t a) {
     if (mi.Protect == PAGE_READWRITE) return "commit-rw";
     if (mi.Protect == PAGE_NOACCESS) return "commit-none";
     if (mi.Protect == PAGE_READONLY) return "commit-r";
+    if (mi.Protect == PAGE_EXECUTE_READ) return "commit-rx";
     return "commit-other";
 }
 static double now_ms(void) {
@@ -258,8 +260,9 @@ int main(void) {
               afw_vma_alloc_count() == 0 && afw_vma_extent_count() == 0);
     }
 
-    printf("13. OS failure injection: metadata stays truthful on failure\n");
+    printf("13. OS failure injection and MAP_FIXED_NOREPLACE\n");
     {
+#ifdef AFW_TEST
         /* 13a: commit fails on a fresh mmap(RW) -> reservation rolled back */
         afw_vma_test_fail_os(2);   /* 1 = os_reserve succeeds, 2 = os_commit fails */
         check("mmap(RW) rolls back reservation when commit fails",
@@ -296,6 +299,7 @@ int main(void) {
         check("mprotect(RW) afterwards commits cleanly with zeros",
               MPROTECT(b, 8 * K, RW) == 0 && all_zero(p, 8 * K));
         MUNMAP(b, 8 * K);
+#endif
 
         /* 13d: MAP_FIXED_NOREPLACE rejects mapped ranges and accepts holes */
         b = MMAP(0, 16 * K, RW, ANON);
@@ -306,6 +310,7 @@ int main(void) {
               MMAP(b + 4 * K, 4 * K, RW, ANON | LNX_MAP_FIXED_NOREPLACE) == b + 4 * (int64_t)K);
         MUNMAP(b, 16 * K);
 
+#ifdef AFW_TEST
         /* 13e: MAP_FIXED over committed page where decommit succeeds and commit fails */
         b = MMAP(0, 8 * K, RW, ANON);
         p = (unsigned char *)(uintptr_t)b;
@@ -320,6 +325,7 @@ int main(void) {
         check("retry MAP_FIXED succeeds and zeroes first page",
               MMAP(b, 4 * K, RW, ANON | LNX_MAP_FIXED) == b && all_zero(p, 4 * K) && p[4 * K] == 0xdd);
         MUNMAP(b, 8 * K);
+#endif
         check("all test-13 allocations released", afw_vma_alloc_count() == 0);
     }
 
@@ -346,6 +352,127 @@ int main(void) {
               MUNMAP(s[2], 16 * K) == 0 && MUNMAP(s[0], 16 * K) == 0);
         check("zero allocations and extents remain",
               afw_vma_alloc_count() == 0 && afw_vma_extent_count() == 0);
+    }
+
+    printf("15. Adopted ELF library (issue #12): WriteProtected mprotect, RELRO, stub isolation\n");
+    {
+        /* Simulate elf_loader: 4-page image [R, RX, RW (GOT/RELRO), RW (.bss)] + 64KB RX stub reserve */
+        size_t img_sz = 16 * K, stub_sz = 64 * K;
+        unsigned char *img = (unsigned char *)afw_mem_alloc(img_sz + stub_sz);
+        uint64_t ibase = (uint64_t)(uintptr_t)img;
+        uint64_t bss = ibase + 12 * K;
+        uint64_t stub = ibase + img_sz;
+        unsigned char lnx_prot[4] = {
+            LNX_PROT_READ,
+            LNX_PROT_READ | LNX_PROT_EXEC,
+            RW,
+            RW
+        };
+        uint64_t c0;
+        check("allocated simulated library + stub reserve", img != NULL);
+        if (img) {
+            img[12 * K] = 0x55;
+            img[12 * K + 4095] = 0x66;
+            check("loader set initial segment and stub protections",
+                  afw_mem_protect(img, 4 * K, AFW_PROT_R) == 0 &&
+                  afw_mem_protect(img + 4 * K, 4 * K, AFW_PROT_R | AFW_PROT_X) == 0 &&
+                  afw_mem_protect(img + 8 * K, 8 * K, AFW_PROT_R | AFW_PROT_W) == 0 &&
+                  afw_mem_protect(img + img_sz, stub_sz, AFW_PROT_R | AFW_PROT_X) == 0);
+
+            /* Before adopt: exact failure from issue #12 */
+            check("before adopt: mprotect on .bss fails with ENOMEM",
+                  MPROTECT(bss, 4 * K, LNX_PROT_READ) == -12);
+
+            c0 = afw_vma_os_call_count();
+            check("afw_vma_adopt succeeds with 0 OS calls and 3 normalized extents [R, RX, RW]",
+                  afw_vma_adopt(ibase, img_sz, lnx_prot) == 0 &&
+                  afw_vma_os_call_count() == c0 &&
+                  afw_vma_alloc_count() == 1 && afw_vma_extent_count() == 3);
+
+            /* Re-adopt after RELRO (page 2 RW -> R) BEFORE any Linux VMA call succeeds */
+            check("loader applies RELRO to page 2", afw_mem_protect(img + 8 * K, 4 * K, AFW_PROT_R) == 0);
+            lnx_prot[2] = LNX_PROT_READ;
+            c0 = afw_vma_os_call_count();
+            check("re-adopt after RELRO (before Linux VMA calls) updates extents to 4 [R, RX, R, RW]",
+                  afw_vma_adopt(ibase, img_sz, lnx_prot) == 0 &&
+                  afw_vma_os_call_count() == c0 && afw_vma_extent_count() == 4);
+
+            /* libc WriteProtected<libc_globals>: partial mprotect RW -> RO on .bss
+             * (all pages stay mapped and committed), then re-adopt MUST be refused. */
+            check("WriteProtected lock: mprotect(.bss, PROT_READ) succeeds",
+                  MPROTECT(bss, 4 * K, LNX_PROT_READ) == 0);
+            WIN_CHECK(".bss is now commit-r", bss, "commit-r");
+            check("page 2 + .bss coalesced to 3 extents [R, RX, R]", afw_vma_extent_count() == 3);
+            check("re-adopt after partial Linux mprotect is refused with -EINVAL (reviewer 2)",
+                  afw_vma_adopt(ibase, img_sz, lnx_prot) == -22);
+            c0 = afw_vma_os_call_count();
+            check("refused re-adopt left metadata intact (3 extents, .bss still PROT_READ -> 0 OS calls)",
+                  afw_vma_extent_count() == 3 &&
+                  MPROTECT(bss, 4 * K, LNX_PROT_READ) == 0 &&
+                  afw_vma_os_call_count() == c0);
+            WIN_CHECK(".bss stayed commit-r after refused re-adopt", bss, "commit-r");
+
+            check("WriteProtected unlock: mprotect(.bss, RW) succeeds",
+                  MPROTECT(bss, 4 * K, RW) == 0);
+            WIN_CHECK(".bss is back to commit-rw", bss, "commit-rw");
+            check(".bss contents survived RO->RW and are writable",
+                  img[12 * K] == 0x55 && img[12 * K + 4095] == 0x66 && ((img[12 * K] = 0x77) == 0x77));
+
+            /* Stub reserve stays invisible and protected from Linux syscalls */
+            check("mprotect on stub area fails with ENOMEM", MPROTECT(stub, 4 * K, RW) == -12);
+            check("mprotect spanning image end + stub area fails with ENOMEM (no partial change)",
+                  MPROTECT(bss, 8 * K, LNX_PROT_READ) == -12);
+            WIN_CHECK(".bss stayed commit-rw", bss, "commit-rw");
+            WIN_CHECK("stub area stayed commit-rx", stub, "commit-rx");
+
+            /* Decommit via PROT_NONE + MADV_DONTNEED: still mapped, not committed -> re-adopt refused */
+            check("decommit .bss via PROT_NONE + MADV_DONTNEED",
+                  MPROTECT(bss, 4 * K, 0) == 0 && MADVISE(bss, 4 * K, LNX_MADV_DONTNEED) == 0);
+            WIN_CHECK(".bss dropped to reserved", bss, "reserved");
+            check("re-adopt after decommit is refused with -EINVAL (reviewer 2 contract)",
+                  afw_vma_adopt(ibase, img_sz, lnx_prot) == -22);
+
+            /* Even full munmap of image (+ overshoot into stub) must NOT release VirtualAlloc or touch stub */
+            check("munmap across image + stub decommits image only", MUNMAP(ibase, img_sz + stub_sz) == 0);
+            WIN_CHECK("image page is decommitted (reserved)", ibase, "reserved");
+            WIN_CHECK("stub area is STILL commit-rx after full image munmap", stub, "commit-rx");
+            check("re-adopt after munmap is refused with -EINVAL (reviewer 2 contract)",
+                  afw_vma_adopt(ibase, img_sz, lnx_prot) == -22);
+            check("mprotect on unmapped image still fails with -ENOMEM after refused re-adopt",
+                  MPROTECT(ibase, 4 * K, RW) == -12);
+
+            /* Interior forget and partial-overlap adopt must be refused */
+            check("partial-overlap adopt refused with -EEXIST",
+                  afw_vma_adopt(ibase + 4 * K, 4 * K, lnx_prot) == -17);
+            check("forget on interior address refused with -EINVAL",
+                  afw_vma_forget(ibase + 4 * K) == -22 && afw_vma_alloc_count() == 1);
+
+            /* Discard/unload: afw_vma_forget removes tracking with 0 OS calls, idempotent */
+            c0 = afw_vma_os_call_count();
+            check("afw_vma_forget removes adopted entry with 0 OS calls",
+                  afw_vma_forget(ibase) == 0 && afw_vma_os_call_count() == c0 &&
+                  afw_vma_alloc_count() == 0 && afw_vma_extent_count() == 0);
+            check("second afw_vma_forget is a safe no-op", afw_vma_forget(ibase) == 0);
+            WIN_CHECK("stub area still exists until loader calls afw_mem_free", stub, "commit-rx");
+            afw_mem_free(img, img_sz + stub_sz);
+            WIN_CHECK("whole allocation free after loader afw_mem_free", ibase, "free");
+        }
+
+        /* Argument & ownership guards */
+        check("adopt rejects bad args (null, unaligned, zero, overflow)",
+              afw_vma_adopt(0, 4 * K, lnx_prot) == -22 &&
+              afw_vma_adopt(0x10001, 4 * K, lnx_prot) == -22 &&
+              afw_vma_adopt(0x10000, 0, lnx_prot) == -22 &&
+              afw_vma_adopt(0x10000, 100, lnx_prot) == -22 &&
+              afw_vma_adopt(0x10000, 4 * K, NULL) == -22 &&
+              afw_vma_adopt(UINT64_MAX - 0xfff, 8 * K, lnx_prot) == -22);
+        b = MMAP(0, 8 * K, RW, ANON);
+        check("adopt rejects overlapping a VMA-owned mmap (-EEXIST)",
+              afw_vma_adopt((uint64_t)b, 8 * K, lnx_prot) == -17);
+        check("forget refuses to drop a VMA-owned mmap (-EINVAL)",
+              afw_vma_forget((uint64_t)b) == -22 && afw_vma_alloc_count() == 1);
+        MUNMAP(b, 8 * K);
+        check("zero allocations remain after test 15", afw_vma_alloc_count() == 0);
     }
 
     printf("\n%s\n", failed ? "VMA TESTS FAILED" : "VMA TESTS PASSED");

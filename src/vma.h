@@ -49,6 +49,39 @@ int64_t afw_munmap(uint64_t addr, uint64_t len);
 int64_t afw_mprotect(uint64_t addr, uint64_t len, int prot);
 int64_t afw_madvise(uint64_t addr, uint64_t len, int advice);
 
+/*
+ * Register an externally mapped region (e.g. an ELF library image allocated
+ * with afw_mem_alloc) so Linux mprotect/madvise/munmap/MAP_FIXED work on
+ * [base, base + size). Any stub reserve after base + size stays outside VMA.
+ *
+ * Ownership stays with the caller: VMA never calls VirtualFree(MEM_RELEASE)
+ * or full-region munmap on an adopted entry; call afw_vma_forget(base) before
+ * afw_mem_free().
+ *
+ * page_prot holds (size / 4096) entries using LNX_PROT_* flags (NOT ELF PF_*
+ * flags: LNX_PROT_READ=1, LNX_PROT_WRITE=2, LNX_PROT_EXEC=4). All pages are
+ * recorded as mapped and committed.
+ *
+ * Re-adopt contract (calling afw_vma_adopt() again on the exact same adopted
+ * [base, base + size)):
+ *   - allowed ONLY while the entire range is still mapped and committed;
+ *   - intended solely to update protections (e.g. after RELRO) BEFORE any
+ *     Linux code has touched the region;
+ *   - MUST NOT be used to bring back a region after munmap or decommit, or
+ *     after any Linux-side VMA change (returns -EINVAL if any Linux-side
+ *     VMA operation has touched the region, or if any tracked page is
+ *     unmapped or decommitted).
+ * Returns 0 or -errno (-EINVAL, -ENOMEM, -EEXIST).
+ */
+int afw_vma_adopt(uint64_t base, uint64_t size, const unsigned char *page_prot);
+
+/*
+ * Drop an adopted region from VMA tracking without making OS calls (call
+ * before afw_mem_free). Idempotent if base is not registered (returns 0).
+ * Returns -EINVAL if base is an interior address or a VMA-owned mmap.
+ */
+int afw_vma_forget(uint64_t base);
+
 /* For tests: live Windows allocations, total metadata bytes, total extents,
  * and total OS memory calls made so far. */
 int afw_vma_alloc_count(void);
@@ -56,7 +89,9 @@ size_t afw_vma_meta_bytes(void);
 size_t afw_vma_extent_count(void);
 uint64_t afw_vma_os_call_count(void);
 
+#ifdef AFW_TEST
 /* Test hook: fail the nth next OS memory call (1 = very next, 0 = off). */
 void afw_vma_test_fail_os(int nth);
+#endif
 
 #endif
