@@ -389,23 +389,34 @@ int main(void) {
                   afw_vma_os_call_count() == c0 &&
                   afw_vma_alloc_count() == 1 && afw_vma_extent_count() == 3);
 
-            /* libc WriteProtected<libc_globals>: RW -> RO -> RW on .bss */
+            /* Re-adopt after RELRO (page 2 RW -> R) BEFORE any Linux VMA call succeeds */
+            check("loader applies RELRO to page 2", afw_mem_protect(img + 8 * K, 4 * K, AFW_PROT_R) == 0);
+            lnx_prot[2] = LNX_PROT_READ;
+            c0 = afw_vma_os_call_count();
+            check("re-adopt after RELRO (before Linux VMA calls) updates extents to 4 [R, RX, R, RW]",
+                  afw_vma_adopt(ibase, img_sz, lnx_prot) == 0 &&
+                  afw_vma_os_call_count() == c0 && afw_vma_extent_count() == 4);
+
+            /* libc WriteProtected<libc_globals>: partial mprotect RW -> RO on .bss
+             * (all pages stay mapped and committed), then re-adopt MUST be refused. */
             check("WriteProtected lock: mprotect(.bss, PROT_READ) succeeds",
                   MPROTECT(bss, 4 * K, LNX_PROT_READ) == 0);
             WIN_CHECK(".bss is now commit-r", bss, "commit-r");
+            check("page 2 + .bss coalesced to 3 extents [R, RX, R]", afw_vma_extent_count() == 3);
+            check("re-adopt after partial Linux mprotect is refused with -EINVAL (reviewer 2)",
+                  afw_vma_adopt(ibase, img_sz, lnx_prot) == -22);
+            c0 = afw_vma_os_call_count();
+            check("refused re-adopt left metadata intact (3 extents, .bss still PROT_READ -> 0 OS calls)",
+                  afw_vma_extent_count() == 3 &&
+                  MPROTECT(bss, 4 * K, LNX_PROT_READ) == 0 &&
+                  afw_vma_os_call_count() == c0);
+            WIN_CHECK(".bss stayed commit-r after refused re-adopt", bss, "commit-r");
+
             check("WriteProtected unlock: mprotect(.bss, RW) succeeds",
                   MPROTECT(bss, 4 * K, RW) == 0);
             WIN_CHECK(".bss is back to commit-rw", bss, "commit-rw");
             check(".bss contents survived RO->RW and are writable",
                   img[12 * K] == 0x55 && img[12 * K + 4095] == 0x66 && ((img[12 * K] = 0x77) == 0x77));
-
-            /* Idempotent re-adopt after RELRO (page 2 changes RW -> R) */
-            check("loader applies RELRO to page 2", afw_mem_protect(img + 8 * K, 4 * K, AFW_PROT_R) == 0);
-            lnx_prot[2] = LNX_PROT_READ;
-            c0 = afw_vma_os_call_count();
-            check("re-adopt after RELRO updates extents to 4 [R, RX, R, RW] with 0 OS calls",
-                  afw_vma_adopt(ibase, img_sz, lnx_prot) == 0 &&
-                  afw_vma_os_call_count() == c0 && afw_vma_extent_count() == 4);
 
             /* Stub reserve stays invisible and protected from Linux syscalls */
             check("mprotect on stub area fails with ENOMEM", MPROTECT(stub, 4 * K, RW) == -12);
