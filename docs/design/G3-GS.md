@@ -1,6 +1,6 @@
 # G3: ART's thread register (%gs:) on Windows - measurement
 
-Status: **measured, decision pending (reviewers)**. Issue #15. Image: Android 14
+Status: **measured; direction agreed by reviewers 2 and 4** (issue #15). Issue #15. Image: Android 14
 `sdk_phone64_x86_64` (the pinned one), ART APEX `com.android.art.capex`.
 
 ## The problem
@@ -61,3 +61,23 @@ REFUSE (1,413 reachable gs:, 1 outside functions, 96 unproven).
 
 The measurements favor **2** for compiled code: the volume and the JIT rule out
 rewriting as the main solution, while 1 is suitable for libart until the build exists.
+
+## Direction agreed (issue #15: reviewer 4, reviewer 2, the lead author)
+
+- **G3a: interpreter only (`-Xint`) + trampolines for libart.so's 1,544 sites.** One TEB slot
+  holds `art::Thread*` (set by `arch_prctl(ARCH_SET_GS)`). The trampoline loads it into a
+  scratch register and accesses `[reg + disp]`, so reads and writes go straight to
+  `art::Thread`. **The load gate does not open for G3a until** (reviewer 2):
+  - the 96 UNPROVEN in libart.so are closed;
+  - the gs: site outside `.eh_frame` is closed (it's not assumed to be non-executable);
+  - the scan is shown to cover every relevant code region;
+  - the thread pointer and the trampolines are proven, with negative tests.
+- **G3b: compiled code (.oat) and JIT: ART and the boot image built from source** with a
+  thread-register ABI that goes through a TEB slot (Gesher ADR 0006). **Trampolines are not
+  used in compiled code.** Beyond the volume and the JIT, there's a correctness reason
+  (reviewer 4): ART finds a method's `OatQuickMethodHeader` and `StackMap`/`CodeInfo` from
+  the return address on the stack (stack walking, GC safepoints, deoptimization,
+  exceptions). A trampoline that does `call` on its own would put a return address inside
+  the stub, and `StackVisitor` would fail. A build from source also fits the licence
+  requirement to build AOSP components from source before distributing them.
+
