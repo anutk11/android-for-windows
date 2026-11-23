@@ -214,7 +214,8 @@ jobs:
           out/afw-asan out/libredzone_test.so
           out/afw-asan out/libtls_test.so
           out/afw-asan out/libifunc_test.so
-          out/afw-asan out/libdeps_user.so --with-deps
+          out/afw-asan out/libdeps_user.so --with-deps --finish-fail=out/libdeps_user.so | tee out/finish-fail.txt
+          grep -q "lib_finish failure cleaned up cleanly" out/finish-fail.txt
           # a refused library (PT_TLS + fs:[reg], refused on Linux) leaves nothing behind
           out/afw-asan out/libtls_test.so --preload-fail=out/libtls_ie_test.so | tee out/preload.txt
           grep -q "refused, and nothing left behind" out/preload.txt
@@ -268,7 +269,7 @@ jobs:
           exit /b 0
       - name: "Dependencies: a library's import resolves to its loaded DT_NEEDED library"
         shell: cmd
-        run: out\afw-loader.exe out\libdeps_user.so --with-deps
+        run: out\afw-loader.exe out\libdeps_user.so --with-deps --finish-fail=out\libdeps_user.so
       - name: "G1: extract the real bionic on this Windows runner (never uploaded)"
         shell: bash
         run: python -I tools/fetch_bionic.py out/bionic

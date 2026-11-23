@@ -732,7 +732,6 @@ static int lib_finish(afw_lib *lib, int verbose) {
     unsigned char *pageprot = lib->pageprot;
     size_t npages = lib->npages;
     lib->pageprot = NULL;
-    lib->pending = 0;
 
     if (!afw_load_patch_only) {
         /* 6b. Static TLS layout is final now: every thread block, including this
@@ -781,6 +780,7 @@ static int lib_finish(afw_lib *lib, int verbose) {
         lib->vma_adopted = 1;
     }
     free(pageprot);
+    lib->pending = 0;
 
     if (afw_load_patch_only) return 0;
 
@@ -975,8 +975,15 @@ int afw_load_with_deps(const char *path, afw_lib *lib, afw_lib *deps, int maxdep
     if (verbose) printf("\n== all %d libraries mapped and relocated; TLS layout closes now\n", g_nlibs - first);
     for (k = first; k < g_nlibs; k++)    /* dependency order: a library after the ones it needs */
         if (g_libs[k]->pending && lib_finish(g_libs[k], verbose) != 0) {
-            fprintf(stderr, "error: %s failed after library code ran; the set stays loaded\n",
-                    g_libs[k]->soname ? g_libs[k]->soname : g_libs[k]->path);
+            int j;
+            const char *who = g_libs[k]->soname ? g_libs[k]->soname : g_libs[k]->path;
+            fprintf(stderr, "error: %s failed to finish; discarding it and %d unfinished library(ies)\n",
+                    who, g_nlibs - k - 1);
+            /* g_libs[k] failed before its constructors ran and [k+1..g_nlibs)
+             * never started: discard [k..g_nlibs) newest first so nothing
+             * unfinished stays registered. Earlier libraries [first..k-1] whose
+             * constructors already ran stay loaded (callers check afw_is_loaded). */
+            for (j = g_nlibs - 1; j >= k; j--) discard(g_libs[j]);
             return -1;
         }
     return 0;

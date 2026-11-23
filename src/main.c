@@ -233,6 +233,8 @@ static void run_loader_api_tests(const afw_lib *user) {
     check("dladdr names the library an address belongs to",
           dla((const void *)afw_sym(user, "afw_deps_check"), &info) == 1 && info.fbase == user->base &&
           info.fname && strstr(info.fname, "libdeps_user.so"));
+    check("dladdr on a non-library address (stack) returns 0; NULL info returns 0",
+          dla(&info, &info) == 0 && dla((const void *)afw_sym(user, "afw_deps_check"), NULL) == 0);
 }
 
 static int run_syscall_tests(const afw_lib *lib) {
@@ -669,6 +671,7 @@ int main(int argc, char **argv) {
     static afw_lib lib;   /* loaded libraries stay loaded: the registry points at it */
     int verbose = 1, rc = 0, strict = 0, min_pads = 0, call_trap = 0;
     const char *preload_fail = NULL;
+    const char *finish_fail = NULL;
     int with_deps = 0;
     int call_bad_ip = 0;   /* test: execute address 0x28 - must be a crash report, never a hang */
     static afw_lib deps[32];
@@ -693,6 +696,7 @@ int main(int argc, char **argv) {
             else if (strcmp(argv[a], "--call-trap") == 0) call_trap = 1;
             else if (strncmp(argv[a], "--min-landing-pads=", 19) == 0) min_pads = atoi(argv[a] + 19);
             else if (strncmp(argv[a], "--preload-fail=", 15) == 0) preload_fail = argv[a] + 15;
+            else if (strncmp(argv[a], "--finish-fail=", 14) == 0) finish_fail = argv[a] + 14;
             else if (strcmp(argv[a], "--with-deps") == 0) with_deps = 1;
             else if (strcmp(argv[a], "--call-bad-ip") == 0) call_bad_ip = 1;
             else if (strncmp(argv[a], "--watchdog=", 11) == 0) {
@@ -718,6 +722,30 @@ int main(int argc, char **argv) {
             printf("FAIL: the failed load left state behind\n"); return 1;
         }
         printf("  [ OK ] refused, and nothing left behind (libraries registered: %d)\n", afw_loaded_count());
+    }
+
+    /* test (PR #11, reviewer 2): dlopen fails inside lib_finish() after Phase A
+     * mapped and registered the dependency set. Must discard unfinished libs so
+     * freeing lib/p in dlopen never leaves dangling pointers in g_libs (ASan UAF). */
+    if (finish_fail) {
+        typedef SYSV void *(*dlopen_fn)(const char *, int, const void *);
+        typedef SYSV int (*dladdr_fn)(const void *, void *);
+        dlopen_fn dlo = (dlopen_fn)afw_shim_lookup("__loader_dlopen");
+        dladdr_fn dla = (dladdr_fn)afw_shim_lookup("__loader_dladdr");
+        struct { const char *fname; void *fbase; const char *sname; void *saddr; } info;
+        int before = afw_loaded_count();
+        printf("Loading %s via dlopen with a forced lib_finish() failure...\n", finish_fail);
+        afw_tls_test_fail_publish(3);
+        if (!dlo || !dla || dlo(finish_fail, 2, NULL) != NULL) {
+            printf("FAIL: dlopen did not fail as expected\n"); return 1;
+        }
+        /* Touch the registry immediately under ASan: catches dangling g_libs[] entries. */
+        if (afw_loaded_count() != before || afw_find_loaded(finish_fail) != NULL ||
+            afw_global_sym("afw_deps_check") != NULL || dla(&info, &info) != 0) {
+            printf("FAIL: failed lib_finish left state behind in the registry\n"); return 1;
+        }
+        printf("  [ OK ] lib_finish failure cleaned up cleanly (no UAF, libraries registered: %d)\n",
+               afw_loaded_count());
     }
 
     if ((with_deps ? afw_load_with_deps(argv[1], &lib, deps, 32, &ndeps, verbose)

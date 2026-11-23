@@ -66,10 +66,15 @@ SYSV void *afw_l_dlopen(const char *name, int flags, const void *caller) {
         }
         strcpy(p, path);
         if (afw_load_with_deps(p, lib, deps, 32, &ndeps, 0) != 0) {
-            /* the set was undone (nothing ran) or the reason is printed */
+            int i, keep_deps = 0;
+            /* Only free allocations that are no longer registered in g_libs:
+             * if an earlier dependency already ran constructors before a later
+             * library failed to finish, that dependency stays live in g_libs. */
             set_err("dlopen failed: could not load \"%s\" (see the loader's message)", name);
-            free(lib); free(p);
-            if (!ndeps) free(deps);
+            if (!afw_is_loaded(lib)) { free(lib); free(p); }
+            for (i = 0; i < ndeps; i++)
+                if (afw_is_loaded(&deps[i])) { keep_deps = 1; break; }
+            if (!keep_deps) free(deps);
             return NULL;
         }
     }
@@ -83,11 +88,14 @@ SYSV void *afw_l_android_dlopen_ext(const char *name, int flags, const void *ext
 
 /* The library an address lies in, as its load-order index; -1 if none. */
 static int lib_index_of(const void *addr) {
+    uintptr_t a = (uintptr_t)addr;
     int k;
     afw_lib *l;
-    for (k = 0; (l = afw_lib_at(k)) != NULL; k++)
-        if ((const unsigned char *)addr >= l->base && (const unsigned char *)addr < l->base + l->size)
+    for (k = 0; (l = afw_lib_at(k)) != NULL; k++) {
+        uintptr_t b = (uintptr_t)l->base;
+        if (l->base && a >= b && a - b < l->size)
             return k;
+    }
     return -1;
 }
 
@@ -149,10 +157,13 @@ typedef struct {            /* bionic's Dl_info (LP64) */
 
 SYSV int afw_l_dladdr(const void *addr, void *vinfo) {
     afw_dl_info *info = (afw_dl_info *)vinfo;
+    uintptr_t a = (uintptr_t)addr;
     int k;
     afw_lib *l;
+    if (!info) return 0;
     for (k = 0; (l = afw_lib_at(k)) != NULL; k++) {
-        if ((const unsigned char *)addr >= l->base && (const unsigned char *)addr < l->base + l->size) {
+        uintptr_t b = (uintptr_t)l->base;
+        if (l->base && a >= b && a - b < l->size) {
             info->dli_fname = l->path;
             info->dli_fbase = l->base;
             info->dli_sname = NULL;   /* nearest symbol: not yet */
