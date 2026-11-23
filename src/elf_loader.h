@@ -51,7 +51,10 @@ typedef struct afw_lib_s {
     char build_id[AFW_BUILD_ID_HEX];
     Elf64_Phdr *phdr;           /* a copy of the program headers (dl_iterate_phdr) */
     int path_owned;             /* path was allocated for this library (dependencies) */
-    int phnum;   /* NT_GNU_BUILD_ID, hex; "" if none */
+    uint64_t entry;             /* bias + e_entry for an executable (PT_INTERP); 0 for a library */
+    uint64_t phoff;             /* e_phoff (AT_PHDR) */
+    int is_exec;                /* has PT_INTERP (executable; afw-loader replaces linker64) */
+    int phnum;                  /* number of program headers */
 
     /* phase A done, phase B (TLS close, IFUNC, RELRO, constructors) not yet */
     int pending;

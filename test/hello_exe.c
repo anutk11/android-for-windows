@@ -1,0 +1,62 @@
+/* hello_exe.c - an ordinary Android executable (NDK, real bionic libc.so):
+ * main(argc, argv) through crtbegin's _start and libc's __libc_init; a
+ * constructor before main; envp forwarding + getauxval + getprogname
+ * consistency across constructors and main; atexit after it; exit code 42. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/auxv.h>
+#include <unistd.h>
+
+static int ctor_ran;
+static unsigned long ctor_phdr, ctor_phent, ctor_phnum, ctor_entry, ctor_random, ctor_execfn;
+static int ctor_env_ok, ctor_auxv_ok;
+__attribute__((constructor)) static void before_main(void) {
+    const char *h = getenv("AFW_HOST_VAR");
+    const char *f = getenv("AFW_FLAG_VAR");
+    const char *p = getprogname();
+    ctor_ran = 1;
+    ctor_phdr = getauxval(AT_PHDR);
+    ctor_phent = getauxval(AT_PHENT);
+    ctor_phnum = getauxval(AT_PHNUM);
+    ctor_entry = getauxval(AT_ENTRY);
+    ctor_random = getauxval(AT_RANDOM);
+    ctor_execfn = getauxval(AT_EXECFN);
+    ctor_env_ok = (h && strcmp(h, "from_windows") == 0 &&
+                   f && strcmp(f, "from_flag") == 0 &&
+                   p && strstr(p, "hello_exe") != NULL);
+    ctor_auxv_ok = (ctor_phdr != 0 && ctor_phent == 56 && ctor_phnum >= 2 &&
+                    ctor_entry != 0 && ctor_random != 0 &&
+                    ctor_execfn != 0 && strstr((const char *)ctor_execfn, "hello_exe") != NULL &&
+                    getauxval(AT_PAGESZ) == 4096 && getauxval(AT_BASE) == 0 &&
+                    getauxval(AT_UID) == 10000 && getauxval(AT_EUID) == 10000 &&
+                    getauxval(AT_GID) == 10000 && getauxval(AT_EGID) == 10000 &&
+                    getauxval(AT_HWCAP) == 0 && getauxval(AT_HWCAP2) == 0 &&
+                    getauxval(AT_SECURE) == 0);
+}
+static void after_main(void) { printf("[android exe] atexit handler ran\n"); fflush(stdout); }
+
+int main(int argc, char **argv) {
+    char *heap = malloc(64);
+    const char *host_v = getenv("AFW_HOST_VAR");
+    const char *flag_v = getenv("AFW_FLAG_VAR");
+    const char *prog = getprogname();
+    printf("[android exe] hello from main: argc=%d argv[0]=%s argv[1]=%s constructor=%d ctor_auxv=%d pid=%d prog=%s host_env=%s flag_env=%s\n",
+           argc, argv[0], argc > 1 ? argv[1] : "(none)", ctor_ran, ctor_auxv_ok, (int)getpid(),
+           prog ? prog : "(null)", host_v ? host_v : "(null)", flag_v ? flag_v : "(null)");
+    if (argc != 2 || strcmp(argv[1], "world") != 0) return 1;
+    if (!ctor_ran) return 2;
+    if (!heap) return 3;
+    snprintf(heap, 64, "%s-%d", "malloc", 64);
+    if (strcmp(heap, "malloc-64") != 0) return 4;
+    free(heap);
+    if (atexit(after_main) != 0) return 5;
+    if (!ctor_env_ok || !host_v || strcmp(host_v, "from_windows") != 0 ||
+        !flag_v || strcmp(flag_v, "from_flag") != 0) return 6;
+    if (!prog || !strstr(prog, "hello_exe")) return 7;
+    if (!ctor_auxv_ok) return 8;
+    if (getauxval(AT_PHDR) != ctor_phdr || getauxval(AT_PHENT) != ctor_phent ||
+        getauxval(AT_PHNUM) != ctor_phnum || getauxval(AT_ENTRY) != ctor_entry ||
+        getauxval(AT_RANDOM) != ctor_random || getauxval(AT_EXECFN) != ctor_execfn) return 9;
+    return 42;
+}

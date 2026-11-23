@@ -15,6 +15,7 @@
 
 #include "bionic_shim.h"
 #include "elf_loader.h"
+#include "exec.h"
 #include "platform.h"
 #include "tls_patch.h"
 #include "crash.h"
@@ -667,6 +668,66 @@ static int run_redzone_tests(const afw_lib *lib) {
     return g_failed ? 1 : 0;
 }
 
+#if !defined(_WIN32)
+extern char **environ;
+#endif
+
+/* Build the NULL-terminated envp for --exec: inherit host environment unless
+ * clean_env is set, then apply --env KEY=VAL overrides (replacing matching
+ * KEY= entries in place or appending). Capped at 4096 entries. */
+static char **build_exec_env(int clean_env, char **overrides, int noverrides) {
+    char **host = clean_env ? NULL :
+#if defined(_WIN32)
+                  _environ;
+#else
+                  environ;
+#endif
+    size_t nhost = 0, cap, n = 0, i;
+    int j;
+    char **out;
+    if (host) {
+        while (host[nhost]) {
+            if (++nhost > 4096) {
+                fprintf(stderr, "error: host environment exceeds 4096 entries (use --clean-env)\n");
+                return NULL;
+            }
+        }
+    }
+    cap = nhost + (size_t)noverrides;
+    if (cap > 4096) cap = 4096;
+    out = (char **)calloc(cap + 1, sizeof *out);
+    if (!out) { fprintf(stderr, "error: out of memory building envp\n"); return NULL; }
+    for (i = 0; i < nhost; i++) out[n++] = host[i];
+    for (j = 0; j < noverrides; j++) {
+        char *ov = overrides[j];
+        const char *eq = strchr(ov, '=');
+        size_t klen = eq ? (size_t)(eq - ov) : 0;
+        int replaced = 0;
+        if (!eq || klen == 0) {
+            fprintf(stderr, "error: --env expects KEY=VAL (got \"%s\")\n", ov);
+            free(out);
+            return NULL;
+        }
+        for (i = 0; i < n; i++) {
+            if (strncmp(out[i], ov, klen + 1) == 0) {
+                out[i] = ov;
+                replaced = 1;
+                break;
+            }
+        }
+        if (!replaced) {
+            if (n >= 4096) {
+                fprintf(stderr, "error: environment exceeds 4096 entries\n");
+                free(out);
+                return NULL;
+            }
+            out[n++] = ov;
+        }
+    }
+    out[n] = NULL;
+    return out;
+}
+
 int main(int argc, char **argv) {
     static afw_lib lib;   /* loaded libraries stay loaded: the registry points at it */
     int verbose = 1, rc = 0, strict = 0, min_pads = 0, call_trap = 0;
@@ -676,6 +737,11 @@ int main(int argc, char **argv) {
     const char *finish_fail_late = NULL;
 #endif
     int with_deps = 0;
+    int exec_from = 0;   /* --exec ARGS...: start the loaded executable with them */
+    int clean_env = 0;   /* --clean-env: do not inherit host environment */
+    char *env_overrides[256];
+    int nenv_overrides = 0;
+    char **penvp = NULL;
     int call_bad_ip = 0;   /* test: execute address 0x28 - must be a crash report, never a hang */
     static afw_lib deps[32];
     int ndeps = 0;
@@ -704,6 +770,15 @@ int main(int argc, char **argv) {
             else if (strncmp(argv[a], "--finish-fail-late=", 19) == 0) finish_fail_late = argv[a] + 19;
 #endif
             else if (strcmp(argv[a], "--with-deps") == 0) with_deps = 1;
+            else if (strcmp(argv[a], "--clean-env") == 0) clean_env = 1;
+            else if (strcmp(argv[a], "--env") == 0 && a + 1 < argc) {
+                if (nenv_overrides >= 256) { fprintf(stderr, "error: too many --env flags\n"); return 2; }
+                env_overrides[nenv_overrides++] = argv[++a];
+            } else if (strncmp(argv[a], "--env=", 6) == 0) {
+                if (nenv_overrides >= 256) { fprintf(stderr, "error: too many --env flags\n"); return 2; }
+                env_overrides[nenv_overrides++] = argv[a] + 6;
+            }
+            else if (strcmp(argv[a], "--exec") == 0) { exec_from = a + 1; break; }   /* the rest: the program's args */
             else if (strcmp(argv[a], "--call-bad-ip") == 0) call_bad_ip = 1;
             else if (strncmp(argv[a], "--watchdog=", 11) == 0) {
                 int sec = atoi(argv[a] + 11);
@@ -861,12 +936,40 @@ int main(int argc, char **argv) {
     }
 #endif
 
+    if (exec_from) {
+        penvp = build_exec_env(clean_env, env_overrides, nenv_overrides);
+        if (!penvp) return 1;
+        /* Set envp and progname before loading dependencies so libc.so's own
+         * constructors see the same environment, program name, and AT_RANDOM
+         * seed as the executable's initial stack. */
+        afw_shared_globals_set_process(NULL, penvp, argv[1]);
+    }
+
     if ((with_deps ? afw_load_with_deps(argv[1], &lib, deps, 32, &ndeps, verbose)
                    : afw_load(argv[1], &lib, verbose)) != 0) {
         printf("\nLoad failed.\n");
+        free(penvp);
         return 1;
     }
 
+    if (exec_from) {
+        /* argv[0] = the executable, then everything after --exec */
+        char **pargv = (char **)calloc((size_t)(argc - exec_from + 2), sizeof *pargv);
+        int n = 0, k;
+        if (!pargv) { free(penvp); return 1; }
+        if (!lib.is_exec) {
+            printf("\n%s is not an executable (no PT_INTERP)\n", argv[1]);
+            free(pargv); free(penvp);
+            return 1;
+        }
+        pargv[n++] = argv[1];
+        for (k = exec_from; k < argc; k++) pargv[n++] = argv[k];
+        printf("\nStarting %s at its entry point (%d argument%s)...\n", argv[1], n, n == 1 ? "" : "s");
+        afw_exec(&lib, n, pargv, penvp);
+        printf("could not start the executable\n");
+        free(pargv); free(penvp);
+        return 1;
+    }
     printf("\nLoaded at %p (%zu KB)\n", (void *)lib.base, lib.size / 1024);
     printf("  relocations applied: %d\n", lib.nrelocs);
     printf("  exports:             %d\n", lib.nexports);
