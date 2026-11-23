@@ -64,25 +64,27 @@ typedef struct {
     uint64_t got_slot1;       /* 0xd0 */
     uint64_t on_bionic_fn;    /* 0xd8 */
     uint64_t exit_mode;       /* 0xe0: 0 = return to caller, 1 = teardown+ExitThread */
-    uint64_t orig_tib_base;   /* 0xe8 */
-    uint64_t orig_tib_limit;  /* 0xf0 */
-    uint64_t bionic_alloc;    /* 0xf8 */
-    uint64_t bionic_limit;    /* 0x100 */
-    uint64_t bionic_top;      /* 0x108 */
-    uint64_t test_ok;         /* 0x110 */
+    uint64_t orig_tib_base;    /* 0xe8 */
+    uint64_t orig_tib_limit;   /* 0xf0 */
+    uint64_t orig_teb_dealloc; /* 0xf8 */
+    uint64_t bionic_alloc;     /* 0x100 */
+    uint64_t bionic_limit;     /* 0x108 */
+    uint64_t bionic_top;       /* 0x110 */
+    uint64_t test_ok;          /* 0x118 */
 } trampoline_ctx;
 
-_Static_assert(offsetof(trampoline_ctx, host_rsp)       == 0x00, "host_rsp");
-_Static_assert(offsetof(trampoline_ctx, host_r15)       == 0x40, "host_r15");
-_Static_assert(offsetof(trampoline_ctx, child_rsp)      == 0x48, "child_rsp");
-_Static_assert(offsetof(trampoline_ctx, child_rip)      == 0x50, "child_rip");
-_Static_assert(offsetof(trampoline_ctx, want_rbx)       == 0x58, "want_rbx");
-_Static_assert(offsetof(trampoline_ctx, got_rax)        == 0x88, "got_rax");
-_Static_assert(offsetof(trampoline_ctx, got_slot0)      == 0xc8, "got_slot0");
-_Static_assert(offsetof(trampoline_ctx, on_bionic_fn)   == 0xd8, "on_bionic_fn");
-_Static_assert(offsetof(trampoline_ctx, exit_mode)      == 0xe0, "exit_mode");
-_Static_assert(offsetof(trampoline_ctx, orig_tib_base)  == 0xe8, "orig_tib_base");
-_Static_assert(offsetof(trampoline_ctx, orig_tib_limit) == 0xf0, "orig_tib_limit");
+_Static_assert(offsetof(trampoline_ctx, host_rsp)         == 0x00, "host_rsp");
+_Static_assert(offsetof(trampoline_ctx, host_r15)         == 0x40, "host_r15");
+_Static_assert(offsetof(trampoline_ctx, child_rsp)        == 0x48, "child_rsp");
+_Static_assert(offsetof(trampoline_ctx, child_rip)        == 0x50, "child_rip");
+_Static_assert(offsetof(trampoline_ctx, want_rbx)         == 0x58, "want_rbx");
+_Static_assert(offsetof(trampoline_ctx, got_rax)          == 0x88, "got_rax");
+_Static_assert(offsetof(trampoline_ctx, got_slot0)        == 0xc8, "got_slot0");
+_Static_assert(offsetof(trampoline_ctx, on_bionic_fn)     == 0xd8, "on_bionic_fn");
+_Static_assert(offsetof(trampoline_ctx, exit_mode)        == 0xe0, "exit_mode");
+_Static_assert(offsetof(trampoline_ctx, orig_tib_base)    == 0xe8, "orig_tib_base");
+_Static_assert(offsetof(trampoline_ctx, orig_tib_limit)   == 0xf0, "orig_tib_limit");
+_Static_assert(offsetof(trampoline_ctx, orig_teb_dealloc) == 0xf8, "orig_teb_dealloc");
 
 void probe_enter_bionic(trampoline_ctx *ctx);
 void probe_child_stub(void);
@@ -147,12 +149,14 @@ __asm__(
     "call *%rax\n\t"
     "add $32, %rsp\n"
     "1:\n\t"
-    /* Switch back to host_rsp and restore original NT_TIB BEFORE freeing/exiting */
+    /* Switch back to host_rsp and restore original NT_TIB + DeallocationStack BEFORE freeing/exiting */
     "mov 0x00(%rbx), %rsp\n\t"
     "mov 0xe8(%rbx), %rax\n\t"
     "mov %rax, %gs:0x08\n\t"
     "mov 0xf0(%rbx), %rax\n\t"
     "mov %rax, %gs:0x10\n\t"
+    "mov 0xf8(%rbx), %rax\n\t"
+    "mov %rax, %gs:0x1478\n\t"
     /* Check exit_mode: 0 = return cleanly, 1 = VirtualFree + ExitThread on host stack */
     "cmpq $0, 0xe0(%rbx)\n\t"
     "jne 2f\n\t"
@@ -260,9 +264,10 @@ static uint64_t get_teb_dealloc(void) {
     __asm__ volatile("movq %%gs:0x1478, %0" : "=r"(v));
     return v;
 }
-static void set_tib_bounds(uint64_t base, uint64_t limit) {
+static void set_tib_bounds(uint64_t base, uint64_t limit, uint64_t dealloc) {
     __asm__ volatile("movq %0, %%gs:0x08" : : "r"(base) : "memory");
     __asm__ volatile("movq %0, %%gs:0x10" : : "r"(limit) : "memory");
+    __asm__ volatile("movq %0, %%gs:0x1478" : : "r"(dealloc) : "memory");
 }
 
 static uint8_t *alloc_bionic_stack(uint64_t *limit_out, uint64_t *top_out) {
@@ -329,6 +334,9 @@ static void item2_on_bionic(trampoline_ctx *ctx) {
     volatile uint64_t local_var = 0;
     uint64_t sp = (uint64_t)(uintptr_t)&local_var;
     int on_bionic = (sp >= ctx->bionic_limit && sp < ctx->bionic_top);
+    int tib_set = (get_tib_base() == ctx->bionic_top &&
+                   get_tib_limit() == ctx->bionic_limit &&
+                   get_teb_dealloc() == ctx->bionic_alloc);
     int regs_ok =
         ctx->got_rax == 0 &&
         ctx->got_rsp == ctx->child_rsp &&
@@ -340,7 +348,7 @@ static void item2_on_bionic(trampoline_ctx *ctx) {
         ctx->got_r15 == ctx->want_r15 &&
         ctx->got_slot0 == 0x1111222233334444ULL &&
         ctx->got_slot1 == 0x5555666677778888ULL;
-    ctx->test_ok = (on_bionic && regs_ok) ? 1 : 0;
+    ctx->test_ok = (on_bionic && tib_set && regs_ok) ? 1 : 0;
 }
 
 static DWORD WINAPI item2_thread(LPVOID param) {
@@ -352,21 +360,22 @@ static DWORD WINAPI item2_thread(LPVOID param) {
     if (!mem) { *res = 0; return 1; }
 
     memset(&ctx, 0, sizeof ctx);
-    ctx.orig_tib_base  = get_tib_base();
-    ctx.orig_tib_limit = get_tib_limit();
-    ctx.bionic_alloc   = (uint64_t)(uintptr_t)mem;
-    ctx.bionic_limit   = lim;
-    ctx.bionic_top     = top;
-    ctx.child_rsp      = (top - 64) & ~15ULL;
-    ctx.child_rip      = (uint64_t)(uintptr_t)probe_child_stub;
-    ctx.want_rbx       = 0xAA01AA01AA01AA01ULL;
-    ctx.want_rbp       = 0xBB02BB02BB02BB02ULL;
-    ctx.want_r12       = 0xCC03CC03CC03CC03ULL;
-    ctx.want_r13       = 0xDD04DD04DD04DD04ULL;
-    ctx.want_r14       = 0xEE05EE05EE05EE05ULL;
-    ctx.want_r15       = 0xFF06FF06FF06FF06ULL;
-    ctx.on_bionic_fn   = (uint64_t)(uintptr_t)item2_on_bionic;
-    ctx.exit_mode      = 0;
+    ctx.orig_tib_base    = get_tib_base();
+    ctx.orig_tib_limit   = get_tib_limit();
+    ctx.orig_teb_dealloc = get_teb_dealloc();
+    ctx.bionic_alloc     = (uint64_t)(uintptr_t)mem;
+    ctx.bionic_limit     = lim;
+    ctx.bionic_top       = top;
+    ctx.child_rsp        = (top - 64) & ~15ULL;
+    ctx.child_rip        = (uint64_t)(uintptr_t)probe_child_stub;
+    ctx.want_rbx         = 0xAA01AA01AA01AA01ULL;
+    ctx.want_rbp         = 0xBB02BB02BB02BB02ULL;
+    ctx.want_r12         = 0xCC03CC03CC03CC03ULL;
+    ctx.want_r13         = 0xDD04DD04DD04DD04ULL;
+    ctx.want_r14         = 0xEE05EE05EE05EE05ULL;
+    ctx.want_r15         = 0xFF06FF06FF06FF06ULL;
+    ctx.on_bionic_fn     = (uint64_t)(uintptr_t)item2_on_bionic;
+    ctx.exit_mode        = 0;
 
     csp = (uint64_t *)(uintptr_t)ctx.child_rsp;
     csp[0] = 0x1111222233334444ULL; /* simulated bionic fn */
@@ -374,16 +383,17 @@ static DWORD WINAPI item2_thread(LPVOID param) {
 
     printf("[Item 2] orig NT_TIB: base=0x%llx limit=0x%llx dealloc=0x%llx; bionic=[0x%llx..0x%llx)\n",
            (unsigned long long)ctx.orig_tib_base, (unsigned long long)ctx.orig_tib_limit,
-           (unsigned long long)get_teb_dealloc(),
+           (unsigned long long)ctx.orig_teb_dealloc,
            (unsigned long long)lim, (unsigned long long)top);
 
-    set_tib_bounds(top, lim);
+    set_tib_bounds(top, lim, ctx.bionic_alloc);
     probe_enter_bionic(&ctx);
 
     {
         int tib_restored = (get_tib_base() == ctx.orig_tib_base &&
-                            get_tib_limit() == ctx.orig_tib_limit);
-        printf("[Item 2] got_rax=0x%llx got_rsp=0x%llx (want=0x%llx) slot0=0x%llx slot1=0x%llx tib_restored=%d\n",
+                            get_tib_limit() == ctx.orig_tib_limit &&
+                            get_teb_dealloc() == ctx.orig_teb_dealloc);
+        printf("[Item 2] got_rax=0x%llx got_rsp=0x%llx (want=0x%llx) slot0=0x%llx slot1=0x%llx tib_and_dealloc_restored=%d\n",
                (unsigned long long)ctx.got_rax, (unsigned long long)ctx.got_rsp,
                (unsigned long long)ctx.child_rsp, (unsigned long long)ctx.got_slot0,
                (unsigned long long)ctx.got_slot1, tib_restored);
@@ -416,19 +426,20 @@ static DWORD WINAPI item3_thread(LPVOID param) {
     if (!mem) { *res = 0; return 1; }
 
     memset(&ctx, 0, sizeof ctx);
-    ctx.orig_tib_base  = get_tib_base();
-    ctx.orig_tib_limit = get_tib_limit();
-    ctx.bionic_alloc   = (uint64_t)(uintptr_t)mem;
-    ctx.bionic_limit   = lim;
-    ctx.bionic_top     = top;
-    ctx.child_rsp      = (top - 64) & ~15ULL;
-    ctx.child_rip      = (uint64_t)(uintptr_t)probe_child_stub;
-    ctx.on_bionic_fn   = (uint64_t)(uintptr_t)item3_on_bionic;
+    ctx.orig_tib_base    = get_tib_base();
+    ctx.orig_tib_limit   = get_tib_limit();
+    ctx.orig_teb_dealloc = get_teb_dealloc();
+    ctx.bionic_alloc     = (uint64_t)(uintptr_t)mem;
+    ctx.bionic_limit     = lim;
+    ctx.bionic_top       = top;
+    ctx.child_rsp        = (top - 64) & ~15ULL;
+    ctx.child_rip        = (uint64_t)(uintptr_t)probe_child_stub;
+    ctx.on_bionic_fn     = (uint64_t)(uintptr_t)item3_on_bionic;
 
-    set_tib_bounds(top, lim);
+    set_tib_bounds(top, lim, ctx.bionic_alloc);
     probe_enter_bionic(&ctx);
 
-    printf("[Item 3] guard_caught=%ld fault_addr=0x%llx (guard_base=0x%llx) fault_rsp=0x%llx\n",
+    printf("[Item 3a] guard_caught=%ld fault_addr=0x%llx (guard_base=0x%llx) fault_rsp=0x%llx\n",
            (long)g_guard_caught, (unsigned long long)g_guard_fault_addr,
            (unsigned long long)ctx.bionic_alloc, (unsigned long long)g_guard_rsp);
     *res = (int)ctx.test_ok;
@@ -478,22 +489,23 @@ static DWORD WINAPI item4a_thread(LPVOID param) {
     memcpy(g_fs_code, code_fs0, sizeof code_fs0);
 
     memset(&ctx, 0, sizeof ctx);
-    ctx.orig_tib_base  = get_tib_base();
-    ctx.orig_tib_limit = get_tib_limit();
-    ctx.bionic_alloc   = (uint64_t)(uintptr_t)mem;
-    ctx.bionic_limit   = lim;
-    ctx.bionic_top     = top;
-    ctx.child_rsp      = (top - 4096) & ~15ULL; /* plenty of room below rsp for Red Zone measurement */
-    ctx.child_rip      = (uint64_t)(uintptr_t)probe_child_stub;
-    ctx.on_bionic_fn   = (uint64_t)(uintptr_t)item4a_on_bionic;
+    ctx.orig_tib_base    = get_tib_base();
+    ctx.orig_tib_limit   = get_tib_limit();
+    ctx.orig_teb_dealloc = get_teb_dealloc();
+    ctx.bionic_alloc     = (uint64_t)(uintptr_t)mem;
+    ctx.bionic_limit     = lim;
+    ctx.bionic_top       = top;
+    ctx.child_rsp        = (top - 4096) & ~15ULL; /* plenty of room below rsp for Red Zone measurement */
+    ctx.child_rip        = (uint64_t)(uintptr_t)probe_child_stub;
+    ctx.on_bionic_fn     = (uint64_t)(uintptr_t)item4a_on_bionic;
 
-    set_tib_bounds(top, lim);
+    set_tib_bounds(top, lim, ctx.bionic_alloc);
     probe_enter_bionic(&ctx);
 
     printf("[Item 4a] fs_caught=%ld patched_prefix=0x%02x val=0x%llx fault_rsp=0x%llx\n",
            (long)g_fs_caught, g_fs_code[0], (unsigned long long)g_fs_val_read,
            (unsigned long long)g_fs_fault_rsp);
-    printf("[Item 4a] KiUserExceptionDispatcher Red Zone measurement: %u/120 Red Zone bytes clobbered, deepest clobber=%u bytes below RSP\n",
+    printf("[Item 4a] KiUserExceptionDispatcher below-RSP measurement: %u/120 bytes in [rsp-136..rsp-16] clobbered, deepest clobber=%u bytes below RSP\n",
            g_rz_clobbered, g_rz_max_depth);
 
     *res = (int)ctx.test_ok;
@@ -572,16 +584,17 @@ static DWORD WINAPI item4b_thread(LPVOID param) {
     if (!mem) { *res = 0; return 1; }
 
     memset(&ctx, 0, sizeof ctx);
-    ctx.orig_tib_base  = get_tib_base();
-    ctx.orig_tib_limit = get_tib_limit();
-    ctx.bionic_alloc   = (uint64_t)(uintptr_t)mem;
-    ctx.bionic_limit   = lim;
-    ctx.bionic_top     = top;
-    ctx.child_rsp      = (top - 64) & ~15ULL;
-    ctx.child_rip      = (uint64_t)(uintptr_t)probe_child_stub;
-    ctx.on_bionic_fn   = (uint64_t)(uintptr_t)item4b_on_bionic;
+    ctx.orig_tib_base    = get_tib_base();
+    ctx.orig_tib_limit   = get_tib_limit();
+    ctx.orig_teb_dealloc = get_teb_dealloc();
+    ctx.bionic_alloc     = (uint64_t)(uintptr_t)mem;
+    ctx.bionic_limit     = lim;
+    ctx.bionic_top       = top;
+    ctx.child_rsp        = (top - 64) & ~15ULL;
+    ctx.child_rip        = (uint64_t)(uintptr_t)probe_child_stub;
+    ctx.on_bionic_fn     = (uint64_t)(uintptr_t)item4b_on_bionic;
 
-    set_tib_bounds(top, lim);
+    set_tib_bounds(top, lim, ctx.bionic_alloc);
     probe_enter_bionic(&ctx);
     *res = (int)ctx.test_ok;
     VirtualFree(mem, 0, MEM_RELEASE);
@@ -615,23 +628,29 @@ static DWORD WINAPI item4c_thread(LPVOID param) {
     if (!mem) { *res = 0; return 1; }
 
     memset(&ctx, 0, sizeof ctx);
-    ctx.orig_tib_base  = get_tib_base();
-    ctx.orig_tib_limit = get_tib_limit();
-    ctx.bionic_alloc   = (uint64_t)(uintptr_t)mem;
-    ctx.bionic_limit   = lim;
-    ctx.bionic_top     = top;
-    ctx.child_rsp      = (top - 64) & ~15ULL;
-    ctx.child_rip      = (uint64_t)(uintptr_t)probe_child_stub;
-    ctx.on_bionic_fn   = (uint64_t)(uintptr_t)item4c_on_bionic;
+    ctx.orig_tib_base    = get_tib_base();
+    ctx.orig_tib_limit   = get_tib_limit();
+    ctx.orig_teb_dealloc = get_teb_dealloc();
+    ctx.bionic_alloc     = (uint64_t)(uintptr_t)mem;
+    ctx.bionic_limit     = lim;
+    ctx.bionic_top       = top;
+    ctx.child_rsp        = (top - 64) & ~15ULL;
+    ctx.child_rip        = (uint64_t)(uintptr_t)probe_child_stub;
+    ctx.on_bionic_fn     = (uint64_t)(uintptr_t)item4c_on_bionic;
 
-    set_tib_bounds(top, lim);
+    set_tib_bounds(top, lim, ctx.bionic_alloc);
     probe_enter_bionic(&ctx);
     *res = (int)ctx.test_ok;
     VirtualFree(mem, 0, MEM_RELEASE);
     return 0;
 }
 
-/* ---- Item 5: Restore host_rsp + NT_TIB + VirtualFree + ExitThread with live FLS ---- */
+/* ---- Item 5: Restore host_rsp + NT_TIB + DeallocationStack + VirtualFree + ExitThread (FLS + DLL_THREAD_DETACH) ---- */
+typedef void (*detach_arm_fn)(DWORD);
+typedef LONG (*detach_res_fn)(uint64_t *);
+static detach_arm_fn     g_detach_arm;
+static detach_res_fn     g_detach_result;
+
 static DWORD             g_fls_idx = FLS_OUT_OF_INDEXES;
 static volatile LONG     g_fls_called;
 static volatile uint64_t g_fls_val_seen;
@@ -639,6 +658,7 @@ static volatile uint64_t g_fls_rsp_seen;
 static volatile uint64_t g_item5_orig_limit;
 static volatile uint64_t g_item5_orig_base;
 static volatile LONG     g_item5_vfree_ok;
+static volatile LONG     g_item5_tib_restored;
 
 static VOID WINAPI item5_fls_callback(PVOID val) {
     volatile uint64_t local_var = 0;
@@ -648,8 +668,12 @@ static VOID WINAPI item5_fls_callback(PVOID val) {
 }
 
 void probe_host_teardown(trampoline_ctx *ctx) {
-    /* Running on restored host_rsp with restored original NT_TIB! */
+    /* Running on restored host_rsp with restored original NT_TIB + DeallocationStack! */
+    int restored = (get_tib_base() == ctx->orig_tib_base &&
+                    get_tib_limit() == ctx->orig_tib_limit &&
+                    get_teb_dealloc() == ctx->orig_teb_dealloc);
     BOOL freed = VirtualFree((void *)(uintptr_t)ctx->bionic_alloc, 0, MEM_RELEASE);
+    InterlockedExchange(&g_item5_tib_restored, restored ? 1 : 0);
     InterlockedExchange(&g_item5_vfree_ok, freed ? 1 : 0);
     ExitThread(0x42);
 }
@@ -657,7 +681,10 @@ void probe_host_teardown(trampoline_ctx *ctx) {
 static void item5_on_bionic(trampoline_ctx *ctx) {
     volatile uint64_t local_var = 0;
     uint64_t sp = (uint64_t)(uintptr_t)&local_var;
-    ctx->test_ok = (sp >= ctx->bionic_limit && sp < ctx->bionic_top) ? 1 : 0;
+    int tib_set = (get_tib_base() == ctx->bionic_top &&
+                   get_tib_limit() == ctx->bionic_limit &&
+                   get_teb_dealloc() == ctx->bionic_alloc);
+    ctx->test_ok = (sp >= ctx->bionic_limit && sp < ctx->bionic_top && tib_set) ? 1 : 0;
 }
 
 static DWORD WINAPI item5_thread(LPVOID param) {
@@ -667,20 +694,22 @@ static DWORD WINAPI item5_thread(LPVOID param) {
     if (!mem) return 1;
 
     memset(ctx, 0, sizeof *ctx);
-    ctx->orig_tib_base  = get_tib_base();
-    ctx->orig_tib_limit = get_tib_limit();
-    g_item5_orig_base   = ctx->orig_tib_base;
-    g_item5_orig_limit  = ctx->orig_tib_limit;
-    ctx->bionic_alloc   = (uint64_t)(uintptr_t)mem;
-    ctx->bionic_limit   = lim;
-    ctx->bionic_top     = top;
-    ctx->child_rsp      = (top - 64) & ~15ULL;
-    ctx->child_rip      = (uint64_t)(uintptr_t)probe_child_stub;
-    ctx->on_bionic_fn   = (uint64_t)(uintptr_t)item5_on_bionic;
-    ctx->exit_mode      = 1;
+    ctx->orig_tib_base    = get_tib_base();
+    ctx->orig_tib_limit   = get_tib_limit();
+    ctx->orig_teb_dealloc = get_teb_dealloc();
+    g_item5_orig_base     = ctx->orig_tib_base;
+    g_item5_orig_limit    = ctx->orig_tib_limit;
+    ctx->bionic_alloc     = (uint64_t)(uintptr_t)mem;
+    ctx->bionic_limit     = lim;
+    ctx->bionic_top       = top;
+    ctx->child_rsp        = (top - 64) & ~15ULL;
+    ctx->child_rip        = (uint64_t)(uintptr_t)probe_child_stub;
+    ctx->on_bionic_fn     = (uint64_t)(uintptr_t)item5_on_bionic;
+    ctx->exit_mode        = 1;
 
+    if (g_detach_arm) g_detach_arm(GetCurrentThreadId());
     FlsSetValue(g_fls_idx, (PVOID)(uintptr_t)0xF15C0DEULL);
-    set_tib_bounds(top, lim);
+    set_tib_bounds(top, lim, ctx->bionic_alloc);
     probe_enter_bionic(ctx);
     return 99; /* unreachable */
 }
@@ -698,6 +727,7 @@ static int run_thread_test(LPTHREAD_START_ROUTINE fn, void *arg, DWORD *exit_cod
 
 int main(void) {
     PVOID veh;
+    HMODULE hdll;
     int r2 = 0, r3 = 0, r4a = 0, r4b = 0, r4c = 0, r5 = 0;
     int fails = 0;
 
@@ -709,14 +739,24 @@ int main(void) {
         return 1;
     }
 
+    hdll = LoadLibraryA("out\\g2_detach_probe.dll");
+    if (!hdll) hdll = LoadLibraryA("g2_detach_probe.dll");
+    if (hdll) {
+        g_detach_arm    = (detach_arm_fn)GetProcAddress(hdll, "g2_detach_arm");
+        g_detach_result = (detach_res_fn)GetProcAddress(hdll, "g2_detach_result");
+    }
+
     /* Item 2 */
     if (!run_thread_test(item2_thread, &r2, NULL)) r2 = 0;
-    printf("VERDICT Item 2 (Trampoline stack switch + non-ret jmp resume): %s\n", r2 ? "PASS" : "FAIL");
+    printf("VERDICT Item 2 (Trampoline stack switch + non-ret jmp resume + NT_TIB/DeallocationStack restore): %s\n",
+           r2 ? "PASS" : "FAIL");
     fails += !r2;
 
     /* Item 3 */
     if (!run_thread_test(item3_thread, &r3, NULL)) r3 = 0;
-    printf("VERDICT Item 3 (PAGE_NOACCESS guard page trap via VEH): %s\n", r3 ? "PASS" : "FAIL");
+    printf("VERDICT Item 3a (Explicit data read into PAGE_NOACCESS guard page with ~1MB RSP headroom): %s\n",
+           r3 ? "PASS" : "FAIL");
+    printf("VERDICT Item 3b (True RSP stack-overflow into PAGE_NOACCESS with <2KB headroom): NOT TESTED (KiUserExceptionDispatcher writes ~2KB below RSP)\n");
     fails += !r3;
 
     /* Item 4a */
@@ -732,7 +772,7 @@ int main(void) {
     /* Item 4c */
     if (!run_thread_test(item4c_thread, &r4c, NULL)) r4c = 0;
     printf("VERDICT Item 4c-win (RtlCaptureStackBackTrace on Bionic stack): %s\n", r4c ? "PASS" : "FAIL");
-    printf("VERDICT Item 4c-dwarf (DWARF libunwind in libc++_shared.so): NOT TESTED (gated on PR #7 / G2-5a)\n");
+    printf("VERDICT Item 4c-dwarf (DWARF libunwind / C++ throw on Bionic stack): NOT TESTED (gated on PR #7 / G2-5a)\n");
     fails += !r4c;
 
     /* Item 5 */
@@ -741,28 +781,42 @@ int main(void) {
         static trampoline_ctx ctx5;
         DWORD ec = 0;
         int joined;
+        LONG detach_cnt = 0;
+        uint64_t detach_rsp = 0;
         g_fls_called = 0;
         g_fls_val_seen = 0;
         g_fls_rsp_seen = 0;
         g_item5_vfree_ok = 0;
+        g_item5_tib_restored = 0;
         joined = run_thread_test(item5_thread, &ctx5, &ec);
+        if (g_detach_result) detach_cnt = g_detach_result(&detach_rsp);
         {
             int fls_on_host_stack = (g_fls_rsp_seen >= g_item5_orig_limit &&
                                      g_fls_rsp_seen < g_item5_orig_base);
-            printf("[Item 5] joined=%d exit_code=0x%lx vfree_ok=%ld fls_called=%ld fls_val=0x%llx fls_rsp=0x%llx (host=[0x%llx..0x%llx), on_host=%d)\n",
-                   joined, (unsigned long)ec, (long)g_item5_vfree_ok, (long)g_fls_called,
-                   (unsigned long long)g_fls_val_seen, (unsigned long long)g_fls_rsp_seen,
-                   (unsigned long long)g_item5_orig_limit, (unsigned long long)g_item5_orig_base,
-                   fls_on_host_stack);
-            r5 = (joined && ec == 0x42 && ctx5.test_ok && g_item5_vfree_ok == 1 &&
-                  g_fls_called == 1 && g_fls_val_seen == 0xF15C0DEULL && fls_on_host_stack);
+            int detach_on_host_stack = (detach_rsp >= g_item5_orig_limit &&
+                                        detach_rsp < g_item5_orig_base);
+            int dll_ok = (g_detach_arm && g_detach_result && detach_cnt == 1 && detach_on_host_stack);
+            printf("[Item 5] joined=%d exit_code=0x%lx tib_dealloc_restored=%ld vfree_ok=%ld "
+                   "fls_called=%ld fls_val=0x%llx fls_rsp=0x%llx (on_host=%d) "
+                   "dll_detach_cnt=%ld dll_detach_rsp=0x%llx (on_host=%d) host=[0x%llx..0x%llx)\n",
+                   joined, (unsigned long)ec, (long)g_item5_tib_restored, (long)g_item5_vfree_ok,
+                   (long)g_fls_called, (unsigned long long)g_fls_val_seen,
+                   (unsigned long long)g_fls_rsp_seen, fls_on_host_stack,
+                   (long)detach_cnt, (unsigned long long)detach_rsp, detach_on_host_stack,
+                   (unsigned long long)g_item5_orig_limit, (unsigned long long)g_item5_orig_base);
+            r5 = (joined && ec == 0x42 && ctx5.test_ok && g_item5_tib_restored == 1 &&
+                  g_item5_vfree_ok == 1 && g_fls_called == 1 && g_fls_val_seen == 0xF15C0DEULL &&
+                  fls_on_host_stack && dll_ok);
         }
         FlsFree(g_fls_idx);
     }
-    printf("VERDICT Item 5 (Restore host_rsp + NT_TIB + VirtualFree + ExitThread with FLS): %s\n", r5 ? "PASS" : "FAIL");
+    printf("VERDICT Item 5 (Restore host_rsp + NT_TIB/DeallocationStack + VirtualFree + ExitThread with FLS + DLL_THREAD_DETACH): %s\n",
+           r5 ? "PASS" : "FAIL");
     fails += !r5;
 
+    if (hdll) FreeLibrary(hdll);
     RemoveVectoredExceptionHandler(veh);
-    printf("\nG2-1 Windows probe summary: %s (failures=%d)\n", fails ? "FAIL" : "ALL TESTED ITEMS PASSED", fails);
+    printf("\nG2-1 Windows probe summary: %s (failures=%d; Items 3b and 4c-dwarf explicitly NOT TESTED)\n",
+           fails ? "FAIL" : "ALL EXECUTED WINDOWS ITEMS PASSED", fails);
     return fails ? 1 : 0;
 }

@@ -139,8 +139,13 @@ int main(void) {
         if (r_sig != 0 || r_bcast != 0 || r_tw_rt != ETIMEDOUT || r_tw_mono != ETIMEDOUT) ok = 0;
     }
 
+    printf("VERDICT Item 1a (Single-threaded Bionic pthread API smoke test; NOT multi-threaded contention proof): %s\n",
+           ok ? "PASS" : "FAIL");
+    fflush(stdout);
+
     /* 6. pthread_create (joinable): expected to hit clone(56) -> ENOSYS */
     {
+        int clone_ok = 1;
         pthread_t th;
         void *marker = (void *)(uintptr_t)0x123456789ABCDEF0ULL;
         printf("[pthread_probe] calling pthread_create(joinable, fn=%p, arg=%p)...\n",
@@ -149,27 +154,29 @@ int main(void) {
         rc = pthread_create(&th, NULL, dummy_worker, marker);
         printf("[pthread_probe] pthread_create(joinable) returned rc=%d (%s)\n", rc, strerror(rc));
         fflush(stdout);
-        if (rc != ENOSYS) ok = 0;
+        if (rc != ENOSYS) clone_ok = 0;
+
+        /* 7. pthread_create (detached): compare clone flags & newtls */
+        {
+            pthread_attr_t attr;
+            void *dmarker = (void *)(uintptr_t)0x0FEDCBA987654321ULL;
+            pthread_attr_init(&attr);
+            pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+            printf("[pthread_probe] calling pthread_create(detached, fn=%p, arg=%p)...\n",
+                   (void *)(uintptr_t)dummy_worker, dmarker);
+            fflush(stdout);
+            rc = pthread_create(&th, &attr, dummy_worker, dmarker);
+            pthread_attr_destroy(&attr);
+            printf("[pthread_probe] pthread_create(detached) returned rc=%d (%s)\n", rc, strerror(rc));
+            fflush(stdout);
+            if (rc != ENOSYS) clone_ok = 0;
+        }
+
+        printf("VERDICT Item 1b (Live pthread_create reaching clone(56) -> ENOSYS): %s\n",
+               clone_ok ? "PASS" : "FAIL");
+        fflush(stdout);
+        if (!clone_ok) ok = 0;
     }
 
-    /* 7. pthread_create (detached): compare clone flags & newtls */
-    {
-        pthread_t th;
-        pthread_attr_t attr;
-        void *marker = (void *)(uintptr_t)0x0FEDCBA987654321ULL;
-        pthread_attr_init(&attr);
-        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-        printf("[pthread_probe] calling pthread_create(detached, fn=%p, arg=%p)...\n",
-               (void *)(uintptr_t)dummy_worker, marker);
-        fflush(stdout);
-        rc = pthread_create(&th, &attr, dummy_worker, marker);
-        pthread_attr_destroy(&attr);
-        printf("[pthread_probe] pthread_create(detached) returned rc=%d (%s)\n", rc, strerror(rc));
-        fflush(stdout);
-        if (rc != ENOSYS) ok = 0;
-    }
-
-    printf("VERDICT Item 1 (Bionic pthread/clone/futex syscall profile): %s\n", ok ? "PASS" : "FAIL");
-    fflush(stdout);
     return ok ? 0 : 1;
 }

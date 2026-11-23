@@ -508,6 +508,8 @@ jobs:
         timeout-minutes: 2
         shell: cmd
         run: |
+          clang-cl /nologo /O2 /W3 /LD /D_CRT_SECURE_NO_WARNINGS /Fe:out\g2_detach_probe.dll /Foout\ tools\g2_detach_probe.c
+          if errorlevel 1 exit /b 1
           clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Fe:out\g2_stack_probe.exe /Foout\ tools\g2_stack_probe.c /link synchronization.lib
           if errorlevel 1 exit /b 1
           out\g2_stack_probe.exe
