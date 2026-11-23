@@ -7,4 +7,6 @@ void afw_crash_init(void);
 /* After `seconds`, print where the main thread is (3 samples) and the
  * syscall counts, then end the process with 124. Windows only. 0 or -1. */
 int afw_watchdog_start(unsigned seconds);
+/* Opt-in last-priority VEH crash logger for --probe-syscalls diagnostics. */
+void afw_crash_enable_probe_veh(void);
 #endif

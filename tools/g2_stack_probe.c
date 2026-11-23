@@ -245,12 +245,24 @@ __asm__(
     ".intel_syntax noprefix\n"
 );
 
-static uint64_t get_tib_base(void)  { return __readgsqword(0x08); }
-static uint64_t get_tib_limit(void) { return __readgsqword(0x10); }
-static uint64_t get_teb_dealloc(void) { return __readgsqword(0x1478); }
+static uint64_t get_tib_base(void) {
+    uint64_t v;
+    __asm__ volatile("movq %%gs:0x08, %0" : "=r"(v));
+    return v;
+}
+static uint64_t get_tib_limit(void) {
+    uint64_t v;
+    __asm__ volatile("movq %%gs:0x10, %0" : "=r"(v));
+    return v;
+}
+static uint64_t get_teb_dealloc(void) {
+    uint64_t v;
+    __asm__ volatile("movq %%gs:0x1478, %0" : "=r"(v));
+    return v;
+}
 static void set_tib_bounds(uint64_t base, uint64_t limit) {
-    __writegsqword(0x08, base);
-    __writegsqword(0x10, limit);
+    __asm__ volatile("movq %0, %%gs:0x08" : : "r"(base) : "memory");
+    __asm__ volatile("movq %0, %%gs:0x10" : : "r"(limit) : "memory");
 }
 
 static uint8_t *alloc_bionic_stack(uint64_t *limit_out, uint64_t *top_out) {

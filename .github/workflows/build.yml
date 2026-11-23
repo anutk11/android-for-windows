@@ -223,10 +223,18 @@ jobs:
               echo "--- libc.debug symtab matches ---"
               "$TC/llvm-readelf" -sW out/bionic/libc.debug | grep -E "__bionic_clone|clone\b|_exit_with_stack|pthread_create|pthread_cond_broadcast|pthread_cond_signal|pthread_cond_timedwait|pthread_exit|__pthread_start|__futex" | head -40 || true
             fi
-            echo "--- disassemble clone / __bionic_clone / pthread_cond_* / _exit_with_stack_teardown ---"
+            echo "--- disassemble __bionic_clone & _exit_with_stack_teardown ---"
             "$TC/llvm-objdump" -d --no-show-raw-insn \
-              --disassemble-symbols=clone,__bionic_clone,_exit_with_stack_teardown,pthread_cond_broadcast,pthread_cond_signal,pthread_cond_timedwait \
-              out/bionic/libc.so | head -220 || true
+              --disassemble-symbols=__bionic_clone,_exit_with_stack_teardown \
+              out/bionic/libc.so || true
+            echo "--- disassemble pthread_cond_broadcast / pthread_cond_signal / pthread_cond_timedwait ---"
+            "$TC/llvm-objdump" -d --no-show-raw-insn \
+              --disassemble-symbols=pthread_cond_broadcast,pthread_cond_signal,pthread_cond_timedwait \
+              out/bionic/libc.so | head -180 || true
+            echo "--- disassemble pthread_create ---"
+            "$TC/llvm-objdump" -d --no-show-raw-insn \
+              --disassemble-symbols=pthread_create \
+              out/bionic/libc.so | head -200 || true
             echo "--- syscall 56 (clone) and 60 (exit) and 202 (futex) sites from libc-scan.txt ---"
             grep -E "nr=(56|60|202)\b|__bionic_clone|_exit_with_stack|futex" out/libc-scan.txt | head -60 || true
           } | tee out/g2-pthread-scan.txt
