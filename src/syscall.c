@@ -5,6 +5,7 @@
  * exactly which syscalls a program really needs.
  */
 #include "syscall.h"
+#include "fd.h"
 #include "platform.h"
 #include "vma.h"
 
@@ -114,41 +115,7 @@ __attribute__((naked)) void afw_syscall_entry(void) {
         "ret\n\t");
 }
 
-/* ---- individual syscalls ---- */
-
-static int64_t sys_write(int64_t fd, const void *buf, uint64_t len) {
-#if defined(_WIN32)
-    DWORD done = 0;
-    HANDLE h;
-    if (fd == 1) h = GetStdHandle(STD_OUTPUT_HANDLE);
-    else if (fd == 2) h = GetStdHandle(STD_ERROR_HANDLE);
-    else return -LNX_EBADF;
-    if (!WriteFile(h, buf, (DWORD)len, &done, NULL)) return -LNX_EBADF;
-    return (int64_t)done;
-#else
-    ssize_t r;
-    if (fd != 1 && fd != 2) return -LNX_EBADF;
-    r = write((int)fd, buf, (size_t)len);
-    return r < 0 ? -LNX_EBADF : r;
-#endif
-}
-
-/* writev: each iovec in order through write(); stops at the first short or
- * failed write, like Linux returns the bytes written so far. */
-static int64_t sys_writev(int64_t fd, const uint64_t *iov, int64_t cnt) {
-    int64_t total = 0, i;
-    if (cnt < 0 || cnt > 1024) return -22;          /* EINVAL beyond IOV_MAX */
-    for (i = 0; i < cnt; i++) {
-        uint64_t len = iov[2 * i + 1];
-        int64_t r;
-        if (!len) continue;
-        r = sys_write(fd, (const void *)(uintptr_t)iov[2 * i], len);
-        if (r < 0) return total ? total : r;
-        total += r;
-        if ((uint64_t)r < len) break;
-    }
-    return total;
-}
+/* ---- individual syscalls (file I/O is in fd.c) ---- */
 
 static int64_t sys_gettid(void) {   /* the same id the thread area holds (tls_patch.c) */
 #if defined(_WIN32)
@@ -322,11 +289,24 @@ int64_t afw_syscall_from_entry(int64_t nr, int64_t *a) {
 int64_t afw_syscall_dispatch(int64_t nr, int64_t *a) {
     if (nr >= 0 && nr < AFW_MAX_SYSCALL) afw_syscall_counts[nr]++;
     switch (nr) {
-    case 1:   return sys_write(a[0], (const void *)(uintptr_t)a[1], (uint64_t)a[2]);
+    case 0:   return afw_fd_read(a[0], (void *)(uintptr_t)a[1], (uint64_t)a[2]);
+    case 1:   return afw_fd_write(a[0], (const void *)(uintptr_t)a[1], (uint64_t)a[2]);
+    case 2:   return afw_fd_openat(-100, (const char *)(uintptr_t)a[0], a[1], (uint64_t)a[2]);
+    case 3:   return afw_fd_close(a[0]);
+    case 4:   return afw_fd_newfstatat(-100, (const char *)(uintptr_t)a[0], (void *)(uintptr_t)a[1], 0);
+    case 5:   return afw_fd_fstat(a[0], (void *)(uintptr_t)a[1]);
+    case 6:   return afw_fd_newfstatat(-100, (const char *)(uintptr_t)a[0], (void *)(uintptr_t)a[1], 0x100);
+    case 8:   return afw_fd_lseek(a[0], a[1], a[2]);
+    case 19:  return afw_fd_readv(a[0], (const uint64_t *)(uintptr_t)a[1], a[2]);
+    case 20:  return afw_fd_writev(a[0], (const uint64_t *)(uintptr_t)a[1], a[2]);
     case 39:  return sys_getpid();
-    case 20:  return sys_writev(a[0], (const uint64_t *)(uintptr_t)a[1], a[2]);
+    case 72:  return afw_fd_fcntl(a[0], a[1], a[2]);
+    case 87:  return afw_fd_unlinkat(-100, (const char *)(uintptr_t)a[0], 0);
     case 202: return sys_futex(a[0], a[1], a[2], a[3], a[4], a[5]);
     case 228: return sys_clock_gettime(a[0], (struct lnx_timespec *)(uintptr_t)a[1]);
+    case 257: return afw_fd_openat(a[0], (const char *)(uintptr_t)a[1], a[2], (uint64_t)a[3]);
+    case 262: return afw_fd_newfstatat(a[0], (const char *)(uintptr_t)a[1], (void *)(uintptr_t)a[2], a[3]);
+    case 263: return afw_fd_unlinkat(a[0], (const char *)(uintptr_t)a[1], a[2]);
     case 318: return sys_getrandom((void *)(uintptr_t)a[0], (uint64_t)a[1], a[2]);
     /* one app user, as AT_UID/AT_GID say (bionic_shim.c): uid 10000 */
     case 102: case 104: case 107: case 108: return 10000;   /* getuid getgid geteuid getegid */
