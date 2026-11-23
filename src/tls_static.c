@@ -123,6 +123,9 @@ int afw_tls_static_finish(void) {
     return 0;
 }
 
+int afw_tls_static_is_finished(void) { return g_finished; }
+int afw_tls_static_count(void) { return g_layout.nmod; }
+
 uint64_t afw_tls_static_memsz(int mod) {
     return (mod >= 1 && mod <= g_layout.nmod) ? g_seg[mod - 1].p_memsz : 0;
 }

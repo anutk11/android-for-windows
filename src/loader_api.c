@@ -43,6 +43,14 @@ static void set_err(const char *fmt, ...) {
     t_has_err = 1;
 }
 
+/* Anchor retained deps[] arrays so LSan sees the allocation start even if only
+ * an interior deps[i] stayed loaded or quarantined. */
+static afw_lib *g_kept_deps[64];
+static int g_nkept_deps;
+static void keep_deps_alloc(afw_lib *deps) {
+    if (g_nkept_deps < 64) g_kept_deps[g_nkept_deps++] = deps;
+}
+
 SYSV void *afw_l_dlopen(const char *name, int flags, const void *caller) {
     char path[1200];
     afw_lib *lib, *deps;
@@ -67,17 +75,19 @@ SYSV void *afw_l_dlopen(const char *name, int flags, const void *caller) {
         strcpy(p, path);
         if (afw_load_with_deps(p, lib, deps, 32, &ndeps, 0) != 0) {
             int i, keep_deps = 0;
-            /* Only free allocations that are no longer registered in g_libs:
-             * if an earlier dependency already ran constructors before a later
-             * library failed to finish, that dependency stays live in g_libs. */
+            /* Only free allocations that are neither loaded in g_libs[] nor
+             * quarantined in g_quarantine[] (past the point of no return). */
             set_err("dlopen failed: could not load \"%s\" (see the loader's message)", name);
-            if (!afw_is_loaded(lib)) { free(lib); free(p); }
+            if (!afw_is_retained(lib)) { free(lib); free(p); }
             for (i = 0; i < ndeps; i++)
-                if (afw_is_loaded(&deps[i])) { keep_deps = 1; break; }
-            if (!keep_deps) free(deps);
+                if (afw_is_retained(&deps[i])) { keep_deps = 1; break; }
+            if (keep_deps) keep_deps_alloc(deps);
+            else free(deps);
             return NULL;
         }
     }
+    if (ndeps == 0) free(deps);
+    else keep_deps_alloc(deps);
     return lib;
 }
 

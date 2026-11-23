@@ -672,6 +672,9 @@ int main(int argc, char **argv) {
     int verbose = 1, rc = 0, strict = 0, min_pads = 0, call_trap = 0;
     const char *preload_fail = NULL;
     const char *finish_fail = NULL;
+#ifdef AFW_TEST
+    const char *finish_fail_late = NULL;
+#endif
     int with_deps = 0;
     int call_bad_ip = 0;   /* test: execute address 0x28 - must be a crash report, never a hang */
     static afw_lib deps[32];
@@ -697,6 +700,9 @@ int main(int argc, char **argv) {
             else if (strncmp(argv[a], "--min-landing-pads=", 19) == 0) min_pads = atoi(argv[a] + 19);
             else if (strncmp(argv[a], "--preload-fail=", 15) == 0) preload_fail = argv[a] + 15;
             else if (strncmp(argv[a], "--finish-fail=", 14) == 0) finish_fail = argv[a] + 14;
+#ifdef AFW_TEST
+            else if (strncmp(argv[a], "--finish-fail-late=", 19) == 0) finish_fail_late = argv[a] + 19;
+#endif
             else if (strcmp(argv[a], "--with-deps") == 0) with_deps = 1;
             else if (strcmp(argv[a], "--call-bad-ip") == 0) call_bad_ip = 1;
             else if (strncmp(argv[a], "--watchdog=", 11) == 0) {
@@ -724,29 +730,100 @@ int main(int argc, char **argv) {
         printf("  [ OK ] refused, and nothing left behind (libraries registered: %d)\n", afw_loaded_count());
     }
 
-    /* test (PR #11, reviewer 2): dlopen fails inside lib_finish() after Phase A
-     * mapped and registered the dependency set. Must discard unfinished libs so
-     * freeing lib/p in dlopen never leaves dangling pointers in g_libs (ASan UAF). */
+    /* test (PR #11, reviewer 2): dlopen fails inside lib_finish() BEFORE TLS closes.
+     * Must roll back completely: zero dangling g_libs[], zero quarantined libs,
+     * zero orphan TLS modules, and TLS layout still open for subsequent loads. */
     if (finish_fail) {
         typedef SYSV void *(*dlopen_fn)(const char *, int, const void *);
         typedef SYSV int (*dladdr_fn)(const void *, void *);
         dlopen_fn dlo = (dlopen_fn)afw_shim_lookup("__loader_dlopen");
         dladdr_fn dla = (dladdr_fn)afw_shim_lookup("__loader_dladdr");
         struct { const char *fname; void *fbase; const char *sname; void *saddr; } info;
-        int before = afw_loaded_count();
-        printf("Loading %s via dlopen with a forced lib_finish() failure...\n", finish_fail);
+        int before = afw_loaded_count(), before_q = afw_quarantined_count(), before_tls = afw_tls_static_count();
+        printf("Loading %s via dlopen with a forced early lib_finish() failure...\n", finish_fail);
         afw_tls_test_fail_publish(3);
         if (!dlo || !dla || dlo(finish_fail, 2, NULL) != NULL) {
             printf("FAIL: dlopen did not fail as expected\n"); return 1;
         }
         /* Touch the registry immediately under ASan: catches dangling g_libs[] entries. */
-        if (afw_loaded_count() != before || afw_find_loaded(finish_fail) != NULL ||
+        if (afw_loaded_count() != before || afw_quarantined_count() != before_q ||
+            afw_tls_static_count() != before_tls || afw_tls_static_is_finished() != 0 ||
+            afw_find_loaded(finish_fail) != NULL ||
             afw_global_sym("afw_deps_check") != NULL || dla(&info, &info) != 0) {
-            printf("FAIL: failed lib_finish left state behind in the registry\n"); return 1;
+            printf("FAIL: early lib_finish failure left state behind (loaded=%d quar=%d tls=%d fin=%d)\n",
+                   afw_loaded_count(), afw_quarantined_count(), afw_tls_static_count(), afw_tls_static_is_finished());
+            return 1;
         }
         printf("  [ OK ] lib_finish failure cleaned up cleanly (no UAF, libraries registered: %d)\n",
                afw_loaded_count());
     }
+
+#ifdef AFW_TEST
+    /* test (PR #11, reviewer 2): dlopen fails inside lib_finish() AFTER the point
+     * of no return (afw_tls_static_finish() succeeded and/or IFUNC ran), forced at
+     * afw_vma_adopt(). Verifies quarantine (no UAF, no orphan TLS module, consistent
+     * registry, and subsequent loads still work). */
+    if (finish_fail_late) {
+        typedef SYSV void *(*dlopen_fn)(const char *, int, const void *);
+        typedef SYSV int (*dladdr_fn)(const void *, void *);
+        dlopen_fn dlo = (dlopen_fn)afw_shim_lookup("__loader_dlopen");
+        dladdr_fn dla = (dladdr_fn)afw_shim_lookup("__loader_dladdr");
+        struct { const char *fname; void *fbase; const char *sname; void *saddr; } info;
+        int before = afw_loaded_count(), before_q = afw_quarantined_count(), before_tls = afw_tls_static_count();
+        const char *libpath = NULL;
+        int mode = 0;   /* 1=tls, 2=ifunc, 3=dep */
+        if (strncmp(finish_fail_late, "tls:", 4) == 0) { mode = 1; libpath = finish_fail_late + 4; }
+        else if (strncmp(finish_fail_late, "ifunc:", 6) == 0) { mode = 2; libpath = finish_fail_late + 6; }
+        else if (strncmp(finish_fail_late, "dep:", 4) == 0) { mode = 3; libpath = finish_fail_late + 4; }
+        else { printf("FAIL: bad --finish-fail-late mode: %s\n", finish_fail_late); return 1; }
+
+        printf("Loading %s via dlopen with a forced late lib_finish() failure (mode=%d)...\n", libpath, mode);
+        afw_load_test_fail_adopt(mode == 3 ? 2 : 1);
+        if (!dlo || !dla || dlo(libpath, 2, NULL) != NULL) {
+            printf("FAIL: late dlopen did not fail as expected\n"); return 1;
+        }
+        afw_load_test_fail_adopt(0);
+
+        if (mode == 1) {
+            /* TLS module was already committed in finished layout -> quarantined, never unregistered */
+            if (afw_loaded_count() != before || afw_quarantined_count() != before_q + 1 ||
+                afw_tls_static_is_finished() != 1 || afw_tls_static_count() != before_tls + 1 ||
+                afw_find_loaded(libpath) != NULL || afw_global_sym("afw_tls_worker") != NULL ||
+                dla(&info, &info) != 0) {
+                printf("FAIL: late TLS quarantine mismatch (loaded=%d quar=%d tls=%d fin=%d)\n",
+                       afw_loaded_count(), afw_quarantined_count(), afw_tls_static_count(), afw_tls_static_is_finished());
+                return 1;
+            }
+            printf("  [ OK ] late TLS lib_finish failure quarantined cleanly (loaded: %d, quarantined: %d, tls mods: %d)\n",
+                   afw_loaded_count(), afw_quarantined_count(), afw_tls_static_count());
+        } else if (mode == 2) {
+            /* IFUNC resolver ran (code_ran=1) before adopt failed -> quarantined */
+            if (afw_loaded_count() != before || afw_quarantined_count() != before_q + 1 ||
+                afw_tls_static_is_finished() != 1 || afw_find_loaded(libpath) != NULL ||
+                afw_global_sym("afw_ifunc_call") != NULL || dla(&info, &info) != 0) {
+                printf("FAIL: late IFUNC quarantine mismatch (loaded=%d quar=%d fin=%d)\n",
+                       afw_loaded_count(), afw_quarantined_count(), afw_tls_static_is_finished());
+                return 1;
+            }
+            printf("  [ OK ] late IFUNC lib_finish failure quarantined cleanly (loaded: %d, quarantined: %d)\n",
+                   afw_loaded_count(), afw_quarantined_count());
+        } else {
+            /* Dependency (libdeps_base.so) ran constructors -> stays loaded in g_libs[];
+             * dependent (libdeps_user.so, with PT_TLS in closed layout) -> quarantined. */
+            if (afw_loaded_count() != before + 1 || afw_quarantined_count() != before_q + 1 ||
+                afw_tls_static_is_finished() != 1 || afw_tls_static_count() != before_tls + 1 ||
+                afw_find_loaded("libdeps_base.so") == NULL || afw_global_sym("afw_base_value") == NULL ||
+                afw_find_loaded(libpath) != NULL || afw_global_sym("afw_deps_check") != NULL ||
+                dla(&info, &info) != 0) {
+                printf("FAIL: late dep-set quarantine mismatch (loaded=%d quar=%d tls=%d fin=%d)\n",
+                       afw_loaded_count(), afw_quarantined_count(), afw_tls_static_count(), afw_tls_static_is_finished());
+                return 1;
+            }
+            printf("  [ OK ] late dep-set lib_finish failure kept base loaded and quarantined user (loaded: %d, quarantined: %d, tls mods: %d)\n",
+                   afw_loaded_count(), afw_quarantined_count(), afw_tls_static_count());
+        }
+    }
+#endif
 
     if ((with_deps ? afw_load_with_deps(argv[1], &lib, deps, 32, &ndeps, verbose)
                    : afw_load(argv[1], &lib, verbose)) != 0) {

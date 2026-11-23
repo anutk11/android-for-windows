@@ -24,6 +24,8 @@ int afw_tls_static_unregister(int mod);
 /* Fix the layout. After this, register() refuses (dynamic TLS is G2).
  * Rebuilds the calling thread's block. Idempotent. Returns 0 or -1. */
 int afw_tls_static_finish(void);
+int afw_tls_static_is_finished(void);
+int afw_tls_static_count(void);
 
 /* Offset of module `mod` (1-based) below tp, or 0 if unknown. */
 uint64_t afw_tls_static_off(int mod);
