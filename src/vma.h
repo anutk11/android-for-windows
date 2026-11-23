@@ -60,9 +60,17 @@ int64_t afw_madvise(uint64_t addr, uint64_t len, int advice);
  *
  * page_prot holds (size / 4096) entries using LNX_PROT_* flags (NOT ELF PF_*
  * flags: LNX_PROT_READ=1, LNX_PROT_WRITE=2, LNX_PROT_EXEC=4). All pages are
- * recorded as mapped and committed. Calling afw_vma_adopt() again for the
- * exact same adopted [base, base + size) replaces its extent map atomically
- * (e.g. after RELRO) without making OS calls. Returns 0 or -errno.
+ * recorded as mapped and committed.
+ *
+ * Re-adopt contract (calling afw_vma_adopt() again on the exact same adopted
+ * [base, base + size)):
+ *   - allowed ONLY while the entire range is still mapped and committed;
+ *   - intended solely to update protections (e.g. after RELRO) BEFORE any
+ *     Linux code has touched the region;
+ *   - MUST NOT be used to bring back a region after munmap or decommit, or
+ *     after any Linux-side VMA change (returns -EINVAL if any tracked page
+ *     is unmapped or decommitted).
+ * Returns 0 or -errno (-EINVAL, -ENOMEM, -EEXIST).
  */
 int afw_vma_adopt(uint64_t base, uint64_t size, const unsigned char *page_prot);
 
