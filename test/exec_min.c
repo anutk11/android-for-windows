@@ -2,7 +2,7 @@
  * stack afw_exec builds, as the Linux kernel would (argc | argv | NULL |
  * envp | NULL | auxv), and ends with exit_group(42) only if all is right.
  * Each wrong field gives its own exit code. */
-static long sys1(long n, long a) {
+__attribute__((noinline)) static long sys1(long n, long a) {
     long r;
     __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a) : "rcx", "r11", "memory");
     return r;
