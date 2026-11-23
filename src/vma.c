@@ -44,7 +44,8 @@ typedef struct {
     uint64_t mapped_bytes;   /* sum of (end - start) over P_MAPPED extents */
     vma_ext *ext;            /* sorted partition of [base, base + size) */
     size_t next, cap;
-    unsigned char owned;     /* 1 = VMA owns the OS reservation; 0 = adopted */
+    unsigned char owned;         /* 1 = VMA owns the OS reservation; 0 = adopted */
+    unsigned char linux_touched; /* 1 = a Linux VMA call touched this region */
 } winalloc;
 
 /* Sorted by base, pairwise disjoint. */
@@ -279,6 +280,7 @@ static winalloc *add(uint64_t base, uint64_t size) {
     w->next = 1;
     w->cap = 8;
     w->owned = 1;
+    w->linux_touched = 0;
     w->ext[0].start = base;
     w->ext[0].end = base + size;
     w->ext[0].state = 0;
@@ -423,6 +425,7 @@ static int map_extents(winalloc *w, uint64_t a, uint64_t n, int prot) {
         }
         for (k = i; k < j; k++)
             w->ext[k].state = (unsigned char)(w->ext[k].state & P_MAPPED);
+        w->linux_touched = 1;
         i = j;
     }
 
@@ -437,6 +440,7 @@ static int map_extents(winalloc *w, uint64_t a, uint64_t n, int prot) {
                 w->mapped_bytes += w->ext[i].end - w->ext[i].start;
             w->ext[i].state = st;
         }
+        w->linux_touched = 1;
     }
 
     coalesce_around(w, i0, i1);
@@ -548,10 +552,13 @@ static int do_unmap(winalloc *w, uint64_t a, uint64_t n, int arg) {
                     w->mapped_bytes -= w->ext[k].end - w->ext[k].start;
                 w->ext[k].state = 0;
             }
+            w->linux_touched = 1;
             i = j;
         } else {
-            if (w->ext[i].state & P_MAPPED)
+            if (w->ext[i].state & P_MAPPED) {
                 w->mapped_bytes -= w->ext[i].end - w->ext[i].start;
+                w->linux_touched = 1;
+            }
             w->ext[i].state = 0;
             i++;
         }
@@ -580,6 +587,7 @@ static int do_protect(winalloc *w, uint64_t a, uint64_t n, int prot) {
             }
             for (k = i; k < j; k++)
                 w->ext[k].state = (unsigned char)(P_MAPPED | P_COMMIT | prot);
+            w->linux_touched = 1;
             i = j;
         } else if (prot) {
             j = i + 1;
@@ -590,6 +598,7 @@ static int do_protect(winalloc *w, uint64_t a, uint64_t n, int prot) {
             }
             for (k = i; k < j; k++)
                 w->ext[k].state = (unsigned char)(P_MAPPED | P_COMMIT | prot);
+            w->linux_touched = 1;
             i = j;
         } else {
             w->ext[i].state = P_MAPPED;
@@ -597,6 +606,7 @@ static int do_protect(winalloc *w, uint64_t a, uint64_t n, int prot) {
         }
     }
 
+    if (rc == 0) w->linux_touched = 1;
     coalesce_around(w, i0, i1);
     return rc;
 }
@@ -616,6 +626,7 @@ static int do_dontneed(winalloc *w, uint64_t a, uint64_t n, int arg) {
             break;
         }
         w->ext[i].state = P_MAPPED;                       /* now truthfully reserved */
+        w->linux_touched = 1;
         if (prot) {                                       /* accessible: zeros back now */
             if (os_commit(w->ext[i].start, len, prot) != 0) {
                 rc = -1;
@@ -626,6 +637,7 @@ static int do_dontneed(winalloc *w, uint64_t a, uint64_t n, int arg) {
         /* PROT_NONE: stays reserved; a later mprotect commits fresh zero pages */
     }
 
+    if (rc == 0) w->linux_touched = 1;
     coalesce_around(w, i0, i1);
     return rc;
 }
@@ -705,9 +717,11 @@ int afw_vma_adopt(uint64_t base, uint64_t size, const unsigned char *page_prot) 
     if (idx < g_n && g_a[idx].base == base && g_a[idx].size == size) {
         size_t i;
         if (g_a[idx].owned) { UNLOCK(); free(ext); return -LNX_EEXIST; }
-        /* Re-adopt contract (reviewer 2, PR #14): allowed only while the whole
-         * range is still mapped and committed (before munmap / decommit). */
-        if (g_a[idx].mapped_bytes != size) { UNLOCK(); free(ext); return -LNX_EINVAL; }
+        /* Re-adopt contract (reviewer 2, PR #14): allowed only before any
+         * Linux-side VMA call touched the region, and while fully mapped+committed. */
+        if (g_a[idx].linux_touched || g_a[idx].mapped_bytes != size) {
+            UNLOCK(); free(ext); return -LNX_EINVAL;
+        }
         for (i = 0; i < g_a[idx].next; i++) {
             if ((g_a[idx].ext[i].state & (P_MAPPED | P_COMMIT)) != (P_MAPPED | P_COMMIT)) {
                 UNLOCK(); free(ext); return -LNX_EINVAL;
@@ -746,6 +760,7 @@ int afw_vma_adopt(uint64_t base, uint64_t size, const unsigned char *page_prot) 
     w->next = nruns;
     w->cap = cap;
     w->owned = 0;
+    w->linux_touched = 0;
     UNLOCK();
     return 0;
 }

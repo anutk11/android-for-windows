@@ -68,8 +68,9 @@ int64_t afw_madvise(uint64_t addr, uint64_t len, int advice);
  *   - intended solely to update protections (e.g. after RELRO) BEFORE any
  *     Linux code has touched the region;
  *   - MUST NOT be used to bring back a region after munmap or decommit, or
- *     after any Linux-side VMA change (returns -EINVAL if any tracked page
- *     is unmapped or decommitted).
+ *     after any Linux-side VMA change (returns -EINVAL if any Linux-side
+ *     VMA operation has touched the region, or if any tracked page is
+ *     unmapped or decommitted).
  * Returns 0 or -errno (-EINVAL, -ENOMEM, -EEXIST).
  */
 int afw_vma_adopt(uint64_t base, uint64_t size, const unsigned char *page_prot);
