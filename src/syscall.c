@@ -286,8 +286,184 @@ int64_t afw_syscall_from_entry(int64_t nr, int64_t *a) {
     return afw_syscall_dispatch(nr, a);
 }
 
+/* Opt-in G2-1 measurement logging (--probe-syscalls); off by default.
+ * Purely observational: never changes syscall behavior or return values. */
+int afw_syscall_probe_log = 0;
+
+static long g_probe_clone_calls;
+static long g_probe_futex_total;
+static long g_probe_futex_ops[16];
+static long g_probe_futex_other;
+static long g_probe_futex_requeue;
+static long g_probe_futex_partial_bitset;
+static long g_probe_futex_logged;
+static long g_probe_misc_logged;
+static int g_probe_summary_printed;
+
+static const char *probe_futex_op_name(int op) {
+    static const char *const names[13] = {
+        "WAIT", "WAKE", "FD", "REQUEUE", "CMP_REQUEUE", "WAKE_OP",
+        "LOCK_PI", "UNLOCK_PI", "TRYLOCK_PI", "WAIT_BITSET", "WAKE_BITSET",
+        "WAIT_REQUEUE_PI", "CMP_REQUEUE_PI"
+    };
+    return (op >= 0 && op < 13) ? names[op] : "OTHER";
+}
+
+static void probe_log_clone(const int64_t *a) {
+    static const struct { uint64_t bit; const char *name; } flag_bits[] = {
+        { 0x00000100ULL, "CLONE_VM" },
+        { 0x00000200ULL, "CLONE_FS" },
+        { 0x00000400ULL, "CLONE_FILES" },
+        { 0x00000800ULL, "CLONE_SIGHAND" },
+        { 0x00002000ULL, "CLONE_PTRACE" },
+        { 0x00004000ULL, "CLONE_VFORK" },
+        { 0x00008000ULL, "CLONE_PARENT" },
+        { 0x00010000ULL, "CLONE_THREAD" },
+        { 0x00020000ULL, "CLONE_NEWNS" },
+        { 0x00040000ULL, "CLONE_SYSVSEM" },
+        { 0x00080000ULL, "CLONE_SETTLS" },
+        { 0x00100000ULL, "CLONE_PARENT_SETTID" },
+        { 0x00200000ULL, "CLONE_CHILD_CLEARTID" },
+        { 0x00400000ULL, "CLONE_DETACHED" },
+        { 0x00800000ULL, "CLONE_UNTRACED" },
+        { 0x01000000ULL, "CLONE_CHILD_SETTID" },
+    };
+    uint64_t flags = (uint64_t)a[0];
+    uint64_t sig = flags & 0xffULL;
+    uint64_t high = flags & ~0xffULL;
+    uint64_t known = 0;
+    uint64_t child_stack = (uint64_t)a[1];
+    uint64_t ptid = (uint64_t)a[2];
+    uint64_t ctid = (uint64_t)a[3];
+    uint64_t newtls = (uint64_t)a[4];
+    size_t i;
+
+    g_probe_clone_calls++;
+    printf("[probe] clone #%ld: flags=0x%llx (sig=%llu", g_probe_clone_calls,
+           (unsigned long long)flags, (unsigned long long)sig);
+    for (i = 0; i < sizeof flag_bits / sizeof flag_bits[0]; i++) {
+        if (high & flag_bits[i].bit) {
+            printf("|%s", flag_bits[i].name);
+            known |= flag_bits[i].bit;
+        }
+    }
+    if (high & ~known)
+        printf("|UNKNOWN=0x%llx", (unsigned long long)(high & ~known));
+    printf(")\n");
+    printf("[probe]   child_stack=0x%llx (mod16=%llu) ptid=0x%llx ctid=0x%llx newtls=0x%llx stub_ret=0x%llx\n",
+           (unsigned long long)child_stack, (unsigned long long)(child_stack & 15ULL),
+           (unsigned long long)ptid, (unsigned long long)ctid,
+           (unsigned long long)newtls, (unsigned long long)afw_last_syscall_ret);
+    if (child_stack && (child_stack & 7ULL) == 0) {
+        const uint64_t *sp = (const uint64_t *)(uintptr_t)child_stack;
+        size_t max_q = (4096ULL - (child_stack & 4095ULL)) / 8ULL;
+        if (max_q > 8) max_q = 8;
+        printf("[probe]   child_stack[0..%zu]:", max_q ? max_q - 1 : 0);
+        for (i = 0; i < max_q; i++)
+            printf(" [%zu]=0x%llx", i, (unsigned long long)sp[i]);
+        printf("\n");
+    }
+    if (newtls && (newtls & 7ULL) == 0) {
+        const uint64_t *tls = (const uint64_t *)(uintptr_t)newtls;
+        size_t max_q = (4096ULL - (newtls & 4095ULL)) / 8ULL;
+        if (max_q > 11) max_q = 11;
+        printf("[probe]   newtls slots[0..%zu]:\n", max_q ? max_q - 1 : 0);
+        for (i = 0; i < max_q; i++)
+            printf("[probe]     fs:[0x%02zx] = 0x%016llx\n", i * 8, (unsigned long long)tls[i]);
+    }
+    fflush(stdout);
+}
+
+static void probe_log_futex(const int64_t *a) {
+    int64_t op_full = a[1];
+    int op = (int)(op_full & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME));
+    int is_priv = (op_full & FUTEX_PRIVATE_FLAG) != 0;
+    int is_rt = (op_full & FUTEX_CLOCK_REALTIME) != 0;
+    uint32_t val3 = (uint32_t)a[5];
+
+    g_probe_futex_total++;
+    if (op >= 0 && op < 16) g_probe_futex_ops[op]++;
+    else g_probe_futex_other++;
+    if (op == 3 || op == 4 || op == 11 || op == 12) g_probe_futex_requeue++;
+    if ((op == FUTEX_WAIT_BITSET || op == FUTEX_WAKE_BITSET) && val3 != FUTEX_BITSET_MATCH_ANY)
+        g_probe_futex_partial_bitset++;
+
+    if (g_probe_futex_logged < 64) {
+        g_probe_futex_logged++;
+        printf("[probe] futex #%ld: op=%s(%d)%s%s uaddr=0x%llx val=0x%llx ts=0x%llx uaddr2=0x%llx val3=0x%x\n",
+               g_probe_futex_total, probe_futex_op_name(op), op,
+               is_priv ? "|PRIVATE" : "", is_rt ? "|CLOCK_REALTIME" : "",
+               (unsigned long long)a[0], (unsigned long long)a[2],
+               (unsigned long long)a[3], (unsigned long long)a[4], val3);
+        if ((op == FUTEX_WAIT || op == FUTEX_WAIT_BITSET) && a[3] != 0) {
+            const struct lnx_timespec *tp = (const struct lnx_timespec *)(uintptr_t)a[3];
+            printf("[probe]   timeout={tv_sec=%lld, tv_nsec=%lld}\n",
+                   (long long)tp->tv_sec, (long long)tp->tv_nsec);
+        }
+        fflush(stdout);
+    }
+}
+
+static void probe_log_syscall(int64_t nr, const int64_t *a) {
+    if (nr == 56) { probe_log_clone(a); return; }
+    if (nr == 202) { probe_log_futex(a); return; }
+    if (g_probe_misc_logged >= 80) return;
+    switch (nr) {
+    case 9:
+        g_probe_misc_logged++;
+        printf("[probe] mmap(addr=0x%llx, len=0x%llx, prot=0x%llx, flags=0x%llx, fd=%lld, off=0x%llx)\n",
+               (unsigned long long)a[0], (unsigned long long)a[1], (unsigned long long)a[2],
+               (unsigned long long)a[3], (long long)a[4], (unsigned long long)a[5]);
+        break;
+    case 10:
+        g_probe_misc_logged++;
+        printf("[probe] mprotect(addr=0x%llx, len=0x%llx, prot=0x%llx)\n",
+               (unsigned long long)a[0], (unsigned long long)a[1], (unsigned long long)a[2]);
+        break;
+    case 11:
+        g_probe_misc_logged++;
+        printf("[probe] munmap(addr=0x%llx, len=0x%llx)\n",
+               (unsigned long long)a[0], (unsigned long long)a[1]);
+        break;
+    case 28:
+        g_probe_misc_logged++;
+        printf("[probe] madvise(addr=0x%llx, len=0x%llx, advice=%lld)\n",
+               (unsigned long long)a[0], (unsigned long long)a[1], (long long)a[2]);
+        break;
+    case 14: case 97: case 131: case 157: case 204: case 218: case 273: case 302:
+        g_probe_misc_logged++;
+        printf("[probe] sys#%lld(a0=0x%llx, a1=0x%llx, a2=0x%llx, a3=0x%llx)\n",
+               (long long)nr, (unsigned long long)a[0], (unsigned long long)a[1],
+               (unsigned long long)a[2], (unsigned long long)a[3]);
+        break;
+    default:
+        break;
+    }
+}
+
+void afw_syscall_probe_summary(void) {
+    int op;
+    if (!afw_syscall_probe_log || g_probe_summary_printed) return;
+    g_probe_summary_printed = 1;
+    printf("\n=== G2-1 Syscall Probe Summary ===\n");
+    printf("clone(56) calls observed: %ld (all returned -ENOSYS; measurement-only)\n", g_probe_clone_calls);
+    printf("futex(202) calls observed: %ld\n", g_probe_futex_total);
+    for (op = 0; op < 13; op++) {
+        if (g_probe_futex_ops[op])
+            printf("  FUTEX_%-15s: %ld\n", probe_futex_op_name(op), g_probe_futex_ops[op]);
+    }
+    if (g_probe_futex_other) printf("  FUTEX_OTHER          : %ld\n", g_probe_futex_other);
+    printf("FUTEX_REQUEUE / FUTEX_CMP_REQUEUE: %s (%ld)\n",
+           g_probe_futex_requeue ? "SEEN" : "NOT SEEN", g_probe_futex_requeue);
+    printf("FUTEX partial bitset (val3 != 0xffffffff): %s (%ld)\n",
+           g_probe_futex_partial_bitset ? "SEEN" : "NOT SEEN", g_probe_futex_partial_bitset);
+    afw_syscall_report();
+    fflush(stdout);
+}
+
 int64_t afw_syscall_dispatch(int64_t nr, int64_t *a) {
     if (nr >= 0 && nr < AFW_MAX_SYSCALL) afw_syscall_counts[nr]++;
+    if (afw_syscall_probe_log) probe_log_syscall(nr, a);
     switch (nr) {
     case 0:   return afw_fd_read(a[0], (void *)(uintptr_t)a[1], (uint64_t)a[2]);
     case 1:   return afw_fd_write(a[0], (const void *)(uintptr_t)a[1], (uint64_t)a[2]);
@@ -320,6 +496,7 @@ int64_t afw_syscall_dispatch(int64_t nr, int64_t *a) {
         if (a[0] == 0x53564d41) return 0;  /* PR_SET_VMA (naming an area): accepted */
         return -22;
     case 60:  /* exit: ends only the calling thread */
+        afw_syscall_probe_summary();
         fflush(stdout);
 #if defined(_WIN32)
         ExitThread((DWORD)a[0]);
@@ -327,6 +504,7 @@ int64_t afw_syscall_dispatch(int64_t nr, int64_t *a) {
         _exit((int)a[0]);   /* host test builds have no emulated threads yet */
 #endif
     case 231: /* exit_group: ends the whole process */
+        afw_syscall_probe_summary();
         fflush(stdout);
 #if defined(_WIN32)
         ExitProcess((UINT)a[0]);

@@ -65,6 +65,8 @@ jobs:
             -o out/hello_exe test/hello_exe.c
           "$TC/clang" --target=x86_64-linux-android34 -O2 -fPIE -pie -Wl,--pack-dyn-relocs=none \
             -o out/g1_gate_exe test/g1_gate_exe.c
+          "$TC/clang" --target=x86_64-linux-android34 -O2 -fPIE -pie -Wl,--pack-dyn-relocs=none \
+            -o out/pthread_probe test/pthread_probe.c
           "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 -nostdlib -Wl,-soname,libdeps_base.so \
             -o out/libdeps_base.so test/deps_base.c
           "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 -nostdlib -Lout -ldeps_base \
@@ -101,6 +103,7 @@ jobs:
             out/exec_bad_entry
             out/hello_exe
             out/g1_gate_exe
+            out/pthread_probe
 
   # Gate G1 experiment: static scan of the real bionic libc.so.
   # The extracted Android files are NOT uploaded (licensing): only the report.
@@ -208,6 +211,25 @@ jobs:
           out/afw-loader out/artprobe/art/libart.so --patch-report 2>&1 \
             | grep -E "^(Library|Needs|Code|Patched|GATE|TLS)|unproven|UNPROVEN [0-9]|refused" | head -30 | tee -a out/art-gs-scan.txt
           rm -rf out/artprobe                  # extracted files are never uploaded (rule 5)
+      - name: "G2-1 Measure: bionic pthread/clone/cond/teardown disassembly (informational)"
+        continue-on-error: true
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"; TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          {
+            echo "=== G2-1 static disassembly of real bionic libc.so ==="
+            echo "--- matching dynamic/debug symbols ---"
+            "$TC/llvm-readelf" --dyn-syms -W out/bionic/libc.so | grep -E "__bionic_clone|clone\b|_exit_with_stack|pthread_create|pthread_cond_broadcast|pthread_cond_signal|pthread_cond_timedwait|pthread_exit|__pthread_start" || true
+            if [ -f out/bionic/libc.debug ]; then
+              echo "--- libc.debug symtab matches ---"
+              "$TC/llvm-readelf" -sW out/bionic/libc.debug | grep -E "__bionic_clone|clone\b|_exit_with_stack|pthread_create|pthread_cond_broadcast|pthread_cond_signal|pthread_cond_timedwait|pthread_exit|__pthread_start|__futex" | head -40 || true
+            fi
+            echo "--- disassemble clone / __bionic_clone / pthread_cond_* / _exit_with_stack_teardown ---"
+            "$TC/llvm-objdump" -d --no-show-raw-insn \
+              --disassemble-symbols=clone,__bionic_clone,_exit_with_stack_teardown,pthread_cond_broadcast,pthread_cond_signal,pthread_cond_timedwait \
+              out/bionic/libc.so | head -220 || true
+            echo "--- syscall 56 (clone) and 60 (exit) and 202 (futex) sites from libc-scan.txt ---"
+            grep -E "nr=(56|60|202)\b|__bionic_clone|_exit_with_stack|futex" out/libc-scan.txt | head -60 || true
+          } | tee out/g2-pthread-scan.txt
       - uses: actions/upload-artifact@v4
         with:
           name: bionic-scan-report
@@ -463,6 +485,24 @@ jobs:
         continue-on-error: true
         shell: cmd
         run: out\afw-loader.exe out\libc++_shared.so --patch-report
+      - name: "G2-1 Probe (Item 1): real bionic pthread/clone/futex syscall profile (informational)"
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: cmd
+        run: |
+          set AFW_LIB_PATH=out\bionic
+          out\afw-loader.exe out\pthread_probe --with-deps --probe-syscalls --watchdog=60 --exec > out\g2-item1.txt 2>&1
+          set rc=%errorlevel%
+          type out\g2-item1.txt
+          echo pthread_probe exit code %rc%
+      - name: "G2-1 Probe (Items 2-5): Windows stack / NT_TIB / VEH / ExitThread probe (informational)"
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: cmd
+        run: |
+          clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Fe:out\g2_stack_probe.exe /Foout\ tools\g2_stack_probe.c /link synchronization.lib
+          if errorlevel 1 exit /b 1
+          out\g2_stack_probe.exe
       - name: "Experiment: fs: TLS on Windows"
         shell: cmd
         run: |
