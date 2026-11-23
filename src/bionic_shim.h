@@ -5,6 +5,7 @@
  */
 #ifndef AFW_BIONIC_SHIM_H
 #define AFW_BIONIC_SHIM_H
+#include <stdint.h>
 
 /* Find a replacement for an Android library symbol. NULL if we have none. */
 void *afw_shim_lookup(const char *name);
@@ -24,5 +25,6 @@ int afw_shim_count(void);
 
 /* libc_shared_globals for the pinned libc build (exposed for tests) */
 void *afw_shared_globals(void);
+void afw_shared_globals_set_process(const uint64_t *auxv, char **envp, const char *progname);
 
 #endif

@@ -15,6 +15,7 @@
 
 #include "bionic_shim.h"
 #include "elf_loader.h"
+#include "exec.h"
 #include "platform.h"
 #include "tls_patch.h"
 #include "crash.h"
@@ -670,6 +671,7 @@ int main(int argc, char **argv) {
     int verbose = 1, rc = 0, strict = 0, min_pads = 0, call_trap = 0;
     const char *preload_fail = NULL;
     int with_deps = 0;
+    int exec_from = 0;   /* --exec ARGS...: start the loaded executable with them */
     int call_bad_ip = 0;   /* test: execute address 0x28 - must be a crash report, never a hang */
     static afw_lib deps[32];
     int ndeps = 0;
@@ -694,6 +696,7 @@ int main(int argc, char **argv) {
             else if (strncmp(argv[a], "--min-landing-pads=", 19) == 0) min_pads = atoi(argv[a] + 19);
             else if (strncmp(argv[a], "--preload-fail=", 15) == 0) preload_fail = argv[a] + 15;
             else if (strcmp(argv[a], "--with-deps") == 0) with_deps = 1;
+            else if (strcmp(argv[a], "--exec") == 0) { exec_from = a + 1; break; }   /* the rest: the program's args */
             else if (strcmp(argv[a], "--call-bad-ip") == 0) call_bad_ip = 1;
             else if (strncmp(argv[a], "--watchdog=", 11) == 0) {
                 int sec = atoi(argv[a] + 11);
@@ -726,6 +729,19 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    if (exec_from) {
+        /* argv[0] = the executable, then everything after --exec */
+        char **pargv = (char **)calloc((size_t)(argc - exec_from + 2), sizeof *pargv);
+        int n = 0, k;
+        if (!pargv) return 1;
+        if (!lib.is_exec) { printf("\n%s is not an executable (no PT_INTERP)\n", argv[1]); return 1; }
+        pargv[n++] = argv[1];
+        for (k = exec_from; k < argc; k++) pargv[n++] = argv[k];
+        printf("\nStarting %s at its entry point (%d argument%s)...\n", argv[1], n, n == 1 ? "" : "s");
+        afw_exec(&lib, n, pargv);
+        printf("could not start the executable\n");
+        return 1;
+    }
     printf("\nLoaded at %p (%zu KB)\n", (void *)lib.base, lib.size / 1024);
     printf("  relocations applied: %d\n", lib.nrelocs);
     printf("  exports:             %d\n", lib.nexports);

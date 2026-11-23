@@ -383,6 +383,7 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
     if (!lib->phdr) { fprintf(stderr, "error: out of memory\n"); free(file); return -1; }
     memcpy(lib->phdr, ph, (size_t)eh->e_phnum * sizeof(Elf64_Phdr));
     lib->phnum = eh->e_phnum;
+    lib->phoff = eh->e_phoff;
 
     /* Executable sections (when section headers exist): the audit sweeps
      * only these, not whole PT_LOAD segments that also hold .dynstr/.rodata */
@@ -409,6 +410,8 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
         } else if (ph[i].p_type == PT_GNU_RELRO) {
             relro_copy = ph[i];
             relro_ph = &relro_copy;
+        } else if (ph[i].p_type == PT_INTERP) {
+            lib->is_exec = 1;       /* an executable: afw_exec starts it at e_entry */
         } else if (ph[i].p_type == PT_NOTE) {
             read_build_id(file, fsize, &ph[i], lib->build_id);
         } else if (ph[i].p_type == PT_TLS) {
@@ -429,6 +432,7 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
     lib->stub_area = lib->base ? lib->base + lib->size : NULL;
     if (!lib->base) { fprintf(stderr, "error: out of memory\n"); free(file); return -1; }
     lib->bias = (intptr_t)lib->base - (intptr_t)lo;
+    if (lib->is_exec && eh->e_entry) lib->entry = (uint64_t)lib->bias + eh->e_entry;
 
     npages = lib->size / AFW_PAGE_SIZE;
     pageprot = (unsigned char *)calloc(npages, 1);

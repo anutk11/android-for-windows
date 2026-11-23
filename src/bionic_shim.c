@@ -195,6 +195,16 @@ void *afw_shared_globals(void) {
 }
 static SYSV void *s_loader_shared_globals(void) { return afw_shared_globals(); }
 
+/* An executable's own auxv, environment and name (exec.c), as the linker
+ * sets them for libc before entering a program. */
+void afw_shared_globals_set_process(const uint64_t *auxv, char **envp, const char *progname) {
+    unsigned char *sg = (unsigned char *)afw_shared_globals();
+    uint64_t p;
+    p = (uint64_t)(uintptr_t)auxv;     memcpy(sg + SG_AUXV, &p, 8);
+    p = (uint64_t)(uintptr_t)envp;     memcpy(sg + SG_INIT_ENVIRON, &p, 8);
+    p = (uint64_t)(uintptr_t)progname; memcpy(sg + SG_INIT_PROGNAME, &p, 8);
+}
+
 static const shim_entry g_shims[] = {
     S("strlen", s_strlen), S("strcmp", s_strcmp), S("strncmp", s_strncmp),
     S("strcpy", s_strcpy), S("strncpy", s_strncpy), S("strcat", s_strcat),
