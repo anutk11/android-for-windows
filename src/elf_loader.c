@@ -440,7 +440,8 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
     lib->stub_area = lib->base ? lib->base + lib->size : NULL;
     if (!lib->base) { fprintf(stderr, "error: out of memory\n"); free(file); return -1; }
     lib->bias = (intptr_t)lib->base - (intptr_t)lo;
-    if (lib->is_exec && eh->e_entry) lib->entry = (uint64_t)lib->bias + eh->e_entry;
+    if (lib->is_exec && eh->e_entry && eh->e_entry >= lo && eh->e_entry < hi)
+        lib->entry = (uint64_t)lib->bias + eh->e_entry;
 
     npages = lib->size / AFW_PAGE_SIZE;
     pageprot = (unsigned char *)calloc(npages, 1);

@@ -25,6 +25,7 @@ int afw_shim_count(void);
 
 /* libc_shared_globals for the pinned libc build (exposed for tests) */
 void *afw_shared_globals(void);
+const unsigned char *afw_shared_globals_random(void);
 void afw_shared_globals_set_process(const uint64_t *auxv, char **envp, const char *progname);
 
 #endif

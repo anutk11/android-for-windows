@@ -90,15 +90,30 @@ syscall and caller), and safe crash reports.
 ## An executable up to main (PR #16)
 
 An ordinary NDK executable (`test/hello_exe.c`) runs `main` on Windows with the real
-bionic: its constructor runs first, printf and malloc work, `atexit` runs after `main`,
-and the exit code (42) goes out through `exit_group`. This is a required CI step.
+bionic: its constructor runs first, printf, malloc, `getenv`, `getprogname`, and
+`getauxval` work, `atexit` runs after `main`, and the exit code (42) goes out through
+`exit_group`. This is a required CI step.
 
-- `src/exec.c` builds the initial stack exactly as the kernel leaves it (argc | argv |
-  NULL | envp | NULL | auxv) on the thread's real stack (`alloca`, which probes pages
-  downward the way Windows grows a stack), passes libc the same auxv, environment and
-  name through the shared globals, then jumps to `_start` with rbp = rdx = 0.
-- `test/exec_min.c` (no libc) checks every field of the stack, with a separate exit code
-  for each wrong field.
+- `src/exec.c` builds the initial stack exactly as the kernel leaves it (`argc | argv |
+  NULL | envp | NULL | auxv`) on the thread's real stack (`alloca`, which probes pages
+  downward the way Windows grows a stack), then jumps to `_start` with `rbp = rdx = 0`.
+- **Environment forwarding & pre-constructor sync:** `--exec` inherits the host process
+  environment by default (overrideable with `--env KEY=VAL`, or cleared with
+  `--clean-env`), and writes `envp` and `progname` into `libc_shared_globals` **before**
+  loading dependencies so `libc.so`'s constructors, executable constructors, and `main()`
+  all observe the exact same environment, program name, and single `AT_RANDOM` 16-byte
+  seed (`afw_shared_globals_random()`).
+- **Explicit caveats / defaults (measured / intentional for G1):**
+  - `PT_INTERP` (`/system/bin/linker64`) is used only to identify an executable; the
+    interpreter binary itself is **not** mapped (`AT_BASE = 0`) because `afw-loader`
+    replaces the dynamic linker.
+  - Several `auxv` fields use fixed G1 defaults: `AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`
+    are `10000` (first Android app uid/gid, matching `src/syscall.c`), `AT_HWCAP` and
+    `AT_HWCAP2` are `0` (conservative baseline x86_64 until CPUID mapping), and
+    `AT_SECURE` is `0`.
+- `test/exec_min.c` (no libc) checks every field of the stack (including forwarded host
+  environment variables and `--env` overrides), with a separate exit code for each wrong
+  field (11 for wrong `argc`, 17 for missing env var, 18 for bad override).
 - Syscalls still answered with ENOSYS along this path: faccessat, newfstatat, openat (the
   property area `/dev/__properties__`), rt_sigaction, sched_getaffinity, fstat. libc lives
   with all of them; they're next in line (files, signals).

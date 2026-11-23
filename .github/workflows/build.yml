@@ -252,9 +252,13 @@ jobs:
           if out/afw-asan out/libgs_gate_test.so > out/gsgate.txt 2>&1; then cat out/gsgate.txt; echo "gs: gate did not refuse"; exit 1; fi
           grep -q "3 unsupported gs: accesses" out/gsgate.txt
           # an executable: the initial stack (argc, argv, envp, auxv) as the kernel builds it
-          set +e; out/afw-asan out/exec_min --exec hello world > out/exec.txt 2>&1; rc=$?; set -e
+          set +e; AFW_EXEC_MIN=ok AFW_OVERRIDE=one out/afw-asan out/exec_min --env AFW_OVERRIDE=two --exec hello world > out/exec.txt 2>&1; rc=$?; set -e
           [ $rc -eq 42 ] || { cat out/exec.txt; echo "exec_min exited $rc, not 42"; exit 1; }
-          set +e; out/afw-asan out/exec_min --exec hello > /dev/null 2>&1; rc=$?; set -e
+          set +e; AFW_EXEC_MIN=ok AFW_OVERRIDE=one out/afw-asan out/exec_min --clean-env --exec hello world > /dev/null 2>&1; rc=$?; set -e
+          [ $rc -eq 17 ] || { echo "exec_min with --clean-env exited $rc, not 17"; exit 1; }
+          set +e; AFW_EXEC_MIN=ok AFW_OVERRIDE=one out/afw-asan out/exec_min --exec hello world > /dev/null 2>&1; rc=$?; set -e
+          [ $rc -eq 18 ] || { echo "exec_min without override exited $rc, not 18"; exit 1; }
+          set +e; AFW_EXEC_MIN=ok out/afw-asan out/exec_min --env AFW_OVERRIDE=two --exec hello > /dev/null 2>&1; rc=$?; set -e
           [ $rc -eq 11 ] || { echo "exec_min with a wrong argc exited $rc, not 11"; exit 1; }
           # fs:[reg] is rewritten on Windows only: on Linux the gate must refuse it
           if out/afw-asan out/libtls_ie_test.so > out/ie.txt 2>&1; then cat out/ie.txt; echo "fs:[reg] ran unrewritten"; exit 1; fi
@@ -304,7 +308,7 @@ jobs:
           clang-cl /nologo /O2 /W3 /DAFW_TEST /D_CRT_SECURE_NO_WARNINGS -Wno-unused-function -Iout\zydis-amalg ^
               /Fe:out\afw-loader-test.exe /Foout\testobj\ ^
               src\main.c src\elf_loader.c src\bionic_shim.c src\platform.c src\tls_patch.c src\crash.c ^
-              src\patch.c src\syscall.c src\funcs.c src\vma.c src\tls_layout.c src\tls_static.c src\loader_api.c out\Zydis.obj ^
+              src\patch.c src\syscall.c src\funcs.c src\vma.c src\tls_layout.c src\tls_static.c src\loader_api.c src\exec.c out\Zydis.obj ^
               /link dbghelp.lib
           if errorlevel 1 exit /b 1
           out\afw-loader-test.exe out\libhello.so --finish-fail-late=tls:out\libtls_test.so
@@ -321,9 +325,15 @@ jobs:
       - name: "An executable's initial stack (argc, argv, envp, auxv) on Windows"
         shell: cmd
         run: |
-          out\afw-loader.exe out\exec_min --exec hello world > out\exec.txt 2>&1
+          set AFW_EXEC_MIN=ok
+          set AFW_OVERRIDE=one
+          out\afw-loader.exe out\exec_min --env AFW_OVERRIDE=two --exec hello world > out\exec.txt 2>&1
           if not %errorlevel% equ 42 (type out\exec.txt & echo exec_min exited %errorlevel%, not 42 & exit /b 1)
-          out\afw-loader.exe out\exec_min --exec hello > nul 2>&1
+          out\afw-loader.exe out\exec_min --clean-env --exec hello world > nul 2>&1
+          if not %errorlevel% equ 17 (echo clean-env exited %errorlevel%, not 17 & exit /b 1)
+          out\afw-loader.exe out\exec_min --exec hello world > nul 2>&1
+          if not %errorlevel% equ 18 (echo missing override exited %errorlevel%, not 18 & exit /b 1)
+          out\afw-loader.exe out\exec_min --env AFW_OVERRIDE=two --exec hello > nul 2>&1
           if not %errorlevel% equ 11 (echo wrong argc exited %errorlevel%, not 11 & exit /b 1)
           exit /b 0
       - name: "G1: an ordinary Android executable runs main() with the real libc (required)"
@@ -331,11 +341,14 @@ jobs:
         shell: cmd
         run: |
           set AFW_LIB_PATH=out\bionic
-          out\afw-loader.exe out\hello_exe --with-deps --watchdog=60 --exec world > out\hello-exe.txt 2>&1
+          set AFW_HOST_VAR=from_windows
+          out\afw-loader.exe out\hello_exe --with-deps --watchdog=60 --env AFW_FLAG_VAR=from_flag --exec world > out\hello-exe.txt 2>&1
           set rc=%errorlevel%
           type out\hello-exe.txt
           if not "%rc%"=="42" (echo hello_exe exited %rc%, not 42 & exit /b 1)
           findstr /c:"constructor=1" out\hello-exe.txt >nul || (echo main did not run after the constructor & exit /b 1)
+          findstr /c:"host_env=from_windows" out\hello-exe.txt >nul || (echo host env var was not forwarded & exit /b 1)
+          findstr /c:"flag_env=from_flag" out\hello-exe.txt >nul || (echo --env flag var was not forwarded & exit /b 1)
           findstr /c:"atexit handler ran" out\hello-exe.txt >nul || (echo atexit did not run & exit /b 1)
           exit /b 0
       - name: "G1: Android code calling the REAL libc.so on Windows (required)"
