@@ -583,21 +583,49 @@ static int do_unmap(winalloc *w, uint64_t a, uint64_t n, int arg) {
     if (split_range(w, a, a + n, &i0, &i1) != 0) return -LNX_ENOMEM;
 
     if (w->kind == VMA_FILEMAP) {
-        /* Phase 2: VirtualProtect(PAGE_NOACCESS) on mapped runs; Phase 3: update metadata. */
+        size_t fail_idx = i1;
+        /* Phase 2: apply VirtualProtect(PAGE_NOACCESS) to every accessible mapped run
+         * BEFORE mutating any metadata. Extents already PROT_NONE are already PAGE_NOACCESS. */
         for (i = i0; i < i1;) {
-            if (!(w->ext[i].state & P_MAPPED)) { i++; continue; }
+            if (!(w->ext[i].state & P_MAPPED) || !(w->ext[i].state & P_PROT)) { i++; continue; }
             j = i + 1;
-            while (j < i1 && (w->ext[j].state & P_MAPPED)) j++;
+            while (j < i1 && (w->ext[j].state & P_MAPPED) && (w->ext[j].state & P_PROT)) j++;
             if (os_filemap_protect(w->ext[i].start, w->ext[j - 1].end - w->ext[i].start, 0) != 0) {
+                fail_idx = i;
                 rc = -LNX_ENOMEM;
                 break;
             }
-            for (k = i; k < j; k++) {
-                w->mapped_bytes -= w->ext[k].end - w->ext[k].start;
-                w->ext[k].state = 0;
-            }
-            w->linux_touched = 1;
             i = j;
+        }
+        if (rc != 0) {
+            /* Roll back all earlier runs changed to PAGE_NOACCESS before fail_idx. */
+            for (i = i0; i < fail_idx;) {
+                if (!(w->ext[i].state & P_MAPPED) || !(w->ext[i].state & P_PROT)) { i++; continue; }
+                j = i + 1;
+                while (j < fail_idx && (w->ext[j].state & P_MAPPED) && (w->ext[j].state & P_PROT)) j++;
+                if (afw_os_filemap_protect((void *)(uintptr_t)w->ext[i].start,
+                                           (size_t)(w->ext[j - 1].end - w->ext[i].start),
+                                           AFW_PROT_R) != 0) {
+                    /* Rollback itself failed: keep metadata truthful to the OS state. */
+                    for (k = i; k < j; k++) {
+                        w->mapped_bytes -= w->ext[k].end - w->ext[k].start;
+                        w->ext[k].state = 0;
+                    }
+                    w->linux_touched = 1;
+                }
+                i = j;
+            }
+            coalesce_around(w, i0, i1);
+            release_if_empty(w);
+            return rc;
+        }
+        /* Phase 3 (infallible): all OS calls succeeded; now commit metadata updates. */
+        for (i = i0; i < i1; i++) {
+            if (w->ext[i].state & P_MAPPED) {
+                w->mapped_bytes -= w->ext[i].end - w->ext[i].start;
+                w->linux_touched = 1;
+            }
+            w->ext[i].state = 0;
         }
     } else if (w->kind == VMA_FILEMAP_EMPTY) {
         for (i = i0; i < i1; i++) {

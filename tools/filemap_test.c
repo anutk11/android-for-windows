@@ -369,6 +369,9 @@ int main(void) {
               verify_pattern((const unsigned char *)(uintptr_t)(b + 3 * PG), 4096 + 3 * PG, PG));
         check("idempotent re-unmap of middle hole returns 0 without underflowing mapped_bytes",
               MUNMAP(b + PG, 2 * PG) == 0 && afw_vma_alloc_count() == 1);
+        check("mprotect on partial-munmap hole fails with -ENOMEM (never revives hole)",
+              MPROTECT(b + PG, PG, LNX_PROT_READ) == -LNX_ENOMEM &&
+              try_read_byte((const volatile unsigned char *)(uintptr_t)(b + PG), &ch) == 1);
         check("MAP_FIXED_NOREPLACE over live page 0 -> -EEXIST",
               MMAP_F(b, PG, LNX_PROT_READ | LNX_PROT_WRITE,
                      LNX_MAP_PRIVATE | LNX_MAP_ANONYMOUS | LNX_MAP_FIXED_NOREPLACE, -1, 0) == -LNX_EEXIST);
@@ -411,6 +414,39 @@ int main(void) {
               verify_pattern((const unsigned char *)(uintptr_t)(b + 2 * PG), 2 * PG, PG));
         check("cleanup fault-injection view",
               MUNMAP(b, 3 * PG) == 0 && afw_vma_alloc_count() == 0);
+    }
+
+    /* Multi-run transactional rollback (Reviewer 2): 5 pages [P0, P1(hole), P2, P3, P4],
+     * fail the 2nd OS VirtualProtect call -> P0 MUST be rolled back to readable! */
+    b = MMAP_F(0, 5 * PG, LNX_PROT_READ, LNX_MAP_SHARED, (int)fd, 0);
+    check("multi-run rollback: map 5 pages [P0..P4]", b > 0);
+    if (b > 0) {
+        check("multi-run rollback: unmap P1 to create 2 disjoint mapped runs ([P0] and [P2..P4])",
+              MUNMAP(b + PG, PG) == 0 && afw_vma_extent_count() == 3 &&
+              try_read_byte((const volatile unsigned char *)(uintptr_t)(b + PG), &ch) == 1);
+        afw_vma_test_fail_os(2);
+        check("multi-run rollback: munmap(P0..P4) with fail_os(2) returns -ENOMEM",
+              MUNMAP(b, 5 * PG) == -LNX_ENOMEM);
+        afw_vma_test_fail_os(0);
+        check("multi-run rollback: P0 was restored and all originally mapped pages [P0, P2..P4] remain readable",
+              verify_pattern((const unsigned char *)(uintptr_t)b, 0, PG) &&
+              verify_pattern((const unsigned char *)(uintptr_t)(b + 2 * PG), 2 * PG, 3 * PG));
+        check("multi-run rollback: P1 remains an unmapped fault hole and metadata has exact 3 extents",
+              try_read_byte((const volatile unsigned char *)(uintptr_t)(b + PG), &ch) == 1 &&
+              MPROTECT(b + PG, PG, LNX_PROT_READ) == -LNX_ENOMEM &&
+              afw_vma_alloc_count() == 1 && afw_vma_extent_count() == 3);
+#if defined(_WIN32)
+        {
+            MEMORY_BASIC_INFORMATION m0, m1, m2;
+            int qok = VirtualQuery((void *)(uintptr_t)b, &m0, sizeof m0) &&
+                      VirtualQuery((void *)(uintptr_t)(b + PG), &m1, sizeof m1) &&
+                      VirtualQuery((void *)(uintptr_t)(b + 2 * PG), &m2, sizeof m2);
+            check("multi-run rollback (Win32 VirtualQuery): P0=PAGE_READONLY, P1=PAGE_NOACCESS, P2=PAGE_READONLY",
+                  qok && m0.Protect == PAGE_READONLY && m1.Protect == PAGE_NOACCESS && m2.Protect == PAGE_READONLY);
+        }
+#endif
+        check("multi-run rollback: retry munmap(P0..P4) succeeds and releases view completely",
+              MUNMAP(b, 5 * PG) == 0 && afw_vma_alloc_count() == 0);
     }
 #endif
 

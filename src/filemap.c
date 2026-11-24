@@ -5,7 +5,10 @@
  *
  * Supported ABI (docs/design/G2-PLAN.md Section 5):
  *   - MAP_SHARED | PROT_READ (required for Bionic /dev/__properties__ map_fd_ro)
- *   - MAP_PRIVATE | PROT_READ (and PROT_NONE with either MAP_SHARED/MAP_PRIVATE)
+ *   - MAP_PRIVATE | PROT_READ (and PROT_NONE with either MAP_SHARED/MAP_PRIVATE).
+ *     Note (G2 known limit): on Windows, both use FILE_MAP_READ, which reflects
+ *     external writes to the underlying file (sufficient for /dev/__properties__
+ *     and immutable assets in G2).
  *   - 4KB-aligned offsets that are not 64KB-aligned on Windows: maps from
  *     aligned_off = off & ~0xFFFF, sets PAGE_NOACCESS on the leading delta bytes,
  *     returns view_base + delta, and counts only logical [addr, addr + len) in
