@@ -26,6 +26,7 @@
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <psapi.h>
 
 static void     a_store_u64(uint64_t *p, uint64_t v)     { InterlockedExchange64((volatile LONG64 *)p, (LONG64)v); }
 static uint64_t a_fetch_add_u64(uint64_t *p, uint64_t v) { return (uint64_t)InterlockedExchangeAdd64((volatile LONG64 *)p, (LONG64)v); }
@@ -796,6 +797,119 @@ int main(void) {
               vma_try_write_byte((volatile unsigned char *)(p + 12 * K), 1) == 1 &&
               p[20 * K] == 0x99 && p[24 * K - 1] == 0x99);
         MUNMAP(b, 24 * K);
+
+#if defined(_WIN32) && defined(AFW_TEST)
+        /* 16g: Windows MEM_WRITE_WATCH integration (Reviewer 2 & Reviewer 3 conditions) */
+        {
+            /* Scope: owned VMA_ANON has WW=1; adopted region has WW=0 */
+            unsigned char *adp = (unsigned char *)afw_mem_alloc(4 * K);
+            unsigned char aprot[1] = { RW };
+            check("16g: adopted allocation does NOT enable write_watch",
+                  adp != NULL && afw_vma_adopt((uint64_t)(uintptr_t)adp, 4 * K, aprot) == 0 &&
+                  afw_vma_test_ww_active((uint64_t)(uintptr_t)adp) == 0 &&
+                  afw_vma_forget((uint64_t)(uintptr_t)adp) == 0);
+            if (adp) afw_mem_free(adp, 4 * K);
+
+            /* Untouched 32MB RW VMA: MADV_DONTNEED keeps Working Set flat (<2MB delta) */
+            {
+                const uint64_t SZ32 = 32ULL * 1024ULL * 1024ULL;
+                PROCESS_MEMORY_COUNTERS_EX pm1, pm2;
+                int64_t ws_delta;
+                memset(&pm1, 0, sizeof pm1); pm1.cb = sizeof pm1;
+                memset(&pm2, 0, sizeof pm2); pm2.cb = sizeof pm2;
+                b = MMAP(0, SZ32, RW, ANON);
+                check("16g: 32MB owned VMA_ANON has write_watch active",
+                      b > 0 && afw_vma_test_ww_active((uint64_t)b) == 1);
+                GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pm1, sizeof pm1);
+                check("16g: MADV_DONTNEED on untouched 32MB succeeds",
+                      MADVISE(b, SZ32, LNX_MADV_DONTNEED) == 0);
+                GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pm2, sizeof pm2);
+                ws_delta = (int64_t)pm2.WorkingSetSize - (int64_t)pm1.WorkingSetSize;
+                printf("  [info] 16g untouched 32MB delta_WS = %lld bytes\n", (long long)ws_delta);
+                check("16g: untouched 32MB MADV_DONTNEED did not inflate Working Set (<2MB)",
+                      ws_delta < (int64_t)(2ULL * 1024ULL * 1024ULL));
+                MUNMAP(b, SZ32);
+            }
+
+            /* Evicted dirty pages (EmptyWorkingSet -> QueryWorkingSetEx Valid=0) still zeroed */
+            {
+                PSAPI_WORKING_SET_EX_INFORMATION wsi[16];
+                int i, valid_cnt = 0;
+                b = MMAP(0, 64 * K, RW, ANON);
+                p = (unsigned char *)(uintptr_t)b;
+                for (i = 0; i < 16; i++) p[(size_t)i * 4 * K] = 0x5a;
+                EmptyWorkingSet(GetCurrentProcess());
+                memset(wsi, 0, sizeof wsi);
+                for (i = 0; i < 16; i++) wsi[i].VirtualAddress = p + (size_t)i * 4 * K;
+                if (QueryWorkingSetEx(GetCurrentProcess(), wsi, sizeof wsi)) {
+                    for (i = 0; i < 16; i++) if (wsi[i].VirtualAttributes.Valid) valid_cnt++;
+                }
+                check("16g: EmptyWorkingSet evicted dirty pages (QueryWorkingSetEx Valid == 0)",
+                      valid_cnt == 0);
+                check("16g: MADV_DONTNEED still zeroes all 16 evicted dirty pages via write_watch",
+                      MADVISE(b, 64 * K, LNX_MADV_DONTNEED) == 0 && all_zero(p, 64 * K));
+                MUNMAP(b, 64 * K);
+            }
+
+            /* Lifecycle: MAP_FIXED + partial munmap + PROT_READ|PROT_EXEC + PROT_NONE decommit */
+            b = MMAP(0, 16 * K, RW, ANON);
+            p = (unsigned char *)(uintptr_t)b;
+            memset(p, 0x33, 16 * K);
+            check("16g: MAP_FIXED over dirty page 1 zeroes page 1 and keeps write_watch active",
+                  MMAP(b + 4 * K, 4 * K, RW, ANON | LNX_MAP_FIXED) == b + 4 * (int64_t)K &&
+                  all_zero(p + 4 * K, 4 * K) && p[0] == 0x33 && p[8 * K] == 0x33 &&
+                  afw_vma_test_ww_active((uint64_t)b) == 1);
+            check("16g: partial munmap + MAP_FIXED remap on page 2 keeps write_watch active",
+                  MUNMAP(b + 8 * K, 4 * K) == 0 &&
+                  MMAP(b + 8 * K, 4 * K, RW, ANON | LNX_MAP_FIXED) == b + 8 * (int64_t)K &&
+                  all_zero(p + 8 * K, 4 * K) && afw_vma_test_ww_active((uint64_t)b) == 1);
+            check("16g: mprotect(PROT_READ|PROT_EXEC) on MEM_WRITE_WATCH page succeeds (Reviewer 3)",
+                  MPROTECT(b, 4 * K, LNX_PROT_READ | LNX_PROT_EXEC) == 0);
+            WIN_CHECK("16g: page 0 is commit-rx under MEM_WRITE_WATCH", (uint64_t)b, "commit-rx");
+            check("16g: MADV_DONTNEED across RX + RW zeroes all pages and preserves RX",
+                  MADVISE(b, 16 * K, LNX_MADV_DONTNEED) == 0 && all_zero(p, 16 * K));
+            WIN_CHECK("16g: page 0 stayed commit-rx after MADV_DONTNEED", (uint64_t)b, "commit-rx");
+            p[12 * K] = 0x88;
+            check("16g: PROT_NONE + MADV_DONTNEED decommits & resets WW, recommit is zeroed",
+                  MPROTECT(b + 12 * K, 4 * K, 0) == 0 &&
+                  MADVISE(b + 12 * K, 4 * K, LNX_MADV_DONTNEED) == 0 &&
+                  afw_vma_test_ww_active((uint64_t)b) == 1 &&
+                  MPROTECT(b + 12 * K, 4 * K, RW) == 0 &&
+                  all_zero(p + 12 * K, 4 * K));
+            MUNMAP(b, 16 * K);
+
+            /* Fail-closed: GetWriteWatch failure MUST still zero pages and disable WW */
+            b = MMAP(0, 8 * K, RW, ANON);
+            p = (unsigned char *)(uintptr_t)b;
+            memset(p, 0x77, 8 * K);
+            afw_vma_test_fail_ww(1);
+            check("16g: GetWriteWatch failure falls back to memset(0) and disables WW",
+                  MADVISE(b, 8 * K, LNX_MADV_DONTNEED) == 0 &&
+                  all_zero(p, 8 * K) &&
+                  afw_vma_test_ww_active((uint64_t)b) == 0);
+            afw_vma_test_fail_ww(0);
+            memset(p, 0x78, 8 * K);
+            check("16g: subsequent MADV_DONTNEED after WW disable still zeroes cleanly",
+                  MADVISE(b, 8 * K, LNX_MADV_DONTNEED) == 0 && all_zero(p, 8 * K));
+            MUNMAP(b, 8 * K);
+
+            /* Fail-closed: ResetWriteWatch failure on decommit disables WW cleanly */
+            b = MMAP(0, 8 * K, RW, ANON);
+            p = (unsigned char *)(uintptr_t)b;
+            memset(p, 0x66, 8 * K);
+            MPROTECT(b, 8 * K, 0);
+            afw_vma_test_fail_ww(1);
+            check("16g: ResetWriteWatch failure on PROT_NONE decommit disables WW fail-closed",
+                  MADVISE(b, 8 * K, LNX_MADV_DONTNEED) == 0 &&
+                  afw_vma_test_ww_active((uint64_t)b) == 0);
+            afw_vma_test_fail_ww(0);
+            WIN_CHECK("16g: dropped to reserved even on ResetWriteWatch failure", (uint64_t)b, "reserved");
+            check("16g: recommit + dirty + MADV_DONTNEED still zeroes after ResetWriteWatch disable",
+                  MPROTECT(b, 8 * K, RW) == 0 && (memset(p, 0x55, 8 * K), 1) &&
+                  MADVISE(b, 8 * K, LNX_MADV_DONTNEED) == 0 && all_zero(p, 8 * K));
+            MUNMAP(b, 8 * K);
+        }
+#endif
 
         check("zero allocations remain after test 16", afw_vma_alloc_count() == 0);
     }

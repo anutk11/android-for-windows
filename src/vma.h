@@ -116,6 +116,10 @@ uint64_t afw_vma_os_call_count(void);
 void afw_vma_test_fail_os(int nth);
 /* Test hook: fail the nth next extent metadata growth (1 = very next, 0 = off). */
 void afw_vma_test_fail_meta(int nth);
+/* Test hook: fail the nth next write-watch API call (1 = very next, 0 = off). */
+void afw_vma_test_fail_ww(int nth);
+/* Test hook: returns 1 if the allocation containing addr has write_watch active, else 0. */
+int afw_vma_test_ww_active(uint64_t addr);
 #endif
 
 #endif

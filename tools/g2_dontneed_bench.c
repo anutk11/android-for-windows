@@ -148,8 +148,37 @@ int main(void) {
     m3 = take_mem();
     print_snap("after munmap(1GB)", m3);
 
-    /* Scenario B: 1GB touched MEM_COMMIT -> MADV_DONTNEED */
-    printf("\n[Scenario B] 1GB touched (dirty) RW MEM_COMMIT -> MADV_DONTNEED\n");
+    /* Scenario B-sparse: 1GB RW MEM_COMMIT with only 4MB (1024 pages) touched -> MADV_DONTNEED */
+    printf("\n[Scenario B-sparse] 1GB RW MEM_COMMIT, 4MB touched -> MADV_DONTNEED\n");
+    b = MMAP(0, ONE_GB, RW, ANON);
+    if (b <= 0) { printf("FAIL: mmap(1GB) returned %lld\n", (long long)b); return 1; }
+    p = (unsigned char *)(uintptr_t)b;
+    for (off = 0; off < 1024u * PG; off += PG) p[off] = 0x77;
+    m1 = take_mem();
+    print_snap("after touching 4MB/1GB", m1);
+
+    t0 = now_ms();
+    if (MADVISE(b, ONE_GB, LNX_MADV_DONTNEED) != 0) {
+        printf("FAIL: madvise(DONTNEED) failed\n");
+        MUNMAP(b, ONE_GB);
+        return 1;
+    }
+    dt = now_ms() - t0;
+    m2 = take_mem();
+    print_snap("after madvise(DONTNEED)", m2);
+    for (off = 0; off < 1024u * PG; off += PG) {
+        if (p[off] != 0) {
+            printf("FAIL: sparse dirty page at off=%zu was not zeroed\n", off);
+            MUNMAP(b, ONE_GB);
+            return 1;
+        }
+    }
+    printf("  madvise(1GB sparse 4MB):   time=%.2f ms (g_lock hold), delta_WS=%+.1f MB, delta_Commit=%+.1f MB, touched_zeros=OK\n",
+           dt, m2.ws_mb - m1.ws_mb, m2.commit_mb - m1.commit_mb);
+    if (MUNMAP(b, ONE_GB) != 0) { printf("FAIL: munmap failed\n"); return 1; }
+
+    /* Scenario B: 1GB full touched MEM_COMMIT -> MADV_DONTNEED (tests contiguous-chunk fast-path) */
+    printf("\n[Scenario B] 1GB full touched (262144 pages) RW MEM_COMMIT -> MADV_DONTNEED\n");
     m0 = take_mem();
     print_snap("before mmap(1GB)", m0);
     b = MMAP(0, ONE_GB, RW, ANON);
@@ -180,8 +209,8 @@ int main(void) {
     m3 = take_mem();
     print_snap("after munmap(1GB)", m3);
 
-    /* Scenario C: 1GB touched -> PROT_NONE -> MADV_DONTNEED (decommit path) */
-    printf("\n[Scenario C] 1GB touched -> mprotect(PROT_NONE) -> MADV_DONTNEED (os_decommit)\n");
+    /* Scenario C: 1GB touched -> PROT_NONE -> MADV_DONTNEED (decommit + ResetWriteWatch) */
+    printf("\n[Scenario C] 1GB touched -> mprotect(PROT_NONE) -> MADV_DONTNEED (os_decommit + WW reset)\n");
     b = MMAP(0, ONE_GB, RW, ANON);
     if (b <= 0) { printf("FAIL: mmap(1GB) returned %lld\n", (long long)b); return 1; }
     p = (unsigned char *)(uintptr_t)b;
@@ -210,179 +239,25 @@ int main(void) {
     m3 = take_mem();
     print_snap("after munmap(1GB)", m3);
 
+    /* Scenario D: 64GB PROT_NONE Scudo reservation via integrated VMA (with MEM_WRITE_WATCH on Windows) */
+    printf("\n[Scenario D] 64GB PROT_NONE Scudo reservation via integrated VMA\n");
+    {
+        const uint64_t G64 = 64ULL * ONE_GB;
+        m0 = take_mem();
+        t0 = now_ms();
+        b = MMAP(0, G64, 0, ANON | LNX_MAP_NORESERVE);
+        dt = now_ms() - t0;
+        if (b <= 0) { printf("FAIL: mmap(64GB) returned %lld\n", (long long)b); return 1; }
+        m1 = take_mem();
+        printf("  mmap(64GB PROT_NONE):      time=%.2f ms, delta_WS=%+.1f MB, delta_Commit=%+.1f MB\n",
+               dt, m1.ws_mb - m0.ws_mb, m1.commit_mb - m0.commit_mb);
+        if (MUNMAP(b, G64) != 0) { printf("FAIL: munmap(64GB) failed\n"); return 1; }
+    }
+
     if (afw_vma_alloc_count() != 0) {
         printf("FAIL: leaked VMA allocations (%d)\n", afw_vma_alloc_count());
         return 1;
     }
-
-#if defined(_WIN32)
-    /* ---- Isolated MEM_WRITE_WATCH experiment (Reviewer 2 request; does NOT modify vma.c) ---- */
-    printf("\n=== Isolated MEM_WRITE_WATCH Probe (Windows-only, does not alter vma.c) ===\n");
-    {
-        const SIZE_T SIXTY_FOUR_GB = 64ULL * 1024ULL * 1024ULL * 1024ULL;
-        const SIZE_T CHUNK_BYTES   = 16ULL * 1024ULL * 1024ULL; /* 4096 pages */
-        PVOID *addrs = (PVOID *)malloc(4096 * sizeof(PVOID));
-        if (!addrs) { printf("FAIL: OOM for addrs\n"); return 1; }
-
-        /* WW-1: 64GB MEM_RESERVE | MEM_WRITE_WATCH (Scudo arena scale compatibility) */
-        printf("\n[WW-1] 64GB VirtualAlloc(MEM_RESERVE | MEM_WRITE_WATCH, PAGE_NOACCESS)\n");
-        m0 = take_mem();
-        print_snap("before 64GB reserve+WW", m0);
-        t0 = now_ms();
-        void *r64 = VirtualAlloc(NULL, SIXTY_FOUR_GB, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_NOACCESS);
-        dt = now_ms() - t0;
-        m1 = take_mem();
-        if (!r64) {
-            printf("  64GB reserve+WW FAILED: GetLastError=%lu, time=%.2f ms\n",
-                   (unsigned long)GetLastError(), dt);
-        } else {
-            void *slice;
-            ULONG_PTR cnt = 4096;
-            DWORD gran = 0;
-            UINT ww_rc;
-            print_snap("after 64GB reserve+WW", m1);
-            printf("  64GB reserve+WW SUCCEEDED: time=%.2f ms, delta_WS=%+.1f MB, delta_Commit=%+.1f MB\n",
-                   dt, m1.ws_mb - m0.ws_mb, m1.commit_mb - m0.commit_mb);
-            /* Commit 64KB at +32GB, write 4 pages, verify GetWriteWatch */
-            slice = VirtualAlloc((unsigned char *)r64 + (32ULL << 30), 64 * 1024, MEM_COMMIT, PAGE_READWRITE);
-            if (!slice) {
-                printf("  64GB +32GB commit FAILED: GetLastError=%lu\n", (unsigned long)GetLastError());
-            } else {
-                unsigned char *sp = (unsigned char *)slice;
-                sp[0] = 1; sp[4096] = 2; sp[8192] = 3; sp[12288] = 4;
-                ww_rc = GetWriteWatch(0, slice, 64 * 1024, addrs, &cnt, &gran);
-                printf("  +32GB 64KB slice (4 written pages): GetWriteWatch rc=%u, dirty=%llu, gran=%lu\n",
-                       ww_rc, (unsigned long long)cnt, (unsigned long)gran);
-                ResetWriteWatch(slice, 64 * 1024);
-            }
-            VirtualFree(r64, 0, MEM_RELEASE);
-            m2 = take_mem();
-            print_snap("after VirtualFree(64GB)", m2);
-        }
-
-        /* WW-2: Evicted / non-resident dirty pages (QueryWorkingSetEx vs GetWriteWatch) */
-        printf("\n[WW-2] Evicted dirty pages: QueryWorkingSetEx(Valid) vs GetWriteWatch\n");
-        {
-            const SIZE_T FOUR_MB = 4ULL * 1024ULL * 1024ULL;
-            unsigned char *w4 = (unsigned char *)VirtualAlloc(NULL, FOUR_MB,
-                                    MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
-            if (!w4) {
-                printf("  WW-2 VirtualAlloc(4MB) FAILED: err=%lu\n", (unsigned long)GetLastError());
-            } else {
-                PSAPI_WORKING_SET_EX_INFORMATION wsi[16];
-                int i, valid_cnt = 0, still_zero = 1;
-                ULONG_PTR cnt = 4096;
-                DWORD gran = 0;
-                UINT ww_rc;
-
-                for (i = 0; i < 16; i++) w4[(size_t)i * PG] = 0x5a;
-                EmptyWorkingSet(GetCurrentProcess());
-                memset(wsi, 0, sizeof wsi);
-                for (i = 0; i < 16; i++) wsi[i].VirtualAddress = w4 + (size_t)i * PG;
-                if (QueryWorkingSetEx(GetCurrentProcess(), wsi, sizeof wsi)) {
-                    for (i = 0; i < 16; i++) if (wsi[i].VirtualAttributes.Valid) valid_cnt++;
-                }
-                ww_rc = GetWriteWatch(0, w4, FOUR_MB, addrs, &cnt, &gran);
-                printf("  after EmptyWorkingSet on 16 dirty pages: QueryWorkingSetEx Valid=%d/16, GetWriteWatch rc=%u dirty=%llu/16\n",
-                       valid_cnt, ww_rc, (unsigned long long)cnt);
-                for (ULONG_PTR k = 0; k < cnt; k++) memset(addrs[k], 0, gran ? gran : PG);
-                ResetWriteWatch(w4, FOUR_MB);
-                cnt = 4096;
-                ww_rc = GetWriteWatch(0, w4, FOUR_MB, addrs, &cnt, &gran);
-                for (i = 0; i < 16; i++) if (w4[(size_t)i * PG] != 0) still_zero = 0;
-                printf("  after zero + ResetWriteWatch: post_dirty=%llu, all_16_zero=%d\n",
-                       (unsigned long long)cnt, still_zero);
-                VirtualFree(w4, 0, MEM_RELEASE);
-            }
-        }
-
-        /* WW-3: 1GB Scenarios A-WW (untouched), B-sparse-WW (4MB touched), B-WW (1GB touched), C-WW (decommit) */
-        printf("\n[WW-3] 1GB MEM_WRITE_WATCH Scenarios (A untouched, B-sparse 4MB, B full 1GB, C PROT_NONE decommit)\n");
-        {
-            unsigned char *w1g = (unsigned char *)VirtualAlloc(NULL, (SIZE_T)ONE_GB,
-                                     MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
-            if (!w1g) {
-                printf("  WW-3 VirtualAlloc(1GB+WW) FAILED: err=%lu\n", (unsigned long)GetLastError());
-            } else {
-                uint64_t total_dirty;
-                SIZE_T c_off;
-                DWORD gran = 0;
-
-                /* A-WW: untouched 1GB */
-                m1 = take_mem();
-                print_snap("A-WW before scan (untouch)", m1);
-                t0 = now_ms();
-                total_dirty = 0;
-                for (c_off = 0; c_off < (SIZE_T)ONE_GB; c_off += CHUNK_BYTES) {
-                    ULONG_PTR cnt = 4096;
-                    if (GetWriteWatch(0, w1g + c_off, CHUNK_BYTES, addrs, &cnt, &gran) == 0 && cnt > 0) {
-                        for (ULONG_PTR k = 0; k < cnt; k++) memset(addrs[k], 0, gran ? gran : PG);
-                        ResetWriteWatch(w1g + c_off, CHUNK_BYTES);
-                        total_dirty += cnt;
-                    }
-                }
-                dt = now_ms() - t0;
-                m2 = take_mem();
-                print_snap("A-WW after scan", m2);
-                printf("  A-WW (1GB untouched):      time=%.2f ms, dirty=%llu, delta_WS=%+.1f MB, delta_Commit=%+.1f MB\n",
-                       dt, (unsigned long long)total_dirty, m2.ws_mb - m1.ws_mb, m2.commit_mb - m1.commit_mb);
-
-                /* B-sparse-WW: 4MB (1024 pages) touched out of 1GB */
-                for (off = 0; off < 1024u * PG; off += PG) w1g[off] = 0x77;
-                m1 = take_mem();
-                t0 = now_ms();
-                total_dirty = 0;
-                for (c_off = 0; c_off < (SIZE_T)ONE_GB; c_off += CHUNK_BYTES) {
-                    ULONG_PTR cnt = 4096;
-                    if (GetWriteWatch(0, w1g + c_off, CHUNK_BYTES, addrs, &cnt, &gran) == 0 && cnt > 0) {
-                        for (ULONG_PTR k = 0; k < cnt; k++) memset(addrs[k], 0, gran ? gran : PG);
-                        ResetWriteWatch(w1g + c_off, CHUNK_BYTES);
-                        total_dirty += cnt;
-                    }
-                }
-                dt = now_ms() - t0;
-                m2 = take_mem();
-                printf("  B-sparse-WW (4MB/1GB):     time=%.2f ms, dirty=%llu, delta_WS=%+.1f MB, zero0=%d\n",
-                       dt, (unsigned long long)total_dirty, m2.ws_mb - m1.ws_mb, w1g[0] == 0);
-
-                /* B-WW: full 1GB touched (all 262,144 pages) */
-                for (off = 0; off < (size_t)ONE_GB; off += PG) w1g[off] = 0x5a;
-                m1 = take_mem();
-                t0 = now_ms();
-                total_dirty = 0;
-                for (c_off = 0; c_off < (SIZE_T)ONE_GB; c_off += CHUNK_BYTES) {
-                    ULONG_PTR cnt = 4096;
-                    if (GetWriteWatch(0, w1g + c_off, CHUNK_BYTES, addrs, &cnt, &gran) == 0 && cnt > 0) {
-                        for (ULONG_PTR k = 0; k < cnt; k++) memset(addrs[k], 0, gran ? gran : PG);
-                        ResetWriteWatch(w1g + c_off, CHUNK_BYTES);
-                        total_dirty += cnt;
-                    }
-                }
-                dt = now_ms() - t0;
-                m2 = take_mem();
-                printf("  B-WW (1GB full touched):   time=%.2f ms, dirty=%llu, delta_WS=%+.1f MB, sampled_zeros=%s\n",
-                       dt, (unsigned long long)total_dirty, m2.ws_mb - m1.ws_mb,
-                       verify_sampled_zeros(w1g, (size_t)ONE_GB) ? "OK" : "FAIL");
-
-                /* C-WW: VirtualProtect(PAGE_NOACCESS) + VirtualFree(MEM_DECOMMIT) on WW region */
-                {
-                    DWORD oldp = 0;
-                    VirtualProtect(w1g, (SIZE_T)ONE_GB, PAGE_NOACCESS, &oldp);
-                    m1 = take_mem();
-                    t0 = now_ms();
-                    BOOL ok = VirtualFree(w1g, (SIZE_T)ONE_GB, MEM_DECOMMIT);
-                    dt = now_ms() - t0;
-                    m2 = take_mem();
-                    printf("  C-WW (1GB PROT_NONE decommit): ok=%d, time=%.2f ms, delta_WS=%+.1f MB, delta_Commit=%+.1f MB\n",
-                           (int)ok, dt, m2.ws_mb - m1.ws_mb, m2.commit_mb - m1.commit_mb);
-                }
-
-                VirtualFree(w1g, 0, MEM_RELEASE);
-            }
-        }
-        free(addrs);
-    }
-#endif
 
     printf("\nG2-3 DONTNEED BENCHMARK COMPLETED\n");
     return 0;

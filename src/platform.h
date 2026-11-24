@@ -119,4 +119,18 @@ int afw_os_filemap_ro(afw_os_file f, uint64_t aligned_off, size_t view_len,
 int afw_os_filemap_unmap(void *view_base, size_t view_len);
 int afw_os_filemap_protect(void *addr, size_t len, int prot);
 
+/* Anonymous VMA reservation + write-watch primitives (Win32 isolated in platform.c, Rule 8).
+ * afw_os_ww_reserve reserves anonymous PROT_NONE space; on Windows tries
+ * MEM_RESERVE | MEM_WRITE_WATCH first and falls back to plain MEM_RESERVE.
+ * Sets *ww_out = 1 iff write-watch tracking is active on the reservation.
+ * afw_os_ww_get queries dirty pages in [addr, addr + len) (if reset != 0, passes
+ * WRITE_WATCH_FLAG_RESET atomically BEFORE caller zeroes pages). Returns 0 on
+ * success, -1 on any OS failure or unsupported platform.
+ * afw_os_ww_reset clears write-watch state on [addr, addr + len) (called ONLY
+ * after os_decommit on inaccessible pages). Returns 0 on success, -1 on failure. */
+int afw_os_ww_reserve(uint64_t addr, uint64_t size, uint64_t *out, int *ww_out);
+int afw_os_ww_get(uint64_t addr, uint64_t len, int reset,
+                  void **addrs, size_t *count_io, uint32_t *gran_out);
+int afw_os_ww_reset(uint64_t addr, uint64_t len);
+
 #endif
