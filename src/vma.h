@@ -21,9 +21,13 @@
  *   mprotect         committed extents: VirtualProtect (PROT_NONE keeps the
  *                    contents, as on Linux - NOT a decommit); reserved
  *                    extents made accessible are committed then
- *   madvise          MADV_DONTNEED: mapped committed extents read back as
- *                    zeros (decommit + recommit); other advice is a no-op
- * File-backed mappings are not supported yet (-ENODEV).
+ *   madvise          MADV_DONTNEED: on VMA_ANON committed accessible pages,
+ *                    zeroes in place via memset(0) under g_lock (temporary
+ *                    RW->RO around anonymous PROT_READ); PROT_NONE committed
+ *                    pages decommit back to reserved; reserved pages and
+ *                    VMA_FILEMAP/MAP_SHARED are safe no-ops; other advice is
+ *                    a no-op
+ * File-backed read-only mappings are handled by src/filemap.c (VMA_FILEMAP).
  * Synchronized with a single lock (SRWLOCK on Windows, pthread mutex on host).
  */
 #ifndef AFW_VMA_H
