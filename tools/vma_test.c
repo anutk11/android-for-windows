@@ -767,6 +767,36 @@ int main(void) {
         check("anon mmap rejects missing or conflicting MAP_SHARED/MAP_PRIVATE (-EINVAL)",
               MMAP(0, 4 * K, RW, LNX_MAP_ANONYMOUS) == -22 &&
               MMAP(0, 4 * K, RW, LNX_MAP_SHARED | LNX_MAP_PRIVATE | LNX_MAP_ANONYMOUS) == -22);
+
+        /* 16f: Single MADV_DONTNEED across mixed states [res, PROT_NONE(commit), RO, RX, RW, SHARED] */
+        b = MMAP(0, 24 * K, 0, ANON | LNX_MAP_NORESERVE);
+        p = (unsigned char *)(uintptr_t)b;
+        check("16f: setup 6-page mixed-state allocation",
+              b > 0 &&
+              MPROTECT(b + 4 * K, 16 * K, RW) == 0 &&
+              (memset(p + 4 * K, 0x44, 16 * K), 1) &&
+              MPROTECT(b + 4 * K, 4 * K, 0) == 0 &&
+              MPROTECT(b + 8 * K, 4 * K, LNX_PROT_READ) == 0 &&
+              MPROTECT(b + 12 * K, 4 * K, LNX_PROT_READ | LNX_PROT_EXEC) == 0 &&
+              MMAP(b + 20 * K, 4 * K, RW, LNX_MAP_SHARED | LNX_MAP_ANONYMOUS | LNX_MAP_FIXED) == b + 20 * (int64_t)K &&
+              (memset(p + 20 * K, 0x99, 4 * K), 1));
+        check("16f: private RW page 4 and shared RW page 5 did NOT coalesce (6 extents)",
+              afw_vma_extent_count() == 6);
+        check("16f: single MADV_DONTNEED across all 6 mixed pages succeeds",
+              MADVISE(b, 24 * K, LNX_MADV_DONTNEED) == 0);
+        WIN_CHECK("16f: page 0 stayed reserved", (uint64_t)b, "reserved");
+        WIN_CHECK("16f: page 1 (PROT_NONE) dropped to reserved", (uint64_t)b + 4 * K, "reserved");
+        WIN_CHECK("16f: page 2 stayed commit-r", (uint64_t)b + 8 * K, "commit-r");
+        WIN_CHECK("16f: page 3 stayed commit-rx", (uint64_t)b + 12 * K, "commit-rx");
+        WIN_CHECK("16f: page 4 stayed commit-rw", (uint64_t)b + 16 * K, "commit-rw");
+        WIN_CHECK("16f: page 5 (MAP_SHARED) stayed commit-rw", (uint64_t)b + 20 * K, "commit-rw");
+        check("16f: private RO/RX/RW pages zeroed, RO/RX write-fault, shared page kept 0x99",
+              all_zero(p + 8 * K, 12 * K) &&
+              vma_try_write_byte((volatile unsigned char *)(p + 8 * K), 1) == 1 &&
+              vma_try_write_byte((volatile unsigned char *)(p + 12 * K), 1) == 1 &&
+              p[20 * K] == 0x99 && p[24 * K - 1] == 0x99);
+        MUNMAP(b, 24 * K);
+
         check("zero allocations remain after test 16", afw_vma_alloc_count() == 0);
     }
 

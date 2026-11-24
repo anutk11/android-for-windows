@@ -776,11 +776,12 @@ static int do_dontneed(winalloc *w, uint64_t a, uint64_t n, int arg) {
             memset((void *)(uintptr_t)w->ext[i].start, 0, (size_t)len);
             w->linux_touched = 1;
         } else {
-            /* Anonymous read-only (or RX) page without PROT_WRITE: temporarily upgrade
-             * to writable under g_lock, zero, and restore original protection.
+            /* Anonymous read-only (or RX) page without PROT_WRITE: temporarily switch
+             * to PAGE_READWRITE (never RWX, per Reviewer 3) under g_lock, zero, and
+             * restore original protection.
              * Documented limit: during this temporary window, a concurrent write from
              * another thread could succeed instead of faulting. */
-            int tmp_prot = prot | LNX_PROT_WRITE;
+            int tmp_prot = LNX_PROT_READ | LNX_PROT_WRITE;
             if (os_protect(w->ext[i].start, len, tmp_prot) != 0) {
                 rc = -LNX_ENOMEM;
                 break;
