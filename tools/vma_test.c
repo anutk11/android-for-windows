@@ -8,6 +8,7 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include <sched.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <time.h>
@@ -22,19 +23,20 @@
 #include <stdio.h>
 #include <string.h>
 
-#define A_LOAD(p)     __atomic_load_n((p), __ATOMIC_RELAXED)
-#define A_STORE(p, v) __atomic_store_n((p), (v), __ATOMIC_RELAXED)
-#define A_LOAD_ACQ(p) __atomic_load_n((p), __ATOMIC_ACQUIRE)
-#define A_STORE_REL(p, v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
-#define A_FETCH_ADD(p, v) __atomic_fetch_add((p), (v), __ATOMIC_RELAXED)
-
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+static void     a_store_u64(uint64_t *p, uint64_t v)     { InterlockedExchange64((volatile LONG64 *)p, (LONG64)v); }
+static uint64_t a_fetch_add_u64(uint64_t *p, uint64_t v) { return (uint64_t)InterlockedExchangeAdd64((volatile LONG64 *)p, (LONG64)v); }
+static int      a_load_i32(int *p)                       { return (int)InterlockedCompareExchange((volatile LONG *)p, 0, 0); }
+static void     a_store_i32(int *p, int v)               { InterlockedExchange((volatile LONG *)p, (LONG)v); }
+static int      a_fetch_add_i32(int *p, int v)           { return (int)InterlockedExchangeAdd((volatile LONG *)p, (LONG)v); }
+static void     vma_yield(void)                          { Sleep(0); }
+
 extern char vma_write_fault[], vma_write_recover[];
 int vma_probe_write(volatile unsigned char *p, unsigned char val);
-void g23_asm_read_loop(const volatile uint64_t *p, volatile int *stop, uint64_t *iters_out);
+void g23_asm_read_loop(const uint64_t *p, const int *stop, uint64_t *iters_out);
 
 __asm__(
     ".att_syntax prefix\n"
@@ -56,31 +58,34 @@ __asm__(
     ".globl g23_asm_read_loop\n"
     "g23_asm_read_loop:\n\t"
     "xor %r9d, %r9d\n"
-    "1:\n\t"
+    "g23_asm_loop:\n\t"
     "movq (%rcx), %rax\n\t"
     "inc %r9\n\t"
     "movl (%rdx), %eax\n\t"
     "test %eax, %eax\n\t"
-    "jz 1b\n\t"
+    "jz g23_asm_loop\n\t"
     "movq %r9, (%r8)\n\t"
     "ret\n"
     ".intel_syntax noprefix\n"
 );
 
-static volatile uint64_t g_g23_watch_lo, g_g23_watch_hi;
-static volatile LONG     g_g23_faults;
+static volatile LONG64 g_g23_watch_lo, g_g23_watch_hi;
+static volatile LONG   g_g23_faults;
 
 static LONG CALLBACK vma_test_veh(EXCEPTION_POINTERS *ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
+    uint64_t lo, hi;
     if (code != EXCEPTION_ACCESS_VIOLATION)
         return EXCEPTION_CONTINUE_SEARCH;
     if (ep->ContextRecord->Rip == (DWORD64)(uintptr_t)vma_write_fault) {
         ep->ContextRecord->Rip = (DWORD64)(uintptr_t)vma_write_recover;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
-    if (g_g23_watch_lo && ep->ExceptionRecord->NumberParameters >= 2) {
+    lo = (uint64_t)InterlockedCompareExchange64(&g_g23_watch_lo, 0, 0);
+    hi = (uint64_t)InterlockedCompareExchange64(&g_g23_watch_hi, 0, 0);
+    if (lo && ep->ExceptionRecord->NumberParameters >= 2) {
         uint64_t fa = (uint64_t)ep->ExceptionRecord->ExceptionInformation[1];
-        if (fa >= g_g23_watch_lo && fa < g_g23_watch_hi)
+        if (fa >= lo && fa < hi)
             InterlockedIncrement(&g_g23_faults);
     }
     return EXCEPTION_CONTINUE_SEARCH;
@@ -109,6 +114,13 @@ static double now_ms(void) {
 }
 #define WIN_CHECK(what, a, want) check(what, strcmp(state(a), want) == 0)
 #else
+static void     a_store_u64(uint64_t *p, uint64_t v)     { __atomic_store_n(p, v, __ATOMIC_RELAXED); }
+static uint64_t a_fetch_add_u64(uint64_t *p, uint64_t v) { return __atomic_fetch_add(p, v, __ATOMIC_RELAXED); }
+static int      a_load_i32(int *p)                       { return __atomic_load_n(p, __ATOMIC_ACQUIRE); }
+static void     a_store_i32(int *p, int v)               { __atomic_store_n(p, v, __ATOMIC_RELEASE); }
+static int      a_fetch_add_i32(int *p, int v)           { return __atomic_fetch_add(p, v, __ATOMIC_RELEASE); }
+static void     vma_yield(void)                          { sched_yield(); }
+
 static sigjmp_buf g_vma_jmp;
 static volatile sig_atomic_t g_vma_armed;
 static void vma_sig_handler(int sig) {
@@ -183,17 +195,17 @@ static void mt_neighbor_worker(void *arg) {
     size_t i;
     int signaled = 0;
     a->ok = 1;
-    for (i = 0; i < a->nslots; i++) A_STORE(&a->slots[i], 0x10000000ULL + i);
+    for (i = 0; i < a->nslots; i++) a_store_u64(&a->slots[i], 0x10000000ULL + i);
     for (;;) {
         size_t idx = (size_t)(it % a->nslots);
         uint64_t expect = 0x10000000ULL + idx + (it / a->nslots);
-        uint64_t prev = A_FETCH_ADD(&a->slots[idx], 1ULL);
+        uint64_t prev = a_fetch_add_u64(&a->slots[idx], 1ULL);
         if (prev != expect) { a->ok = 0; break; }
         it++;
-        if (!signaled) { __atomic_fetch_add(a->ready, 1, __ATOMIC_RELEASE); signaled = 1; }
-        if (A_LOAD_ACQ(a->stop)) break;
+        if (!signaled) { a_fetch_add_i32(a->ready, 1); signaled = 1; }
+        if (a_load_i32(a->stop)) break;
     }
-    if (!signaled) __atomic_fetch_add(a->ready, 1, __ATOMIC_RELEASE);
+    if (!signaled) a_fetch_add_i32(a->ready, 1);
     a->iters = it;
 }
 
@@ -224,23 +236,23 @@ static void mt_disjoint_churn_worker(void *arg) {
             break;
         }
         a->iters++;
-        if (!signaled) { __atomic_fetch_add(a->ready, 1, __ATOMIC_RELEASE); signaled = 1; }
-        if (A_LOAD_ACQ(a->stop)) break;
+        if (!signaled) { a_fetch_add_i32(a->ready, 1); signaled = 1; }
+        if (a_load_i32(a->stop)) break;
     }
-    if (!signaled) __atomic_fetch_add(a->ready, 1, __ATOMIC_RELEASE);
+    if (!signaled) a_fetch_add_i32(a->ready, 1);
 }
 
 #if defined(_WIN32)
 typedef struct {
-    const volatile uint64_t *target;
+    const uint64_t *target;
     int *started;
-    volatile int *stop;
+    const int *stop;
     uint64_t iters;
 } g23_asm_arg;
 
 static void g23_asm_worker(void *arg) {
     g23_asm_arg *a = (g23_asm_arg *)arg;
-    A_STORE_REL(a->started, 1);
+    a_store_i32(a->started, 1);
     g23_asm_read_loop(a->target, a->stop, &a->iters);
 }
 #endif
@@ -796,7 +808,7 @@ int main(void) {
               afw_os_thread_start(mt_neighbor_worker, &n2, &t2) == 0 &&
               afw_os_thread_start(mt_disjoint_churn_worker, &ch, &t3) == 0);
 
-        while (A_LOAD_ACQ(&ready) < 3) { /* wait for all 3 workers to be live */ }
+        while (a_load_i32(&ready) < 3) vma_yield();
 
         /* Main thread exclusively touches middle pages 4..11 (never 0..3 or 12..15). */
         for (iter = 0; iter < 200; iter++) {
@@ -818,7 +830,7 @@ int main(void) {
             }
         }
 
-        A_STORE_REL(&stop, 1);
+        a_store_i32(&stop, 1);
         check("all 3 worker threads joined cleanly",
               afw_os_thread_join(t1) == 0 &&
               afw_os_thread_join(t2) == 0 &&
@@ -850,8 +862,7 @@ int main(void) {
     {
         afw_os_thread tr;
         g23_asm_arg arg;
-        int started = 0;
-        volatile int stop = 0;
+        int started = 0, stop = 0;
         int iter, madv_ok = 1;
         double t0 = now_ms(), elapsed;
 
@@ -859,18 +870,18 @@ int main(void) {
         p = (unsigned char *)(uintptr_t)b;
         check("allocated 16KB RW VMA for same-page asm fault-absence probe", b > 0);
 
-        g_g23_faults = 0;
-        g_g23_watch_hi = (uint64_t)b + 16 * K;
-        A_STORE_REL(&g_g23_watch_lo, (uint64_t)b);
+        InterlockedExchange(&g_g23_faults, 0);
+        InterlockedExchange64(&g_g23_watch_hi, (LONG64)((uint64_t)b + 16 * K));
+        InterlockedExchange64(&g_g23_watch_lo, (LONG64)(uint64_t)b);
 
-        arg.target = (const volatile uint64_t *)(uintptr_t)(b + 4 * K);
+        arg.target = (const uint64_t *)(uintptr_t)(b + 4 * K);
         arg.started = &started;
         arg.stop = &stop;
         arg.iters = 0;
         check("spawned x86-64 asm reader on same page as MADV_DONTNEED",
               afw_os_thread_start(g23_asm_worker, &arg, &tr) == 0);
 
-        while (!A_LOAD_ACQ(&started)) { /* wait for asm reader thread to enter loop */ }
+        while (!a_load_i32(&started)) vma_yield();
 
         for (iter = 0; iter < 2000; iter++) {
             if (MADVISE(b, 16 * K, LNX_MADV_DONTNEED) != 0) {
@@ -879,17 +890,18 @@ int main(void) {
             }
         }
 
-        A_STORE_REL(&stop, 1);
+        a_store_i32(&stop, 1);
         check("asm reader thread joined cleanly", afw_os_thread_join(tr) == 0);
         elapsed = now_ms() - t0;
 
-        A_STORE_REL(&g_g23_watch_lo, 0);
-        g_g23_watch_hi = 0;
+        InterlockedExchange64(&g_g23_watch_lo, 0);
+        InterlockedExchange64(&g_g23_watch_hi, 0);
 
         printf("  [info] asm probe: %.1f ms, reader=%llu loads, VEH faults=%ld\n",
-               elapsed, (unsigned long long)arg.iters, (long)g_g23_faults);
+               elapsed, (unsigned long long)arg.iters,
+               (long)InterlockedCompareExchange(&g_g23_faults, 0, 0));
         check("2000 MADV_DONTNEED calls with concurrent same-page asm loads had 0 faults",
-              madv_ok && arg.iters > 0 && g_g23_faults == 0);
+              madv_ok && arg.iters > 0 && InterlockedCompareExchange(&g_g23_faults, 0, 0) == 0);
         check("post-barrier range is all zero and cleanup leaves 0 allocations",
               MADVISE(b, 16 * K, LNX_MADV_DONTNEED) == 0 &&
               all_zero(p, 16 * K) &&
