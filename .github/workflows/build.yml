@@ -233,9 +233,9 @@ jobs:
             "$TC/llvm-objdump" -d --no-show-raw-insn \
               --disassemble-symbols=_Z25__allocate_thread_mappingmm,_Z17__init_static_tlsPv,_Z10__init_tcbP10bionic_tcbP18pthread_internal_t,_Z14__init_tcb_dtvP10bionic_tcb,__libc_get_static_tls_bounds \
               out/bionic/libc.so || true
-            echo "--- disassemble _ZL15__pthread_startPv, pthread_exit, pthread_join ---"
+            echo "--- disassemble _ZL15__pthread_startPv, _Z24__init_additional_stacksP18pthread_internal_t, pthread_exit, pthread_join ---"
             "$TC/llvm-objdump" -d --no-show-raw-insn \
-              --disassemble-symbols=_ZL15__pthread_startPv,pthread_exit,pthread_join \
+              --disassemble-symbols=_ZL15__pthread_startPv,_Z24__init_additional_stacksP18pthread_internal_t,pthread_exit,pthread_join \
               out/bionic/libc.so || true
             echo "--- disassemble pthread_create (full) ---"
             "$TC/llvm-objdump" -d --no-show-raw-insn \
@@ -246,10 +246,10 @@ jobs:
               --disassemble-symbols=pthread_cond_broadcast,pthread_cond_signal,pthread_cond_timedwait \
               out/bionic/libc.so | head -180 || true
             if [ -f out/bionic/linker64 ]; then
-              echo "--- linker64 StaticTlsLayout / reserve_bionic_tls oracle ---"
-              "$TC/llvm-readelf" -sW out/bionic/linker64 | grep -iE "StaticTlsLayout|bionic_tls|reserve_bionic|reserve_type|finish_layout" | head -40 || true
-              "$TC/llvm-objdump" -d --no-show-raw-insn out/bionic/linker64 \
-                | grep -nE "0x450\(|0x458\(|0x460\(|0x468\(|0x470\(|reserve_bionic_tls|StaticTlsLayout" | head -60 || true
+              echo "--- linker64 StaticTlsLayout / reserve_bionic_tls exact disassembly oracle ---"
+              "$TC/llvm-objdump" -d --no-show-raw-insn \
+                --disassemble-symbols=__dl__ZNK15StaticTlsLayout21offset_thread_pointerEv,__dl__ZN15StaticTlsLayout27reserve_exe_segment_and_tcbEPK10TlsSegmentPKc,__dl__ZN15StaticTlsLayout7reserveEmm,__dl__ZN15StaticTlsLayout18reserve_bionic_tlsEv,__dl__ZN15StaticTlsLayout13finish_layoutEv \
+                out/bionic/linker64 || true
             fi
             echo "--- syscall 56 (clone) and 60 (exit) and 202 (futex) sites from libc-scan.txt ---"
             grep -E "nr=(56|60|202)\b|__bionic_clone|_exit_with_stack|futex" out/libc-scan.txt | head -60 || true
