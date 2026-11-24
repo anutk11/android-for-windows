@@ -804,10 +804,11 @@ int main(void) {
             /* Scope: owned VMA_ANON has WW=1; adopted region has WW=0 */
             unsigned char *adp = (unsigned char *)afw_mem_alloc(4 * K);
             unsigned char aprot[1] = { RW };
+            int adp_ok = (adp != NULL && afw_vma_adopt((uint64_t)(uintptr_t)adp, 4 * K, aprot) == 0);
+            int adp_ww = adp_ok ? afw_vma_test_ww_active((uint64_t)(uintptr_t)adp) : -1;
+            int adp_fg = adp_ok ? afw_vma_forget((uint64_t)(uintptr_t)adp) : -1;
             check("16g: adopted allocation does NOT enable write_watch",
-                  adp != NULL && afw_vma_adopt((uint64_t)(uintptr_t)adp, 4 * K, aprot) == 0 &&
-                  afw_vma_test_ww_active((uint64_t)(uintptr_t)adp) == 0 &&
-                  afw_vma_forget((uint64_t)(uintptr_t)adp) == 0);
+                  adp_ok && adp_ww == 0 && adp_fg == 0);
             if (adp) afw_mem_free(adp, 4 * K);
 
             /* Untouched 32MB RW VMA: MADV_DONTNEED keeps Working Set flat (<2MB delta) */
@@ -893,19 +894,22 @@ int main(void) {
                   MADVISE(b, 8 * K, LNX_MADV_DONTNEED) == 0 && all_zero(p, 8 * K));
             MUNMAP(b, 8 * K);
 
-            /* Fail-closed: ResetWriteWatch failure on decommit disables WW cleanly */
+            /* Fail-closed: ResetWriteWatch failure on recommit disables WW cleanly */
             b = MMAP(0, 8 * K, RW, ANON);
             p = (unsigned char *)(uintptr_t)b;
             memset(p, 0x66, 8 * K);
             MPROTECT(b, 8 * K, 0);
-            afw_vma_test_fail_ww(1);
-            check("16g: ResetWriteWatch failure on PROT_NONE decommit disables WW fail-closed",
+            check("16g: PROT_NONE + MADV_DONTNEED decommits cleanly and keeps WW active",
                   MADVISE(b, 8 * K, LNX_MADV_DONTNEED) == 0 &&
+                  afw_vma_test_ww_active((uint64_t)b) == 1);
+            WIN_CHECK("16g: dropped to reserved before recommit", (uint64_t)b, "reserved");
+            afw_vma_test_fail_ww(1);
+            check("16g: ResetWriteWatch failure on recommit disables WW fail-closed",
+                  MPROTECT(b, 8 * K, RW) == 0 &&
                   afw_vma_test_ww_active((uint64_t)b) == 0);
             afw_vma_test_fail_ww(0);
-            WIN_CHECK("16g: dropped to reserved even on ResetWriteWatch failure", (uint64_t)b, "reserved");
-            check("16g: recommit + dirty + MADV_DONTNEED still zeroes after ResetWriteWatch disable",
-                  MPROTECT(b, 8 * K, RW) == 0 && (memset(p, 0x55, 8 * K), 1) &&
+            check("16g: dirty + MADV_DONTNEED still zeroes after ResetWriteWatch disable",
+                  (memset(p, 0x55, 8 * K), 1) &&
                   MADVISE(b, 8 * K, LNX_MADV_DONTNEED) == 0 && all_zero(p, 8 * K));
             MUNMAP(b, 8 * K);
         }
@@ -958,16 +962,22 @@ int main(void) {
         for (iter = 0; iter < 200; iter++) {
             memset(p + 16 * K, 0xa5, 32 * K);
             if ((iter % 10) == 0) {
-                if (MPROTECT(b + 16 * K, 32 * K, LNX_PROT_READ) != 0 ||
-                    MADVISE(b + 16 * K, 32 * K, LNX_MADV_DONTNEED) != 0 ||
-                    !all_zero(p + 16 * K, 32 * K) ||
-                    MPROTECT(b + 16 * K, 32 * K, RW) != 0) {
+                int64_t r1 = MPROTECT(b + 16 * K, 32 * K, LNX_PROT_READ);
+                int64_t r2 = (r1 == 0) ? MADVISE(b + 16 * K, 32 * K, LNX_MADV_DONTNEED) : -1;
+                int z = (r2 == 0) ? all_zero(p + 16 * K, 32 * K) : 0;
+                int64_t r3 = (r1 == 0) ? MPROTECT(b + 16 * K, 32 * K, RW) : -1;
+                if (r1 != 0 || r2 != 0 || !z || r3 != 0) {
+                    printf("  [diag] Test 17 RO iter=%d r1=%lld r2=%lld z=%d r3=%lld b0=0x%02x\n",
+                           iter, (long long)r1, (long long)r2, z, (long long)r3, p[16 * K]);
                     main_ok = 0;
                     break;
                 }
             } else {
-                if (MADVISE(b + 16 * K, 32 * K, LNX_MADV_DONTNEED) != 0 ||
-                    !all_zero(p + 16 * K, 32 * K)) {
+                int64_t r2 = MADVISE(b + 16 * K, 32 * K, LNX_MADV_DONTNEED);
+                int z = (r2 == 0) ? all_zero(p + 16 * K, 32 * K) : 0;
+                if (r2 != 0 || !z) {
+                    printf("  [diag] Test 17 RW iter=%d r2=%lld z=%d b0=0x%02x\n",
+                           iter, (long long)r2, z, p[16 * K]);
                     main_ok = 0;
                     break;
                 }

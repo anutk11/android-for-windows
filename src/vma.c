@@ -575,16 +575,17 @@ static int map_extents(winalloc *w, uint64_t a, uint64_t n, int prot, int shared
             rc = -1;
             break;
         }
-        ww_reset_or_disable(w, w->ext[i].start, run_len);
         for (k = i; k < j; k++)
             w->ext[k].state = (unsigned char)(w->ext[k].state & (P_MAPPED | P_SHARED));
         w->linux_touched = 1;
         i = j;
     }
 
-    /* Phase 2: commit whole range in one call (if accessible), then publish. */
+    /* Phase 2: commit whole range in one call (if accessible), then publish.
+     * ResetWriteWatch requires MEM_COMMIT pages; run right after os_commit under g_lock. */
     if (rc == 0 && prot) {
         if (os_commit(a, n, prot) != 0) rc = -1;
+        else ww_reset_or_disable(w, a, n);
     }
     if (rc == 0) {
         unsigned char st = (unsigned char)(P_MAPPED | (prot ? P_COMMIT : 0) |
@@ -768,7 +769,6 @@ static int do_unmap(winalloc *w, uint64_t a, uint64_t n, int arg) {
                     rc = -LNX_ENOMEM;
                     break;
                 }
-                ww_reset_or_disable(w, w->ext[i].start, run_len);
                 for (k = i; k < j; k++) {
                     if (w->ext[k].state & P_MAPPED)
                         w->mapped_bytes -= w->ext[k].end - w->ext[k].start;
@@ -842,12 +842,15 @@ static int do_protect(winalloc *w, uint64_t a, uint64_t n, int prot) {
             w->linux_touched = 1;
             i = j;
         } else if (prot) {
+            uint64_t run_len;
             j = i + 1;
             while (j < i1 && !(w->ext[j].state & P_COMMIT)) j++;
-            if (os_commit(w->ext[i].start, w->ext[j - 1].end - w->ext[i].start, prot) != 0) {
+            run_len = w->ext[j - 1].end - w->ext[i].start;
+            if (os_commit(w->ext[i].start, run_len, prot) != 0) {
                 rc = -LNX_ENOMEM;
                 break;
             }
+            ww_reset_or_disable(w, w->ext[i].start, run_len);
             for (k = i; k < j; k++)
                 w->ext[k].state = (unsigned char)(P_MAPPED | P_COMMIT | (w->ext[k].state & P_SHARED) | prot);
             w->linux_touched = 1;
@@ -878,12 +881,12 @@ static int do_dontneed(winalloc *w, uint64_t a, uint64_t n, int arg) {
         if (!(w->ext[i].state & P_COMMIT)) continue;      /* reserved stays reserved */
         if (prot == 0) {
             /* PROT_NONE in MEM_COMMIT: decommit drops commit charge with zero VEH/Red Zone risk
-             * because accessing PROT_NONE is already a fault. */
+             * because accessing PROT_NONE is already a fault. (ResetWriteWatch runs on later
+             * os_commit because ResetWriteWatch requires MEM_COMMIT pages.) */
             if (os_decommit(w->ext[i].start, len) != 0) {
                 rc = -LNX_ENOMEM;
                 break;
             }
-            ww_reset_or_disable(w, w->ext[i].start, len);
             w->ext[i].state = P_MAPPED;
             w->linux_touched = 1;
         } else if (prot & LNX_PROT_WRITE) {
@@ -1046,6 +1049,7 @@ int afw_vma_adopt(uint64_t base, uint64_t size, const unsigned char *page_prot) 
     w->owned = 0;
     w->linux_touched = 0;
     w->kind = VMA_ANON;
+    w->write_watch = 0;
     UNLOCK();
     return 0;
 }
