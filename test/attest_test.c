@@ -16,6 +16,8 @@
  *                        (models libc++ 0xd54f2 / 0xd5554): APPLIED
  *   VARIANT 10 xblock_clobber one path into the second dispatch clobbers r15: REJECTED
  *   VARIANT 11 xblock_caller  second dispatch reuses caller-saved rcx = T across a call: REJECTED
+ *   VARIANT 12 xblock_switch  another bounded switch in the same function clobbers r15: REJECTED (fail-closed)
+ *   VARIANT 13 xblock_subreg  32-bit sub-register write (xor r15d, r15d) clobbers r15: REJECTED
  */
 #ifndef VARIANT
 #define VARIANT 1
@@ -55,7 +57,7 @@ __attribute__((naked)) int afw_at_dispatch(int i) {
         "lea other_tbl(%rip), %rdx\n\t"
         "movslq (%rdx,%rdi,4), %rax\n\t"
         "add %rdx, %rax\n\t"
-#elif VARIANT == 9 || VARIANT == 10
+#elif VARIANT == 9 || VARIANT == 10 || VARIANT == 12 || VARIANT == 13
         "lea afw_at_tbl(%rip), %r15\n\t"          /* callee-saved table base, like libc++ 0xd54e1 */
         "movslq (%r15,%rdi,4), %rax\n\t"
         "add %r15, %rax\n\t"
@@ -114,6 +116,35 @@ __attribute__((naked)) int afw_at_dispatch(int i) {
         "add %rcx, %rax\n\t"
         "jmp *%rax\n"
         "3:\n\t"
+#elif VARIANT == 12
+        "cmp $1, %rsi\n\t"                       /* another bounded switch whose arm clobbers r15 -> fail-closed REJECT */
+        "ja 3f\n\t"
+        "lea sub_tbl(%rip), %rcx\n\t"
+        "movslq (%rcx,%rsi,4), %rax\n\t"
+        "add %rcx, %rax\n\t"
+        "jmp *%rax\n"
+        "sub0:\n\t"
+        "jmp 4f\n"
+        "sub1:\n\t"
+        "mov %rsi, %r15\n"
+        "4:\n\t"
+        "mov %esi, %edx\n\t"
+        "movslq (%r15,%rdx,4), %rax\n\t"
+        "add %r15, %rax\n\t"
+        "jmp *%rax\n"
+        "3:\n\t"
+#elif VARIANT == 13
+        "test %esi, %esi\n\t"                    /* 32-bit sub-register write zeroes all 64 bits of r15 -> MUST reject */
+        "jz 3f\n\t"
+        "cmp $1, %esi\n\t"
+        "je 4f\n\t"
+        "xor %r15d, %r15d\n"
+        "4:\n\t"
+        "mov %esi, %edx\n\t"
+        "movslq (%r15,%rdx,4), %rax\n\t"
+        "add %r15, %rax\n\t"
+        "jmp *%rax\n"
+        "3:\n\t"
 #endif
         "mov $1, %eax\n\t"
         "ret\n"
@@ -134,5 +165,10 @@ __attribute__((naked)) int afw_at_dispatch(int i) {
         "other_tbl:\n\t"
         ".long c0 - other_tbl\n\t"
         ".long c1 - other_tbl\n\t"
+#if VARIANT == 12
+        "sub_tbl:\n\t"
+        ".long sub0 - sub_tbl\n\t"
+        ".long sub1 - sub_tbl\n\t"
+#endif
         ".text\n");
 }

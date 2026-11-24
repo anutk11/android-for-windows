@@ -124,4 +124,8 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                    unsigned char *stub_area, size_t stub_size,
                    const afw_patch_ctx *ctx, afw_patch_report *rep, int verbose);
 
+#ifdef AFW_TEST
+int afw_patch_test_must_queue(void);
+#endif
+
 #endif

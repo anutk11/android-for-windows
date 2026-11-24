@@ -756,6 +756,10 @@ int main(int argc, char **argv) {
         printf("usage: %s <library.so> [-v]\n", argv[0]);
         return 2;
     }
+#ifdef AFW_TEST
+    if (strcmp(argv[1], "--test-must-queue") == 0)
+        return afw_patch_test_must_queue();
+#endif
     if (argc > 2 && strcmp(argv[2], "-v") == 0) verbose = 2;
     if (argc > 2 && strcmp(argv[2], "--patch-report") == 0) afw_load_patch_only = 1;
     {

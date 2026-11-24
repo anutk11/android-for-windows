@@ -371,75 +371,121 @@ static int gpr_bit(ZydisRegister r) {
  * Sound forward MUST-analysis over the function's reached CFG: computes, for
  * every reached instruction offset `off`, the bitmask `must_T[off]` of 64-bit
  * GPRs guaranteed to hold the exact constant `T` along EVERY path from
- * function entry / EH landing pads (using bitmask intersection at CFG joins).
+ * function entry / EH landing pads / external direct branch entries (using
+ * bitmask intersection at CFG joins).
  *
- * - Entry (`fstart`) and all original EH landing pads start with mask 0.
+ * - Entry (`fstart`), all original EH landing pads, and any direct branch
+ *   target from outside `[fstart, fend)` start with mask 0.
  * - `lea r64, [rip + disp]` targeting `T` sets bit `r64` (any other lea clears it).
- * - `mov r64, r64` copies the bit from source to destination.
+ * - 64-bit `mov r64, r64` copies the bit from source to destination.
  * - `call` preserves only SysV callee-saved GPRs (`rbx, rbp, r12..r15`).
- * - Any other write (explicit or implicit, any width) clears that GPR's bit.
+ * - Any other write (explicit or implicit, any width via `reg64()`) clears that bit.
  * - Indirect jumps in `jumps[0..njumps-1]` propagate `out` to the attested
- *   entries `att_targets[0..k-1]` (sound because `all_jumps_use_table` rejects
- *   the entire attestation if ANY jump in `jumps[]` fails verification).
+ *   entries `att_targets[0..k-1]`.
+ * - Fail-closed (returns 1, disabling cross-block proof): any other indirect
+ *   `UNCOND_BR` (e.g. another proven switch table or `jmp [mem]`), any decode
+ *   failure on a reached instruction, or any intra-function branch/fallthrough
+ *   landing on an unreached byte (`map[off] != 1`).
  *
- * Lattice height is 16 per instruction, so fixed-point convergence is guaranteed.
+ * Returns 0 on sound completion, 1 if cross-block proof is inapplicable
+ * (fail-closed), or -1 on allocation/queue-capacity error.
  */
-static int must_hold_table(ZydisDecoder *dec, unsigned char *fstart, size_t fsize,
+static int must_hold_table(ZydisDecoder *dec, const afw_patch_ctx *c,
+                           unsigned char *fstart, size_t fsize,
                            const unsigned char *map, uint64_t T,
                            const uint64_t *orig_pads, int n_orig_pads,
                            const uint64_t *att_targets, int k,
                            unsigned char *const *jumps, int njumps,
-                           uint16_t **must_out, unsigned char **seen_out) {
-    uint16_t *in_m = (uint16_t *)calloc(fsize ? fsize : 1, sizeof *in_m);
-    unsigned char *seen = (unsigned char *)calloc(fsize ? fsize : 1, 1);
-    unsigned char *in_q = (unsigned char *)calloc(fsize ? fsize : 1, 1);
-    size_t *q = (size_t *)malloc((fsize ? fsize : 1) * sizeof *q);
-    size_t qh = 0, qt = 0, qcap = fsize ? fsize : 1;
-    int i;
+                           uint16_t **must_out, unsigned char **seen_out,
+                           size_t *max_q_out, size_t *popped_out) {
+    size_t qcap = fsize ? fsize : 1;
+    uint16_t *in_m = (uint16_t *)calloc(qcap, sizeof *in_m);
+    unsigned char *seen = (unsigned char *)calloc(qcap, 1);
+    unsigned char *in_q = (unsigned char *)calloc(qcap, 1);
+    size_t *q = (size_t *)malloc(qcap * sizeof *q);
+    size_t qh = 0, qt = 0, q_count = 0, max_q = 0, popped = 0;
+    uint64_t f0 = (uint64_t)(uintptr_t)fstart;
+    uint64_t f1 = f0 + (uint64_t)fsize;
+    int i, rc = 0;
     if (!in_m || !seen || !in_q || !q) {
         free(in_m); free(seen); free(in_q); free(q);
         return -1;
     }
 
-#define MERGE_OFF(o_, m_) do {                                                \
+#define ENQ_OFF(o_, m_) do {                                                  \
     size_t _oo = (o_);                                                        \
     uint16_t _mm = (m_);                                                      \
-    if (_oo < fsize && map && map[_oo] == 1) {                                \
+    if (_oo >= fsize || !map || map[_oo] != 1) { rc = 1; goto done; }         \
+    {                                                                         \
         int _chg = 0;                                                         \
         if (!seen[_oo]) { seen[_oo] = 1; in_m[_oo] = _mm; _chg = 1; }         \
         else if ((in_m[_oo] & _mm) != in_m[_oo]) {                            \
             in_m[_oo] &= _mm; _chg = 1;                                       \
         }                                                                     \
         if (_chg && !in_q[_oo]) {                                             \
-            in_q[_oo] = 1; q[qt] = _oo; qt = (qt + 1) % qcap;                 \
+            if (q_count >= qcap) { rc = -1; goto done; }                      \
+            in_q[_oo] = 1; q[qt] = _oo; qt = (qt + 1) % qcap; q_count++;      \
+            if (q_count > max_q) max_q = q_count;                             \
         }                                                                     \
     }                                                                         \
 } while (0)
 
-    MERGE_OFF(0, 0);
+    if (fsize == 0) { rc = 1; goto done; }
+    ENQ_OFF(0, 0);
     for (i = 0; i < n_orig_pads; i++) {
-        uint64_t base = (uint64_t)(uintptr_t)fstart;
-        if (orig_pads[i] >= base && orig_pads[i] - base < fsize)
-            MERGE_OFF((size_t)(orig_pads[i] - base), 0);
+        if (orig_pads[i] >= f0 && orig_pads[i] < f1)
+            ENQ_OFF((size_t)(orig_pads[i] - f0), 0);
     }
 
-    while (qh != qt) {
+    /* Seed 0 at any direct branch/call target entering [fstart, fend) from outside. */
+    if (c && c->nsegs > 0) {
+        int g;
+        for (g = 0; g < c->nsegs; g++) {
+            unsigned char *s0 = c->segs[g].addr;
+            unsigned char *s1 = s0 + c->segs[g].size;
+            unsigned char *sq;
+            for (sq = s0; sq < s1;) {
+                ZydisDecodedInstruction sins;
+                ZydisDecodedOperand sops[ZYDIS_MAX_OPERAND_COUNT];
+                int sok = ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, sq, (ZyanUSize)(s1 - sq), &sins, sops));
+                if (sok && is_branch(&sins) && sins.operand_count_visible >= 1 &&
+                    sops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                    uint64_t qaddr = (uint64_t)(uintptr_t)sq;
+                    if (qaddr < f0 || qaddr >= f1) {
+                        ZyanU64 t = 0;
+                        if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&sins, &sops[0], (ZyanU64)qaddr, &t)) &&
+                            (uint64_t)t >= f0 && (uint64_t)t < f1) {
+                            ENQ_OFF((size_t)((uint64_t)t - f0), 0);
+                        }
+                    }
+                }
+                sq += sok ? sins.length : 1;
+            }
+        }
+    }
+
+    while (q_count != 0) {
         ZydisDecodedInstruction ins;
         ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
         size_t off = q[qh];
         unsigned char *pc = fstart + off;
         uint16_t out = in_m[off];
         qh = (qh + 1) % qcap;
+        q_count--;
+        popped++;
         in_q[off] = 0;
 
-        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, pc, (ZyanUSize)(fsize - off), &ins, ops)))
-            continue;
+        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, pc, (ZyanUSize)(fsize - off), &ins, ops))) {
+            rc = 1;
+            goto done;
+        }
 
         if (ins.meta.category == ZYDIS_CATEGORY_CALL) {
             out &= SYSV_CALLEE_SAVED_MASK;
         } else if (ins.mnemonic == ZYDIS_MNEMONIC_LEA && ins.operand_width == 64 &&
                    ins.operand_count_visible >= 2 &&
-                   ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                   ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER && ops[0].size == 64 &&
+                   ops[0].reg.value == reg64(ops[0].reg.value) &&
                    ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
                    ops[1].mem.base == ZYDIS_REGISTER_RIP) {
             int b = gpr_bit(ops[0].reg.value);
@@ -452,8 +498,10 @@ static int must_hold_table(ZydisDecoder *dec, unsigned char *fstart, size_t fsiz
             }
         } else if (ins.mnemonic == ZYDIS_MNEMONIC_MOV && ins.operand_width == 64 &&
                    ins.operand_count_visible >= 2 &&
-                   ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                   ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                   ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER && ops[0].size == 64 &&
+                   ops[0].reg.value == reg64(ops[0].reg.value) &&
+                   ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER && ops[1].size == 64 &&
+                   ops[1].reg.value == reg64(ops[1].reg.value)) {
             int bd = gpr_bit(ops[0].reg.value), bs = gpr_bit(ops[1].reg.value);
             if (bd >= 0) {
                 if (bs >= 0 && (out & (1u << bs))) out |= (uint16_t)(1u << bd);
@@ -479,43 +527,184 @@ static int must_hold_table(ZydisDecoder *dec, unsigned char *fstart, size_t fsiz
         if (ins.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
             if (ins.operand_count_visible >= 1 && ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
                 ZyanU64 t = 0;
-                uint64_t base = (uint64_t)(uintptr_t)fstart;
                 if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&ins, &ops[0], (ZyanU64)(uintptr_t)pc, &t)) &&
-                    (uint64_t)t >= base && (uint64_t)t - base < fsize)
-                    MERGE_OFF((size_t)((uint64_t)t - base), out);
-            } else if (ins.operand_count_visible >= 1 && ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                    (uint64_t)t >= f0 && (uint64_t)t < f1) {
+                    ENQ_OFF((size_t)((uint64_t)t - f0), out);
+                }
+                continue;
+            }
+            if (ins.operand_count_visible >= 1 && ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
                 int u, is_att_jmp = 0;
                 for (u = 0; u < njumps; u++)
                     if (jumps[u] == pc) { is_att_jmp = 1; break; }
                 if (is_att_jmp) {
-                    uint64_t base = (uint64_t)(uintptr_t)fstart;
-                    for (i = 0; i < k; i++)
-                        if (att_targets[i] >= base && att_targets[i] - base < fsize)
-                            MERGE_OFF((size_t)(att_targets[i] - base), out);
+                    for (i = 0; i < k; i++) {
+                        if (att_targets[i] < f0 || att_targets[i] >= f1) { rc = 1; goto done; }
+                        ENQ_OFF((size_t)(att_targets[i] - f0), out);
+                    }
+                    continue;
                 }
             }
-            continue;
+            /* Unmodeled indirect branch (e.g. another proven switch table or
+             * jmp [mem]): fail-closed so no edge into the dispatch can be missed. */
+            rc = 1;
+            goto done;
         }
         if (ins.meta.category == ZYDIS_CATEGORY_COND_BR) {
             if (ins.operand_count_visible >= 1 && ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
                 ZyanU64 t = 0;
-                uint64_t base = (uint64_t)(uintptr_t)fstart;
                 if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&ins, &ops[0], (ZyanU64)(uintptr_t)pc, &t)) &&
-                    (uint64_t)t >= base && (uint64_t)t - base < fsize)
-                    MERGE_OFF((size_t)((uint64_t)t - base), out);
+                    (uint64_t)t >= f0 && (uint64_t)t < f1) {
+                    ENQ_OFF((size_t)((uint64_t)t - f0), out);
+                }
             }
         }
         if (off + ins.length < fsize)
-            MERGE_OFF(off + ins.length, out);
+            ENQ_OFF(off + ins.length, out);
     }
 
-#undef MERGE_OFF
+done:
+#undef ENQ_OFF
     free(in_q);
     free(q);
+    if (max_q_out) *max_q_out = max_q;
+    if (popped_out) *popped_out = popped;
+    if (rc != 0) {
+        free(in_m);
+        free(seen);
+        *must_out = NULL;
+        *seen_out = NULL;
+        return rc;
+    }
     *must_out = in_m;
     *seen_out = seen;
     return 0;
 }
+
+#ifdef AFW_TEST
+/* Regression self-test for must_hold_table() (PR #25 Reviewers 1, 2 & 3):
+ *   1. Full-capacity circular queue (q_count == qcap == fsize, qt wraps to qh):
+ *      verifies max_q == 8 AND popped == 8 (old `qh != qt` loop popped 0).
+ *   2. Path intersection + sub-register 32-bit write (`xor r15d, r15d`) +
+ *      SysV CALL preserving callee-saved r15 while killing caller-saved rcx.
+ *   3. Unmodeled indirect jump (`jmp [rdi]`) fails closed (rc == 1).
+ * Returns 0 on pass, 1 on failure. */
+int afw_patch_test_must_queue(void) {
+    ZydisDecoder dec;
+    int fails = 0;
+    ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+
+    /* Case 1: 8-byte function of 7x nop + ret, all 8 offsets seeded at once
+     * via orig_pads -> q_count hits 8 == qcap, qt wraps back to qh == 0. */
+    {
+        unsigned char code[8] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xC3 };
+        unsigned char map[8]  = { 1, 1, 1, 1, 1, 1, 1, 1 };
+        uint64_t pads[8];
+        uint16_t *must = NULL;
+        unsigned char *seen = NULL;
+        size_t max_q = 0, popped = 0, i;
+        int rc;
+        for (i = 0; i < 8; i++) pads[i] = (uint64_t)(uintptr_t)(code + i);
+        rc = must_hold_table(&dec, NULL, code, sizeof code, map, 0x1000,
+                             pads, 8, NULL, 0, NULL, 0, &must, &seen, &max_q, &popped);
+        if (rc != 0 || max_q != 8 || popped != 8) {
+            fprintf(stderr, "[must_queue] FAIL full-capacity: rc=%d max_q=%zu popped=%zu (want 0, 8, 8)\n",
+                    rc, max_q, popped);
+            fails++;
+        }
+        for (i = 0; i < 8; i++) {
+            if (!seen || !seen[i] || !must || must[i] != 0) {
+                fprintf(stderr, "[must_queue] FAIL node %zu not processed\n", i);
+                fails++;
+                break;
+            }
+        }
+        free(must);
+        free(seen);
+    }
+
+    /* Case 2: lea r15, [T]; lea rcx, [T]; call +0; test edi,edi; jz +3; xor r15d,r15d; ret
+     * Verifies:
+     *   - after call: r15 stays set, rcx is cleared (caller-saved)
+     *   - at ret (join of kept-r15 path and xor-r15d path): r15 is cleared (intersection) */
+    {
+        unsigned char code[32];
+        unsigned char map[32];
+        uint16_t *must = NULL;
+        unsigned char *seen = NULL;
+        size_t n = 0, off_after_call, off_ret;
+        uint64_t T;
+        int32_t disp;
+        int rc;
+        memset(map, 0, sizeof map);
+        T = (uint64_t)(uintptr_t)(code + 0x100);
+        /* 0: lea r15, [rip + disp] (4C 8D 3D disp32) */
+        map[n] = 1;
+        code[n] = 0x4C; code[n + 1] = 0x8D; code[n + 2] = 0x3D;
+        disp = (int32_t)((int64_t)T - (int64_t)(uintptr_t)(code + n + 7));
+        memcpy(code + n + 3, &disp, 4); n += 7;
+        /* 7: lea rcx, [rip + disp] (48 8D 0D disp32) */
+        map[n] = 1;
+        code[n] = 0x48; code[n + 1] = 0x8D; code[n + 2] = 0x0D;
+        disp = (int32_t)((int64_t)T - (int64_t)(uintptr_t)(code + n + 7));
+        memcpy(code + n + 3, &disp, 4); n += 7;
+        /* 14: call rel32 (E8 00 00 00 00) */
+        map[n] = 1;
+        code[n] = 0xE8; memset(code + n + 1, 0, 4); n += 5;
+        /* 19: test edi, edi (85 FF) */
+        off_after_call = n; map[n] = 1;
+        code[n] = 0x85; code[n + 1] = 0xFF; n += 2;
+        /* 21: jz +3 (74 03 -> offset 26) */
+        map[n] = 1;
+        code[n] = 0x74; code[n + 1] = 0x03; n += 2;
+        /* 23: xor r15d, r15d (45 31 FF) */
+        map[n] = 1;
+        code[n] = 0x45; code[n + 1] = 0x31; code[n + 2] = 0xFF; n += 3;
+        /* 26: ret (C3) */
+        off_ret = n; map[n] = 1;
+        code[n] = 0xC3; n += 1;
+
+        rc = must_hold_table(&dec, NULL, code, n, map, T,
+                             NULL, 0, NULL, 0, NULL, 0, &must, &seen, NULL, NULL);
+        if (rc != 0 || !must || !seen || !seen[off_after_call] || !seen[off_ret]) {
+            fprintf(stderr, "[must_queue] FAIL case2: rc=%d\n", rc);
+            fails++;
+        } else {
+            uint16_t m_call = must[off_after_call];
+            uint16_t m_ret  = must[off_ret];
+            if ((m_call & (1u << 15)) == 0 || (m_call & (1u << 1)) != 0) {
+                fprintf(stderr, "[must_queue] FAIL after_call mask=0x%x (want r15=1, rcx=0)\n", m_call);
+                fails++;
+            }
+            if ((m_ret & (1u << 15)) != 0) {
+                fprintf(stderr, "[must_queue] FAIL join after xor r15d: mask=0x%x (want r15=0)\n", m_ret);
+                fails++;
+            }
+        }
+        free(must);
+        free(seen);
+    }
+
+    /* Case 3: unmodeled indirect jump (jmp [rdi]: FF 27) must fail closed (rc == 1). */
+    {
+        unsigned char code[3] = { 0x90, 0xFF, 0x27 };
+        unsigned char map[3]  = { 1, 1, 0 };
+        uint16_t *must = NULL;
+        unsigned char *seen = NULL;
+        int rc = must_hold_table(&dec, NULL, code, sizeof code, map, 0x1000,
+                                 NULL, 0, NULL, 0, NULL, 0, &must, &seen, NULL, NULL);
+        if (rc != 1 || must != NULL || seen != NULL) {
+            fprintf(stderr, "[must_queue] FAIL case3 unmodeled jmp: rc=%d\n", rc);
+            fails++;
+        }
+        free(must);
+        free(seen);
+    }
+
+    printf("must_queue_test: %s (%d failures)\n", fails ? "FAILED" : "PASSED", fails);
+    return fails != 0;
+}
+#endif
 
 /* Data flow from the table to the jump (reviewer 2, PR #7): walking back
  * from "jmp rX" over straight-line, reached instructions with no branch:
@@ -618,9 +807,9 @@ static void note_unresolved(const unsigned char *p) {
 /* One jump J dispatches through table T, and nothing else decides it:
  * J is a reached "jmp reg" in this function, the dispatch chain
  * (lea T -> movsxd -> add -> jmp, or cross-block proven rT == T -> movsxd ->
- * add -> jmp) proves the register, and no branch target lands inside
- * (chain_start, J] (and for cross-block chains, no external branch from
- * outside the function lands on chain_start either). (reviewer 2, PR #7) */
+ * add -> jmp) proves the register, and no branch target (including EH landing
+ * pads in tt[]) lands inside (chain_start, J] (and for cross-block chains, no
+ * external branch from outside the function lands on chain_start either). */
 static int jump_uses_table(ZydisDecoder *dec, const afw_patch_ctx *c, unsigned char *fstart, size_t fsize,
                            const unsigned char *map, unsigned char *J, uint64_t T, int k,
                            const uint64_t *tt, size_t ntt,
@@ -748,13 +937,15 @@ static int all_jumps_use_table(ZydisDecoder *dec, const afw_patch_ctx *c, unsign
     unsigned char *list[16];
     uint16_t *must_T = NULL;
     unsigned char *must_seen = NULL;
-    int n = g_nunres, u, ok = 1;
+    int n = g_nunres, u, ok = 1, mrc;
     const char *why = "";
     if (n > 16) return 0;
     for (u = 0; u < n; u++) list[u] = (unsigned char *)g_unres[u];
-    if (must_hold_table(dec, fstart, fsize, map, T, orig_pads, n_orig_pads,
-                        att_targets, n_att, list, n, &must_T, &must_seen) != 0)
-        return 0;
+    mrc = must_hold_table(dec, c, fstart, fsize, map, T, orig_pads, n_orig_pads,
+                          att_targets, n_att, list, n, &must_T, &must_seen, NULL, NULL);
+    if (mrc < 0) return 0;
+    /* mrc == 1 (fail-closed, e.g. another unmodeled indirect branch in this
+     * function): must_T == NULL so only straight-line chains can pass. */
     for (u = 0; u < n; u++)
         if (!jump_uses_table(dec, c, fstart, fsize, map, list[u], T, a->k, tt, ntt, must_T, must_seen, &why)) {
             fprintf(stderr, "           +0x%llx: %s\n", (long long)((intptr_t)list[u] - c->bias), why);
