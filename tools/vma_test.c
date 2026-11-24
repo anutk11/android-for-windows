@@ -193,7 +193,10 @@ int main(void) {
     b = MMAP(0, 100, RW, ANON);
     check("length rounded up to a page", b > 0 && (((unsigned char *)(uintptr_t)b)[4095] = 1) == 1);
     MUNMAP(b, 100);
-    check("file mappings not supported yet -> ENODEV", sc(9, 0, 4096, RW, LNX_MAP_PRIVATE, 3, 0) == -19);
+    check("filemap rejects PROT_WRITE -> ENOSYS, PROT_EXEC -> EACCES, bad fd -> EBADF",
+          sc(9, 0, 4096, RW, LNX_MAP_PRIVATE, 3, 0) == -38 &&
+          sc(9, 0, 4096, LNX_PROT_READ | LNX_PROT_EXEC, LNX_MAP_PRIVATE, 3, 0) == -13 &&
+          sc(9, 0, 4096, LNX_PROT_READ, LNX_MAP_PRIVATE, 3, 0) == -9);
     check("prctl(PR_SET_VMA) accepted", sc(157, 0x53564d41, 0, 0, 0, 0, 0) == 0);
 
     printf("11. 64GB PROT_NONE reservation (Scudo arena scale: <1s, <1MB metadata)\n");

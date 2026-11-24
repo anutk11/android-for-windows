@@ -47,4 +47,8 @@ int64_t afw_fd_newfstatat(int64_t dirfd, const char *path, void *statbuf, int64_
 int64_t afw_fd_unlinkat(int64_t dirfd, const char *path, int64_t flags);
 int64_t afw_fd_fcntl(int64_t fd, int64_t cmd, int64_t arg);
 
+/* Validate an open fd for read-only file mapping (caller must hold afw_fd_lock()).
+ * Returns 0 with *os_out and *size_out set, or -EBADF / -EACCES / -ENODEV. */
+int afw_fd_inspect_for_mmap_locked(int fd, intptr_t *os_out, int64_t *size_out);
+
 #endif

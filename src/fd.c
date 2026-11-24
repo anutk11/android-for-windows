@@ -365,3 +365,20 @@ int64_t afw_fd_fcntl(int64_t fd, int64_t cmd, int64_t arg) {
     afw_fd_unlock();
     return r;
 }
+
+int afw_fd_inspect_for_mmap_locked(int fd, intptr_t *os_out, int64_t *size_out) {
+    afw_os_stat_info st;
+    int rc;
+    fds_ensure_init();
+    if (!valid_fd_locked(fd)) return -LNX_EBADF;
+    if (g_fds[fd].kind != FD_FILE) return -19; /* ENODEV: stdio is not mappable */
+    if (g_fds[fd].flags & AFW_O_DIRECTORY) return -19; /* ENODEV: directory */
+    if ((g_fds[fd].flags & AFW_O_ACCMODE) == AFW_O_WRONLY) return -13; /* EACCES: write-only */
+    rc = afw_os_fstat(g_fds[fd].os, &st);
+    if (rc != 0) return rc;
+    if ((st.mode & 0170000u) != 0100000u) return -19; /* ENODEV: not S_IFREG */
+    if (st.size < 0) return -LNX_EINVAL;
+    if (os_out) *os_out = (intptr_t)g_fds[fd].os;
+    if (size_out) *size_out = st.size;
+    return 0;
+}
