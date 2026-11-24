@@ -259,6 +259,91 @@ int main(void) {
         return 1;
     }
 
+#if defined(_WIN32)
+    /* Scenario B-breakdown (Reviewer 2 request): measure get_ms vs memset_ms for
+     * 64x16MB chunked GetWriteWatch(0) vs single 1GB GetWriteWatch(0) vs plain memset(1GB). */
+    printf("\n[Scenario B-breakdown] 1GB full touched: 64x16MB vs 1x1GB GetWriteWatch(0) vs plain memset\n");
+    {
+        const SIZE_T NPAGES = (SIZE_T)(ONE_GB / PG);
+        const SIZE_T CHUNK_BYTES = 16ULL * 1024ULL * 1024ULL;
+        PVOID *addrs = (PVOID *)malloc(NPAGES * sizeof(PVOID));
+        unsigned char *w1g = (unsigned char *)VirtualAlloc(NULL, (SIZE_T)ONE_GB,
+                                 MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+        unsigned char *plain = (unsigned char *)VirtualAlloc(NULL, (SIZE_T)ONE_GB,
+                                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        double get_ms = 0.0, zero_ms = 0.0, t1;
+        DWORD gran = 0;
+        ULONG_PTR cnt;
+        SIZE_T c_off;
+
+        if (!addrs || !w1g || !plain) {
+            printf("FAIL: B-breakdown allocation failed (addrs=%p w1g=%p plain=%p)\n",
+                   (void *)addrs, (void *)w1g, (void *)plain);
+            if (w1g) VirtualFree(w1g, 0, MEM_RELEASE);
+            if (plain) VirtualFree(plain, 0, MEM_RELEASE);
+            free(addrs);
+            return 1;
+        }
+
+        /* Touch all 262,144 pages of both 1GB buffers */
+        for (off = 0; off < (size_t)ONE_GB; off += PG) w1g[off] = 0x5a;
+        for (off = 0; off < (size_t)ONE_GB; off += PG) plain[off] = 0x5a;
+
+        /* B1: 64 x 16MB chunked GetWriteWatch(0) + contiguous memset */
+        for (c_off = 0; c_off < (SIZE_T)ONE_GB; c_off += CHUNK_BYTES) {
+            cnt = 4096;
+            t0 = now_ms();
+            if (GetWriteWatch(0, w1g + c_off, CHUNK_BYTES, addrs, &cnt, &gran) != 0 ||
+                gran != PG || cnt != 4096) {
+                printf("FAIL: B1 chunk GetWriteWatch failed (cnt=%llu gran=%lu)\n",
+                       (unsigned long long)cnt, (unsigned long)gran);
+                VirtualFree(w1g, 0, MEM_RELEASE);
+                VirtualFree(plain, 0, MEM_RELEASE);
+                free(addrs);
+                return 1;
+            }
+            t1 = now_ms();
+            get_ms += (t1 - t0);
+            memset(w1g + c_off, 0, CHUNK_BYTES);
+            zero_ms += (now_ms() - t1);
+        }
+        printf("  B1 (64x16MB WW):           total=%.2f ms (GetWriteWatch=%.2f ms, memset=%.2f ms)\n",
+               get_ms + zero_ms, get_ms, zero_ms);
+
+        /* Re-dirty all 262,144 pages */
+        for (off = 0; off < (size_t)ONE_GB; off += PG) w1g[off] = 0x5b;
+
+        /* B2: single 1GB GetWriteWatch(0) + single 1GB memset */
+        cnt = NPAGES;
+        t0 = now_ms();
+        if (GetWriteWatch(0, w1g, (SIZE_T)ONE_GB, addrs, &cnt, &gran) != 0 ||
+            gran != PG || cnt != NPAGES) {
+            printf("FAIL: B2 single-call GetWriteWatch failed (cnt=%llu gran=%lu)\n",
+                   (unsigned long long)cnt, (unsigned long)gran);
+            VirtualFree(w1g, 0, MEM_RELEASE);
+            VirtualFree(plain, 0, MEM_RELEASE);
+            free(addrs);
+            return 1;
+        }
+        t1 = now_ms();
+        get_ms = t1 - t0;
+        memset(w1g, 0, (SIZE_T)ONE_GB);
+        zero_ms = now_ms() - t1;
+        printf("  B2 (1x1GB single-call WW): total=%.2f ms (GetWriteWatch=%.2f ms, memset=%.2f ms)\n",
+               get_ms + zero_ms, get_ms, zero_ms);
+
+        /* B3: control — plain MEM_COMMIT (no MEM_WRITE_WATCH) memset(1GB) on same runner */
+        t0 = now_ms();
+        memset(plain, 0, (SIZE_T)ONE_GB);
+        dt = now_ms() - t0;
+        printf("  B3 (plain control, no WW): total=%.2f ms (memset only)\n", dt);
+
+        VirtualFree(w1g, 0, MEM_RELEASE);
+        VirtualFree(plain, 0, MEM_RELEASE);
+        free(addrs);
+    }
+#endif
+
     printf("\nG2-3 DONTNEED BENCHMARK COMPLETED\n");
     return 0;
 }

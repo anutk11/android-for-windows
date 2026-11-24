@@ -123,9 +123,10 @@ int afw_os_filemap_protect(void *addr, size_t len, int prot);
  * afw_os_ww_reserve reserves anonymous PROT_NONE space; on Windows tries
  * MEM_RESERVE | MEM_WRITE_WATCH first and falls back to plain MEM_RESERVE.
  * Sets *ww_out = 1 iff write-watch tracking is active on the reservation.
- * afw_os_ww_get queries dirty pages in [addr, addr + len) (if reset != 0, passes
- * WRITE_WATCH_FLAG_RESET atomically BEFORE caller zeroes pages). Returns 0 on
- * success, -1 on any OS failure or unsupported platform.
+ * afw_os_ww_get queries dirty pages in [addr, addr + len) (src/vma.c passes
+ * reset = 0 so dirty bits on accessible pages are never cleared; if reset != 0,
+ * passes WRITE_WATCH_FLAG_RESET). Returns 0 on success, -1 on any OS failure
+ * or unsupported platform.
  * afw_os_ww_reset clears write-watch state on freshly committed [addr, addr + len)
  * MEM_COMMIT pages under g_lock (never on MEM_RESERVE, never after memset on
  * accessible pages). Returns 0 on success, -1 on failure. */
