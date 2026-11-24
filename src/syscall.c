@@ -390,7 +390,7 @@ static void probe_log_clone(const int64_t *a) {
     if (newtls && (newtls & 7ULL) == 0) {
         const uint64_t *tls = (const uint64_t *)(uintptr_t)newtls;
         size_t max_q = (4096ULL - (newtls & 4095ULL)) / 8ULL;
-        if (max_q > 11) max_q = 11;
+        if (max_q > 10) max_q = 10; /* sizeof(bionic_tcb) == 0x50 (10 slots: 0x00..0x48) */
         printf("[probe]   newtls slots[0..%zu]:\n", max_q ? max_q - 1 : 0);
         for (i = 0; i < max_q; i++)
             printf("[probe]     fs:[0x%02zx] = 0x%016llx\n", i * 8, (unsigned long long)tls[i]);
