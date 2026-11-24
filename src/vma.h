@@ -107,8 +107,8 @@ int64_t afw_vma_alloc_empty_filemap(uint64_t logical_len, int prot);
 /*
  * Query the contiguous mapped+committed RW VMA stack extent containing sp - 1
  * (for SYS_clone NT_TIB StackBase / StackLimit / DeallocationStack setup).
- * Returns 0 on success (requiring at least 4KB of committed RW stack below sp),
- * or -1 if sp is not inside a valid anonymous RW VMA extent.
+ * Returns 0 on success (requiring at least 4KB of committed RW stack below sp
+ * and at least 16 bytes [sp, sp + 16) inside the RW extent), or -1 otherwise.
  */
 int afw_vma_stack_bounds(uint64_t sp, uint64_t *stack_base_out,
                          uint64_t *stack_limit_out, uint64_t *dealloc_stack_out);

@@ -152,6 +152,31 @@ static void *pc_consumer(void *p) {
     return NULL;
 }
 
+/* Helper for T5 pthread_cond_timedwait (signaled wakeup before deadline) */
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    int ready;
+    int go;
+} timedwait_ctx;
+
+static void *timedwait_signaler(void *p) {
+    timedwait_ctx *tc = (timedwait_ctx *)p;
+    pthread_mutex_lock(&tc->mu);
+    tc->go = 1;
+    pthread_cond_signal(&tc->cv);
+    pthread_mutex_unlock(&tc->mu);
+    return NULL;
+}
+
+static void add_ms(struct timespec *ts, long ms) {
+    ts->tv_nsec += ms * 1000000L;
+    while (ts->tv_nsec >= 1000000000L) {
+        ts->tv_sec += 1;
+        ts->tv_nsec -= 1000000000L;
+    }
+}
+
 /* ---- Test 6: pthread_rwlock + pthread_once + pthread_key_t ---- */
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 static _Atomic int g_once_runs;
@@ -340,7 +365,73 @@ int main(void) {
         }
         CHECK(pthread_join(cth, NULL) == 0, "T5 pc join");
         CHECK(g_pc_sum == want_sum, "T5 pc sum=%d want %d", g_pc_sum, want_sum);
-        printf("[pthread_mt] T5 (cond broadcast=4, prod/cons sum=%d): ok\n", g_pc_sum);
+
+        /* T5c: pthread_cond_timedwait on CLOCK_REALTIME (timeout + signaled wakeup) */
+        {
+            timedwait_ctx tc;
+            pthread_t sth;
+            struct timespec dl;
+            int r_to, r_sig = 0;
+
+            memset(&tc, 0, sizeof tc);
+            CHECK(pthread_mutex_init(&tc.mu, NULL) == 0, "T5 rt mu init");
+            CHECK(pthread_cond_init(&tc.cv, NULL) == 0, "T5 rt cv init");
+
+            pthread_mutex_lock(&tc.mu);
+            CHECK(clock_gettime(CLOCK_REALTIME, &dl) == 0, "T5 rt clock_gettime");
+            add_ms(&dl, 10);
+            r_to = pthread_cond_timedwait(&tc.cv, &tc.mu, &dl);
+            CHECK(r_to == ETIMEDOUT, "T5 rt timedwait timeout rc=%d want %d", r_to, ETIMEDOUT);
+
+            /* Hold tc.mu while spawning signaler so signaler cannot run before timedwait sleeps */
+            CHECK(clock_gettime(CLOCK_REALTIME, &dl) == 0, "T5 rt clock_gettime 2");
+            add_ms(&dl, 5000);
+            CHECK(pthread_create(&sth, NULL, timedwait_signaler, &tc) == 0, "T5 rt signaler create");
+            while (!tc.go && r_sig == 0)
+                r_sig = pthread_cond_timedwait(&tc.cv, &tc.mu, &dl);
+            pthread_mutex_unlock(&tc.mu);
+            CHECK(pthread_join(sth, NULL) == 0, "T5 rt signaler join");
+            CHECK(r_sig == 0 && tc.go == 1, "T5 rt timedwait signaled rc=%d go=%d", r_sig, tc.go);
+
+            pthread_cond_destroy(&tc.cv);
+            pthread_mutex_destroy(&tc.mu);
+        }
+
+        /* T5d: pthread_cond_timedwait on CLOCK_MONOTONIC (timeout + signaled wakeup) */
+        {
+            timedwait_ctx tc;
+            pthread_condattr_t ca;
+            pthread_t sth;
+            struct timespec dl;
+            int r_to, r_sig = 0;
+
+            memset(&tc, 0, sizeof tc);
+            CHECK(pthread_mutex_init(&tc.mu, NULL) == 0, "T5 mono mu init");
+            CHECK(pthread_condattr_init(&ca) == 0, "T5 mono condattr init");
+            CHECK(pthread_condattr_setclock(&ca, CLOCK_MONOTONIC) == 0, "T5 mono setclock");
+            CHECK(pthread_cond_init(&tc.cv, &ca) == 0, "T5 mono cv init");
+            pthread_condattr_destroy(&ca);
+
+            pthread_mutex_lock(&tc.mu);
+            CHECK(clock_gettime(CLOCK_MONOTONIC, &dl) == 0, "T5 mono clock_gettime");
+            add_ms(&dl, 10);
+            r_to = pthread_cond_timedwait(&tc.cv, &tc.mu, &dl);
+            CHECK(r_to == ETIMEDOUT, "T5 mono timedwait timeout rc=%d want %d", r_to, ETIMEDOUT);
+
+            CHECK(clock_gettime(CLOCK_MONOTONIC, &dl) == 0, "T5 mono clock_gettime 2");
+            add_ms(&dl, 5000);
+            CHECK(pthread_create(&sth, NULL, timedwait_signaler, &tc) == 0, "T5 mono signaler create");
+            while (!tc.go && r_sig == 0)
+                r_sig = pthread_cond_timedwait(&tc.cv, &tc.mu, &dl);
+            pthread_mutex_unlock(&tc.mu);
+            CHECK(pthread_join(sth, NULL) == 0, "T5 mono signaler join");
+            CHECK(r_sig == 0 && tc.go == 1, "T5 mono timedwait signaled rc=%d go=%d", r_sig, tc.go);
+
+            pthread_cond_destroy(&tc.cv);
+            pthread_mutex_destroy(&tc.mu);
+        }
+
+        printf("[pthread_mt] T5 (cond broadcast=4, prod/cons sum=%d, timedwait RT+MONO): ok\n", g_pc_sum);
         fflush(stdout);
     }
 

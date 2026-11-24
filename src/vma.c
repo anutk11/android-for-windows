@@ -1184,7 +1184,7 @@ int afw_vma_stack_bounds(uint64_t sp, uint64_t *stack_base_out,
     while (hi + 1 < w->next && is_rw_committed(w->ext[hi + 1].state)) hi++;
     lim = w->ext[lo].start;
     top = w->ext[hi].end;
-    if (sp <= lim || sp - lim < PG) {
+    if (sp <= lim || sp - lim < PG || sp >= top || top - sp < 16) {
         UNLOCK();
         return -1;
     }

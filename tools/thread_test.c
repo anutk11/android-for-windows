@@ -29,6 +29,7 @@ static int g_pass, g_fail;
 
 static void dummy_init_static(uintptr_t *tp) { (void)tp; }
 static int  dummy_attach_ext(uintptr_t *tp)  { (void)tp; return 0; }
+static void dummy_detach_ext(void)           {}
 static uint64_t dummy_tp_off(void)           { return 16; }
 
 int main(void) {
@@ -59,6 +60,13 @@ int main(void) {
     CHECK(sb == map_addr + 9 * 4096, "stack_base=0x%llx want 0x%llx", (unsigned long long)sb, (unsigned long long)(map_addr + 9 * 4096));
     CHECK(ds == map_addr, "dealloc_stack=0x%llx want 0x%llx", (unsigned long long)ds, (unsigned long long)map_addr);
 
+    /* Exact upper boundary of RW extent: top = map_addr + 9 * 4096 (Reviewer 2) */
+    CHECK(afw_vma_stack_bounds(map_addr + 9 * 4096, &sb, &sl, &ds) == -1, "sp == top must fail");
+    CHECK(afw_vma_stack_bounds(map_addr + 9 * 4096 - 8, &sb, &sl, &ds) == -1, "sp == top - 8 must fail");
+    sb = sl = ds = 0;
+    CHECK(afw_vma_stack_bounds(map_addr + 9 * 4096 - 16, &sb, &sl, &ds) == 0, "sp == top - 16 (aligned) must succeed");
+    CHECK(sl == map_addr + 4096 && sb == map_addr + 9 * 4096 && ds == map_addr, "sp == top - 16 bounds exact");
+
     CHECK(afw_vma_stack_bounds(map_addr + 4096, &sb, &sl, &ds) == -1, "sp at bottom guard edge must fail");
     CHECK(afw_vma_stack_bounds(map_addr + 4096 + 2048, &sb, &sl, &ds) == -1, "sp with <4KB headroom must fail");
     CHECK(afw_vma_stack_bounds(map_addr + 9 * 4096 + 16, &sb, &sl, &ds) == -1, "sp in top guard must fail");
@@ -83,7 +91,7 @@ int main(void) {
     }
 
     /* 4. SYS_clone negative validation tests */
-    afw_thread_set_tls_ops(dummy_init_static, dummy_attach_ext, dummy_tp_off);
+    afw_thread_set_tls_ops(dummy_init_static, dummy_attach_ext, dummy_detach_ext, dummy_tp_off);
     CHECK(afw_sys_clone(bionic_flags, stack_top, stack_top, stack_top, stack_top + 64, NULL) == -LNX_ENOSYS,
           "NULL regs -> -ENOSYS");
     /* fork-like flags (missing CLONE_VM | CLONE_THREAD) -> -ENOSYS */
@@ -99,6 +107,8 @@ int main(void) {
           "misaligned child_stack -> -EINVAL");
     CHECK(afw_sys_clone(bionic_flags, map_addr + 16, stack_top, stack_top, stack_top + 64, &fake_regs) == -LNX_EINVAL,
           "guard-page child_stack -> -EINVAL");
+    CHECK(afw_sys_clone(bionic_flags, map_addr + 9 * 4096, stack_top, stack_top, stack_top + 64, &fake_regs) == -LNX_EINVAL,
+          "child_stack == top (at top guard edge) -> -EINVAL");
     /* Bad ptid / ctid */
     CHECK(afw_sys_clone(bionic_flags, stack_top, 0, stack_top, stack_top + 64, &fake_regs) == -LNX_EFAULT,
           "NULL ptid with PARENT_SETTID -> -EFAULT");
@@ -106,6 +116,8 @@ int main(void) {
           "misaligned ptid -> -EINVAL");
     CHECK(afw_sys_clone(bionic_flags, stack_top, map_addr, stack_top, stack_top + 64, &fake_regs) == -LNX_EFAULT,
           "guard-page ptid -> -EFAULT");
+    CHECK(afw_sys_clone(bionic_flags | LNX_CLONE_CHILD_SETTID, stack_top, stack_top, 0, stack_top + 64, &fake_regs) == -LNX_EFAULT,
+          "NULL ctid with CHILD_SETTID -> -EFAULT");
     CHECK(afw_sys_clone(bionic_flags, stack_top, stack_top, stack_top + 2, stack_top + 64, &fake_regs) == -LNX_EINVAL,
           "misaligned ctid -> -EINVAL");
     CHECK(afw_sys_clone(bionic_flags, stack_top, stack_top, map_addr, stack_top + 64, &fake_regs) == -LNX_EFAULT,

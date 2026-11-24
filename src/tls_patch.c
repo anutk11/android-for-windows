@@ -154,6 +154,7 @@ int afw_tls_init(void) {
         g_ready = 1;
         afw_thread_set_tls_ops(afw_tls_static_init_external,
                                afw_tls_thread_attach_external,
+                               afw_tls_thread_detach_external,
                                afw_tls_static_tp_off);
     }
     return afw_tls_thread_init();
@@ -202,6 +203,14 @@ int afw_tls_thread_attach_external(uintptr_t *tp) {
     return 0;
 }
 
+void afw_tls_thread_detach_external(void) {
+    if (g_ready)
+        TlsSetValue(g_slot[TLS_SLOT_SELF], NULL);
+    t_block = NULL;
+    t_alloc = NULL;
+    t_area = NULL;
+}
+
 /* What the CPU-visible copy of slot i holds right now (tests). */
 uintptr_t afw_tls_published_slot(int i) { return (uintptr_t)TlsGetValue(g_slot[i]); }
 static uintptr_t thread_id(void) { return (uintptr_t)GetCurrentThreadId(); }
@@ -230,6 +239,11 @@ int afw_tls_thread_attach_external(uintptr_t *tp) {
     t_area = NULL;
     return 0;
 }
+void afw_tls_thread_detach_external(void) {
+    t_block = NULL;
+    t_alloc = NULL;
+    t_area = NULL;
+}
 uintptr_t afw_tls_published_slot(int i) { return t_block ? t_block[i] : 0; }   /* fs: is native here */
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -241,6 +255,7 @@ int afw_tls_init(void) {   /* the key once; the thread's block until it succeeds
         g_key_ready = 1;
         afw_thread_set_tls_ops(afw_tls_static_init_external,
                                afw_tls_thread_attach_external,
+                               afw_tls_thread_detach_external,
                                afw_tls_static_tp_off);
     }
     return afw_tls_thread_init();

@@ -41,9 +41,11 @@ typedef struct {
  * test binaries linking syscall.c + thread.c do not need to link bionic_shim.c. */
 typedef void     (*afw_tls_init_static_fn)(uintptr_t *tp);
 typedef int      (*afw_tls_attach_ext_fn)(uintptr_t *tp);
+typedef void     (*afw_tls_detach_ext_fn)(void);
 typedef uint64_t (*afw_tls_tp_off_fn)(void);
 void afw_thread_set_tls_ops(afw_tls_init_static_fn init_static,
                             afw_tls_attach_ext_fn attach_ext,
+                            afw_tls_detach_ext_fn detach_ext,
                             afw_tls_tp_off_fn tp_off);
 
 /* SYS_clone(56) and SYS_set_tid_address(218) implementations. */

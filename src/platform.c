@@ -886,6 +886,9 @@ __asm__(
     "mov %rax, %gs:0x10\n\t"           /* bionic_stack_limit */
     "mov 0x30(%rcx), %rax\n\t"
     "mov %rax, %gs:0x1478\n\t"         /* bionic_dealloc_stack */
+    /* Note: volatile registers (rdi/rsi/rdx/r8/r9/r10) are not restored in the
+     * child — matches Android 14 __bionic_clone, which tests rax == 0 and
+     * immediately pops fn/arg into rdi/rsi from child_stack. */
     "cld\n\t"
     "mov 0x40(%rcx), %r11\n\t"         /* child_rip (stub_ret) */
     "mov 0x48(%rcx), %rbx\n\t"

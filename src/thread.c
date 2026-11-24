@@ -54,26 +54,29 @@ static _Thread_local afw_thread_ctx *t_ctx;
 
 static afw_tls_init_static_fn g_tls_init_static;
 static afw_tls_attach_ext_fn  g_tls_attach_ext;
+static afw_tls_detach_ext_fn  g_tls_detach_ext;
 static afw_tls_tp_off_fn      g_tls_tp_off;
 
 void afw_thread_set_tls_ops(afw_tls_init_static_fn init_static,
                             afw_tls_attach_ext_fn attach_ext,
+                            afw_tls_detach_ext_fn detach_ext,
                             afw_tls_tp_off_fn tp_off) {
     g_tls_init_static = init_static;
     g_tls_attach_ext = attach_ext;
+    g_tls_detach_ext = detach_ext;
     g_tls_tp_off = tp_off;
 }
 
 /* One-shot atomic clear_child_tid + futex wake (G2-PLAN.md Section 3.4b).
- * On abnormal exit (in_fls != 0, inside LdrShutdownThread), checks VMA
- * writability before writing so already-unmapped memory cannot fault. */
-static void thread_clear_tid_once(afw_thread_ctx *ctx, int in_fls) {
+ * Unconditionally checks VMA writability before writing (matching Linux
+ * put_user(0, ctid) ignoring -EFAULT on both SYS_exit and abnormal FLS exit). */
+static void thread_clear_tid_once(afw_thread_ctx *ctx) {
     uintptr_t addr;
     if (!ctx) return;
     if (afw_os_atomic_xchg_i32(&ctx->clear_tid_done, 1) != 0) return;
     addr = afw_os_atomic_xchg_uptr(&ctx->clear_child_tid_addr, 0);
     if (!addr) return;
-    if (in_fls && !afw_vma_is_writable((uint64_t)addr, 4)) return;
+    if (!afw_vma_is_writable((uint64_t)addr, 4)) return;
     /* seq_cst zero write strictly happens-before WakeByAddressAll. */
     afw_os_atomic_store_i32((void *)addr, 0);
     afw_os_wake_address_all((void *)addr);
@@ -84,7 +87,8 @@ static void thread_clear_tid_once(afw_thread_ctx *ctx, int in_fls) {
 static void ctx_fls_release(void *p) {
     afw_thread_ctx *ctx = (afw_thread_ctx *)p;
     if (!ctx) return;
-    thread_clear_tid_once(ctx, 1);
+    if (g_tls_detach_ext) g_tls_detach_ext();
+    thread_clear_tid_once(ctx);
     t_ctx = NULL;
     free(ctx);
 }
@@ -101,9 +105,12 @@ static void finish_exit_on_host(void *p, int exit_code) {
         ctx->pending_unmap_len = 0;
         (void)afw_munmap(a, n);
     }
+    /* Clear t_block and TEB TLS_SLOT_SELF before waking pthread_join so no
+     * dangling pointer to Bionic's newtls survives into LdrShutdownThread. */
+    if (g_tls_detach_ext) g_tls_detach_ext();
     /* Only now — after all Bionic memory touches are done — clear tid and wake
      * pthread_join so the joining thread may safely munmap stack + newtls. */
-    thread_clear_tid_once(ctx, 0);
+    thread_clear_tid_once(ctx);
     afw_os_exit_thread(exit_code);
 }
 
@@ -185,6 +192,7 @@ int64_t afw_sys_clone(uint64_t flags, uint64_t child_stack,
         if ((ptid & 3ULL) != 0) return -LNX_EINVAL;
         if (!afw_vma_is_writable(ptid, 4)) return -LNX_EFAULT;
     }
+    if ((flags & LNX_CLONE_CHILD_SETTID) && ctid == 0) return -LNX_EFAULT;
     if (flags & (LNX_CLONE_CHILD_CLEARTID | LNX_CLONE_CHILD_SETTID)) {
         if (ctid != 0 && (ctid & 3ULL) != 0) return -LNX_EINVAL;
         if (ctid != 0 && !afw_vma_is_writable(ctid, 4)) return -LNX_EFAULT;
