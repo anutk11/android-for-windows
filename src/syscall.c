@@ -7,8 +7,10 @@
 #include "syscall.h"
 #include "fd.h"
 #include "platform.h"
+#include "thread.h"
 #include "vma.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,12 +39,24 @@
 long afw_syscall_counts[AFW_MAX_SYSCALL];
 static long g_unimplemented[AFW_MAX_SYSCALL];
 
+_Static_assert(offsetof(afw_syscall_frame, rbx)        == 0,   "frame.rbx");
+_Static_assert(offsetof(afw_syscall_frame, r12)        == 8,   "frame.r12");
+_Static_assert(offsetof(afw_syscall_frame, r13)        == 16,  "frame.r13");
+_Static_assert(offsetof(afw_syscall_frame, r14)        == 24,  "frame.r14");
+_Static_assert(offsetof(afw_syscall_frame, r15)        == 32,  "frame.r15");
+_Static_assert(offsetof(afw_syscall_frame, args)       == 40,  "frame.args");
+_Static_assert(offsetof(afw_syscall_frame, caller_rbp) == 88,  "frame.caller_rbp");
+_Static_assert(offsetof(afw_syscall_frame, rflags)     == 96,  "frame.rflags");
+_Static_assert(offsetof(afw_syscall_frame, rip)        == 104, "frame.rip");
+
 /*
  * Stack frame built by the entry (offsets from rbp):
- *   rbp+16   return address into the patched wrapper
+ *   rbp+16   return address into the patched wrapper (frame.rip)
  *   rbp+8    the caller's RFLAGS (restored on return, like sysret)
+ *   rbp+0    the caller's RBP (frame.caller_rbp)
  *   rbp-48   args[6] = rdi, rsi, rdx, r10, r8, r9
- *   rbp-304  xmm0..xmm15 (16 x 16 bytes)
+ *   rbp-88   callee-saved = rbx, r12, r13, r14, r15 (for SYS_clone)
+ *   rbp-344  xmm0..xmm15 (16 x 16 bytes)
  * then rsp is aligned to 16 and 32 bytes of shadow space are reserved
  * (required by the Windows ABI, harmless elsewhere).
  */
@@ -50,9 +64,9 @@ static long g_unimplemented[AFW_MAX_SYSCALL];
  * int since 5.13 ("x86/entry: Use int everywhere for system call numbers"),
  * so 0x100000001 is write(), as here (checked for reviewer 4, #8). */
 #if defined(_WIN32)
-#  define DISPATCH_ARGS "mov %eax, %ecx\n\t lea -48(%rbp), %rdx\n\t"
+#  define DISPATCH_ARGS "mov %eax, %ecx\n\t lea -88(%rbp), %rdx\n\t"
 #else
-#  define DISPATCH_ARGS "mov %eax, %edi\n\t lea -48(%rbp), %rsi\n\t"
+#  define DISPATCH_ARGS "mov %eax, %edi\n\t lea -88(%rbp), %rsi\n\t"
 #endif
 
 __attribute__((naked)) void afw_syscall_entry(void) {
@@ -60,49 +74,54 @@ __attribute__((naked)) void afw_syscall_entry(void) {
         "pushfq\n\t"                 /* Linux returns from syscall with the caller's RFLAGS (reviewer 4) */
         "push %rbp\n\t"
         "mov %rsp, %rbp\n\t"
-        "sub $304, %rsp\n\t"
+        "sub $352, %rsp\n\t"
         "mov %rdi, -48(%rbp)\n\t"
         "mov %rsi, -40(%rbp)\n\t"
         "mov %rdx, -32(%rbp)\n\t"
         "mov %r10, -24(%rbp)\n\t"
         "mov %r8,  -16(%rbp)\n\t"
         "mov %r9,   -8(%rbp)\n\t"
-        "movdqu %xmm0,  -304(%rbp)\n\t"
-        "movdqu %xmm1,  -288(%rbp)\n\t"
-        "movdqu %xmm2,  -272(%rbp)\n\t"
-        "movdqu %xmm3,  -256(%rbp)\n\t"
-        "movdqu %xmm4,  -240(%rbp)\n\t"
-        "movdqu %xmm5,  -224(%rbp)\n\t"
-        "movdqu %xmm6,  -208(%rbp)\n\t"
-        "movdqu %xmm7,  -192(%rbp)\n\t"
-        "movdqu %xmm8,  -176(%rbp)\n\t"
-        "movdqu %xmm9,  -160(%rbp)\n\t"
-        "movdqu %xmm10, -144(%rbp)\n\t"
-        "movdqu %xmm11, -128(%rbp)\n\t"
-        "movdqu %xmm12, -112(%rbp)\n\t"
-        "movdqu %xmm13,  -96(%rbp)\n\t"
-        "movdqu %xmm14,  -80(%rbp)\n\t"
-        "movdqu %xmm15,  -64(%rbp)\n\t"
+        "mov %rbx, -88(%rbp)\n\t"
+        "mov %r12, -80(%rbp)\n\t"
+        "mov %r13, -72(%rbp)\n\t"
+        "mov %r14, -64(%rbp)\n\t"
+        "mov %r15, -56(%rbp)\n\t"
+        "movdqu %xmm0,  -344(%rbp)\n\t"
+        "movdqu %xmm1,  -328(%rbp)\n\t"
+        "movdqu %xmm2,  -312(%rbp)\n\t"
+        "movdqu %xmm3,  -296(%rbp)\n\t"
+        "movdqu %xmm4,  -280(%rbp)\n\t"
+        "movdqu %xmm5,  -264(%rbp)\n\t"
+        "movdqu %xmm6,  -248(%rbp)\n\t"
+        "movdqu %xmm7,  -232(%rbp)\n\t"
+        "movdqu %xmm8,  -216(%rbp)\n\t"
+        "movdqu %xmm9,  -200(%rbp)\n\t"
+        "movdqu %xmm10, -184(%rbp)\n\t"
+        "movdqu %xmm11, -168(%rbp)\n\t"
+        "movdqu %xmm12, -152(%rbp)\n\t"
+        "movdqu %xmm13, -136(%rbp)\n\t"
+        "movdqu %xmm14, -120(%rbp)\n\t"
+        "movdqu %xmm15, -104(%rbp)\n\t"
         "and $-16, %rsp\n\t"
         "sub $32, %rsp\n\t"
         DISPATCH_ARGS
         "call afw_syscall_from_entry\n\t"
-        "movdqu -304(%rbp), %xmm0\n\t"
-        "movdqu -288(%rbp), %xmm1\n\t"
-        "movdqu -272(%rbp), %xmm2\n\t"
-        "movdqu -256(%rbp), %xmm3\n\t"
-        "movdqu -240(%rbp), %xmm4\n\t"
-        "movdqu -224(%rbp), %xmm5\n\t"
-        "movdqu -208(%rbp), %xmm6\n\t"
-        "movdqu -192(%rbp), %xmm7\n\t"
-        "movdqu -176(%rbp), %xmm8\n\t"
-        "movdqu -160(%rbp), %xmm9\n\t"
-        "movdqu -144(%rbp), %xmm10\n\t"
-        "movdqu -128(%rbp), %xmm11\n\t"
-        "movdqu -112(%rbp), %xmm12\n\t"
-        "movdqu  -96(%rbp), %xmm13\n\t"
-        "movdqu  -80(%rbp), %xmm14\n\t"
-        "movdqu  -64(%rbp), %xmm15\n\t"
+        "movdqu -344(%rbp), %xmm0\n\t"
+        "movdqu -328(%rbp), %xmm1\n\t"
+        "movdqu -312(%rbp), %xmm2\n\t"
+        "movdqu -296(%rbp), %xmm3\n\t"
+        "movdqu -280(%rbp), %xmm4\n\t"
+        "movdqu -264(%rbp), %xmm5\n\t"
+        "movdqu -248(%rbp), %xmm6\n\t"
+        "movdqu -232(%rbp), %xmm7\n\t"
+        "movdqu -216(%rbp), %xmm8\n\t"
+        "movdqu -200(%rbp), %xmm9\n\t"
+        "movdqu -184(%rbp), %xmm10\n\t"
+        "movdqu -168(%rbp), %xmm11\n\t"
+        "movdqu -152(%rbp), %xmm12\n\t"
+        "movdqu -136(%rbp), %xmm13\n\t"
+        "movdqu -120(%rbp), %xmm14\n\t"
+        "movdqu -104(%rbp), %xmm15\n\t"
         "mov -48(%rbp), %rdi\n\t"
         "mov -40(%rbp), %rsi\n\t"
         "mov -32(%rbp), %rdx\n\t"
@@ -214,6 +233,9 @@ static int64_t sys_futex(int64_t uaddr, int64_t op_full, int64_t val, int64_t ts
         if ((uint32_t)val3 == 0) return -LNX_EINVAL;
         return -LNX_ENOSYS;      /* partial bitsets: not used by bionic; refused loudly */
     }
+    /* Match Linux kernel: FUTEX_CLOCK_REALTIME is allowed on FUTEX_WAIT_BITSET,
+     * never on plain FUTEX_WAIT (G2-PLAN.md Section 3.5). */
+    if (op == FUTEX_WAIT && (op_full & FUTEX_CLOCK_REALTIME)) return -LNX_ENOSYS;
 #if defined(_WIN32)
     if (op == FUTEX_WAIT || op == FUTEX_WAIT_BITSET) {
         int32_t expect = (int32_t)val;
@@ -275,6 +297,12 @@ static int64_t sys_getpid(void) {
  * rt_sigprocmask(SIG_SETMASK, ..., sigsetsize=8) around thread setup. */
 static _Thread_local uint64_t t_sigmask;
 
+uint64_t afw_syscall_get_sigmask(void) { return t_sigmask; }
+void afw_syscall_set_sigmask(uint64_t mask) {
+    const uint64_t unmaskable = (1ULL << (9 - 1)) | (1ULL << (19 - 1));
+    t_sigmask = mask & ~unmaskable;
+}
+
 static int64_t sys_rt_sigprocmask(int how, const void *set, void *oldset, uint64_t sigsetsize) {
     uint64_t prev = t_sigmask;
     if (sigsetsize != 8) return -LNX_EINVAL;
@@ -294,20 +322,32 @@ static int64_t sys_rt_sigprocmask(int how, const void *set, void *oldset, uint64
     return 0;
 }
 
-/* The last syscall the process made (diagnosis: the watchdog). The
- * entry frame holds the return address into the patched wrapper at
- * rbp+16, 64 bytes above args (rbp-48). Only set when called through the
- * entry (afw_syscall_entry_frame), never from tests calling dispatch. */
+static int64_t dispatch_ex(int64_t nr, int64_t *a, const afw_clone_regs *regs, uintptr_t cur_sp);
+
+/* The last syscall the process made (diagnosis: the watchdog). Only set when
+ * called through afw_syscall_entry, never from tests calling dispatch. */
 volatile int64_t afw_last_syscall_nr = -1;
 volatile int64_t afw_last_syscall_args[6];
 volatile uint64_t afw_last_syscall_ret;
 
-int64_t afw_syscall_from_entry(int64_t nr, int64_t *a) {
+int64_t afw_syscall_from_entry(int64_t nr, afw_syscall_frame *f) {
     int i;
+    afw_clone_regs regs;
     afw_last_syscall_nr = nr;
-    for (i = 0; i < 6; i++) afw_last_syscall_args[i] = a[i];
-    afw_last_syscall_ret = ((uint64_t *)a)[8];
-    return afw_syscall_dispatch(nr, a);
+    for (i = 0; i < 6; i++) afw_last_syscall_args[i] = f->args[i];
+    afw_last_syscall_ret = f->rip;
+    if (nr == 56) {
+        regs.rip    = f->rip;
+        regs.rbp    = f->caller_rbp;
+        regs.rflags = f->rflags;
+        regs.rbx    = f->rbx;
+        regs.r12    = f->r12;
+        regs.r13    = f->r13;
+        regs.r14    = f->r14;
+        regs.r15    = f->r15;
+        return dispatch_ex(nr, f->args, &regs, (uintptr_t)f);
+    }
+    return dispatch_ex(nr, f->args, NULL, (uintptr_t)f);
 }
 
 /* Opt-in G2-1 measurement logging (--probe-syscalls); off by default.
@@ -485,8 +525,16 @@ void afw_syscall_probe_summary(void) {
     fflush(stdout);
 }
 
-int64_t afw_syscall_dispatch(int64_t nr, int64_t *a) {
-    if (nr >= 0 && nr < AFW_MAX_SYSCALL) afw_syscall_counts[nr]++;
+static long atomic_inc_long(long *p) {
+#if defined(_WIN32)
+    return (long)InterlockedIncrement((volatile LONG *)p) - 1;
+#else
+    return __atomic_fetch_add(p, 1, __ATOMIC_RELAXED);
+#endif
+}
+
+static int64_t dispatch_ex(int64_t nr, int64_t *a, const afw_clone_regs *regs, uintptr_t cur_sp) {
+    if (nr >= 0 && nr < AFW_MAX_SYSCALL) (void)atomic_inc_long(&afw_syscall_counts[nr]);
     if (afw_syscall_probe_log) probe_log_syscall(nr, a);
     switch (nr) {
     case 0:   return afw_fd_read(a[0], (void *)(uintptr_t)a[1], (uint64_t)a[2]);
@@ -500,9 +548,12 @@ int64_t afw_syscall_dispatch(int64_t nr, int64_t *a) {
     case 19:  return afw_fd_readv(a[0], (const uint64_t *)(uintptr_t)a[1], a[2]);
     case 20:  return afw_fd_writev(a[0], (const uint64_t *)(uintptr_t)a[1], a[2]);
     case 39:  return sys_getpid();
+    case 56:  return afw_sys_clone((uint64_t)a[0], (uint64_t)a[1], (uint64_t)a[2],
+                                   (uint64_t)a[3], (uint64_t)a[4], regs);
     case 72:  return afw_fd_fcntl(a[0], a[1], a[2]);
     case 87:  return afw_fd_unlinkat(-100, (const char *)(uintptr_t)a[0], 0);
     case 202: return sys_futex(a[0], a[1], a[2], a[3], a[4], a[5]);
+    case 218: return afw_sys_set_tid_address((uint64_t)a[0]);
     case 228: return sys_clock_gettime(a[0], (struct lnx_timespec *)(uintptr_t)a[1]);
     case 257: return afw_fd_openat(a[0], (const char *)(uintptr_t)a[1], a[2], (uint64_t)a[3]);
     case 262: return afw_fd_newfstatat(a[0], (const char *)(uintptr_t)a[1], (void *)(uintptr_t)a[2], a[3]);
@@ -513,7 +564,12 @@ int64_t afw_syscall_dispatch(int64_t nr, int64_t *a) {
     case 186: return sys_gettid();
     case 9:   return afw_mmap((uint64_t)a[0], (uint64_t)a[1], (int)a[2], (int)a[3], (int)a[4], a[5]);
     case 10:  return afw_mprotect((uint64_t)a[0], (uint64_t)a[1], (int)a[2]);
-    case 11:  return afw_munmap((uint64_t)a[0], (uint64_t)a[1]);
+    case 11: {
+        int64_t rc = 0;
+        if (afw_thread_try_defer_self_unmap((uint64_t)a[0], (uint64_t)a[1], cur_sp, &rc))
+            return rc;
+        return afw_munmap((uint64_t)a[0], (uint64_t)a[1]);
+    }
     case 14:  return sys_rt_sigprocmask((int)a[0], (const void *)(uintptr_t)a[1],
                                         (void *)(uintptr_t)a[2], (uint64_t)a[3]);
     case 28:  return afw_madvise((uint64_t)a[0], (uint64_t)a[1], (int)a[2]);
@@ -522,6 +578,8 @@ int64_t afw_syscall_dispatch(int64_t nr, int64_t *a) {
         if (a[0] == 0x53564d41) return 0;  /* PR_SET_VMA (naming an area): accepted */
         return -22;
     case 60:  /* exit: ends only the calling thread */
+        if (afw_thread_is_cloned())
+            afw_thread_exit((int)a[0]);
         afw_syscall_probe_summary();
         fflush(stdout);
 #if defined(_WIN32)
@@ -538,10 +596,14 @@ int64_t afw_syscall_dispatch(int64_t nr, int64_t *a) {
         exit((int)a[0]);
 #endif
     default:
-        if (nr >= 0 && nr < AFW_MAX_SYSCALL && g_unimplemented[nr]++ == 0)
+        if (nr >= 0 && nr < AFW_MAX_SYSCALL && atomic_inc_long(&g_unimplemented[nr]) == 0)
             fprintf(stderr, "[syscall] %lld not implemented, returning -ENOSYS\n", (long long)nr);
         return -LNX_ENOSYS;
     }
+}
+
+int64_t afw_syscall_dispatch(int64_t nr, int64_t *a) {
+    return dispatch_ex(nr, a, NULL, (uintptr_t)&nr);
 }
 
 void afw_syscall_report(void) {

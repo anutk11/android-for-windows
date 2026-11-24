@@ -1155,3 +1155,74 @@ int64_t afw_vma_alloc_empty_filemap(uint64_t logical_len, int prot) {
     UNLOCK();
     return (int64_t)base;
 }
+
+static int is_rw_committed(unsigned char st) {
+    const unsigned char need = P_MAPPED | P_COMMIT | LNX_PROT_READ | LNX_PROT_WRITE;
+    return (st & need) == need;
+}
+
+int afw_vma_stack_bounds(uint64_t sp, uint64_t *stack_base_out,
+                         uint64_t *stack_limit_out, uint64_t *dealloc_stack_out) {
+    winalloc *w;
+    size_t idx, lo, hi;
+    uint64_t lim, top;
+    if (sp < 16 || !stack_base_out || !stack_limit_out || !dealloc_stack_out) return -1;
+    LOCK();
+    w = find(sp - 1);
+    if (!w || w->kind != VMA_ANON || w->next == 0) {
+        UNLOCK();
+        return -1;
+    }
+    idx = find_ext(w, sp - 1);
+    if (idx >= w->next || !is_rw_committed(w->ext[idx].state)) {
+        UNLOCK();
+        return -1;
+    }
+    lo = idx;
+    while (lo > 0 && is_rw_committed(w->ext[lo - 1].state)) lo--;
+    hi = idx;
+    while (hi + 1 < w->next && is_rw_committed(w->ext[hi + 1].state)) hi++;
+    lim = w->ext[lo].start;
+    top = w->ext[hi].end;
+    if (sp <= lim || sp - lim < PG) {
+        UNLOCK();
+        return -1;
+    }
+    *stack_limit_out = lim;
+    *stack_base_out = top;
+    *dealloc_stack_out = w->base;
+    UNLOCK();
+    return 0;
+}
+
+int afw_vma_is_writable(uint64_t addr, uint64_t len) {
+    uint64_t cur, end;
+    size_t ai, ei;
+    if (len == 0 || addr > UINT64_MAX - len) return 0;
+    end = addr + len;
+    cur = addr;
+    LOCK();
+    ai = lower_bound_alloc(cur);
+    while (cur < end) {
+        winalloc *w;
+        if (ai >= g_n || g_a[ai].base > cur) {
+            UNLOCK();
+            return 0;
+        }
+        w = &g_a[ai];
+        ei = find_ext(w, cur);
+        while (ei < w->next && cur < end) {
+            unsigned char st = w->ext[ei].state;
+            if ((st & (P_MAPPED | P_COMMIT | LNX_PROT_WRITE)) !=
+                (P_MAPPED | P_COMMIT | LNX_PROT_WRITE)) {
+                UNLOCK();
+                return 0;
+            }
+            cur = w->ext[ei].end;
+            ei++;
+        }
+        ai++;
+    }
+    UNLOCK();
+    return 1;
+}

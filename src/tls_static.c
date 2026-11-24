@@ -58,6 +58,20 @@ int afw_tls_static_get_bionic_layout(afw_bionic_static_tls *out) {
     return 0;
 }
 
+uint64_t afw_tls_static_tp_off(void) {
+    return g_finished ? g_layout.tp_off : 0;
+}
+
+void afw_tls_static_init_external(uintptr_t *tp) {
+    unsigned char *tp_bytes = (unsigned char *)tp;
+    int m;
+    if (!g_finished || !tp_bytes) return;
+    for (m = 0; m < g_layout.nmod; m++) {
+        if (g_seg[m].p_filesz && g_image[m])
+            memcpy(tp_bytes - g_layout.off[m], g_image[m], (size_t)g_seg[m].p_filesz);
+    }
+}
+
 uintptr_t *afw_tls_static_alloc(void **out, unsigned char **area) {
     unsigned char *block, *tp;
     size_t total;

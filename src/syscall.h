@@ -31,12 +31,29 @@ int64_t afw_syscall_dispatch(int64_t nr, int64_t *args);
 extern long afw_syscall_counts[AFW_MAX_SYSCALL];
 void afw_syscall_report(void);
 
+/* Frame built by afw_syscall_entry at rbp - 88 (offsets verified by _Static_assert). */
+typedef struct {
+    uint64_t rbx;        /* +0   (rbp - 88) */
+    uint64_t r12;        /* +8   (rbp - 80) */
+    uint64_t r13;        /* +16  (rbp - 72) */
+    uint64_t r14;        /* +24  (rbp - 64) */
+    uint64_t r15;        /* +32  (rbp - 56) */
+    int64_t  args[6];    /* +40  (rbp - 48): rdi, rsi, rdx, r10, r8, r9 */
+    uint64_t caller_rbp; /* +88  (rbp + 0)  */
+    uint64_t rflags;     /* +96  (rbp + 8)  */
+    uint64_t rip;        /* +104 (rbp + 16) stub return address */
+} afw_syscall_frame;
+
 /* The last syscall made through the entry: number, arguments, and the
  * return address into the Android code that made it (diagnosis). */
 extern volatile int64_t afw_last_syscall_nr;
 extern volatile int64_t afw_last_syscall_args[6];
 extern volatile uint64_t afw_last_syscall_ret;
-int64_t afw_syscall_from_entry(int64_t nr, int64_t *args);
+int64_t afw_syscall_from_entry(int64_t nr, afw_syscall_frame *frame);
+
+/* Per-thread Linux signal mask (for SYS_rt_sigprocmask and clone inheritance). */
+uint64_t afw_syscall_get_sigmask(void);
+void     afw_syscall_set_sigmask(uint64_t mask);
 
 /* Opt-in G2-1 measurement logging (--probe-syscalls); 0 by default. */
 extern int afw_syscall_probe_log;

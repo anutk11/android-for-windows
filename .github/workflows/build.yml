@@ -67,6 +67,14 @@ jobs:
             -o out/g1_gate_exe test/g1_gate_exe.c
           "$TC/clang" --target=x86_64-linux-android34 -O2 -fPIE -pie -Wl,--pack-dyn-relocs=none \
             -o out/pthread_probe test/pthread_probe.c
+          "$TC/clang" --target=x86_64-linux-android34 -shared -fPIC -O2 \
+            -Wl,--pack-dyn-relocs=none -Wl,-soname,libpthread_tdata.so \
+            -o out/libpthread_tdata.so test/pthread_tdata_lib.c
+          echo "--- G2-4b PT_TLS check for libpthread_tdata.so (must have FileSiz > 0 and TPOFF64)"
+          "$TC/llvm-readelf" -lW out/libpthread_tdata.so | grep -E "TLS|Type"
+          "$TC/llvm-readelf" -rW out/libpthread_tdata.so | grep -E "TPOFF|DTP|TLS" || echo "  no TLS relocations"
+          "$TC/clang" --target=x86_64-linux-android34 -O2 -fPIE -pie -Wl,--pack-dyn-relocs=none \
+            -Lout -lpthread_tdata -o out/pthread_mt_test test/pthread_mt_test.c
           "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 -nostdlib -Wl,-soname,libdeps_base.so \
             -o out/libdeps_base.so test/deps_base.c
           "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 -nostdlib -Lout -ldeps_base \
@@ -104,6 +112,7 @@ jobs:
             out/hello_exe
             out/g1_gate_exe
             out/pthread_probe
+            out/pthread_mt_test
 
   # Gate G1 experiment: static scan of the real bionic libc.so.
   # The extracted Android files are NOT uploaded (licensing): only the report.
@@ -276,9 +285,11 @@ jobs:
           OUTBIN=out/afw-asan EXTRA_CFLAGS="-g -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined" bash tools/build_linux.sh
           OUTBIN=out/afw-asan-test EXTRA_CFLAGS="-g -DAFW_TEST -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined" bash tools/build_linux.sh
           cc -g -O1 -DAFW_TEST -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined -Wall -Wextra -pthread \
-             -o out/vma_test tools/vma_test.c src/vma.c src/filemap.c src/syscall.c src/fd.c src/platform.c
-          cc -g -O1 -DAFW_TEST -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined -Wall -Wextra \
-             -o out/filemap_test tools/filemap_test.c src/vma.c src/filemap.c src/syscall.c src/fd.c src/platform.c
+             -o out/vma_test tools/vma_test.c src/vma.c src/filemap.c src/syscall.c src/thread.c src/fd.c src/platform.c
+          cc -g -O1 -DAFW_TEST -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined -Wall -Wextra -pthread \
+             -o out/filemap_test tools/filemap_test.c src/vma.c src/filemap.c src/syscall.c src/thread.c src/fd.c src/platform.c
+          cc -g -O1 -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined -Wall -Wextra -pthread \
+             -o out/thread_test tools/thread_test.c src/vma.c src/filemap.c src/syscall.c src/thread.c src/fd.c src/platform.c
           cc -g -O1 -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined -Wall -Wextra \
              -o out/fd_test tools/fd_test.c src/fd.c src/platform.c
           cc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall -Wextra \
@@ -293,6 +304,7 @@ jobs:
           fi
           out/vma_test
           out/filemap_test
+          out/thread_test
           out/fd_test
           out/tls_layout_test
           out/afw-asan out/libhello.so
@@ -385,7 +397,7 @@ jobs:
           clang-cl /nologo /O2 /W3 /DAFW_TEST /D_CRT_SECURE_NO_WARNINGS -Wno-unused-function -Iout\zydis-amalg ^
               /Fe:out\afw-loader-test.exe /Foout\testobj\ ^
               src\main.c src\elf_loader.c src\bionic_shim.c src\platform.c src\tls_patch.c src\crash.c ^
-              src\patch.c src\syscall.c src\fd.c src\filemap.c src\funcs.c src\vma.c src\tls_layout.c src\tls_static.c src\loader_api.c src\exec.c out\Zydis.obj ^
+              src\patch.c src\syscall.c src\thread.c src\fd.c src\filemap.c src\funcs.c src\vma.c src\tls_layout.c src\tls_static.c src\loader_api.c src\exec.c out\Zydis.obj ^
               /link dbghelp.lib
           if errorlevel 1 exit /b 1
           out\afw-loader-test.exe out\libhello.so --finish-fail-late=tls:out\libtls_test.so
@@ -472,23 +484,30 @@ jobs:
         shell: cmd
         run: |
           if not exist out\vmaobj mkdir out\vmaobj
-          clang-cl /nologo /O2 /W3 /DAFW_TEST /D_CRT_SECURE_NO_WARNINGS /Fe:out\vma_test.exe /Foout\vmaobj\ tools\vma_test.c src\vma.c src\filemap.c src\syscall.c src\fd.c src\platform.c /link psapi.lib
+          clang-cl /nologo /O2 /W3 /DAFW_TEST /D_CRT_SECURE_NO_WARNINGS /Fe:out\vma_test.exe /Foout\vmaobj\ tools\vma_test.c src\vma.c src\filemap.c src\syscall.c src\thread.c src\fd.c src\platform.c /link psapi.lib
           if errorlevel 1 exit /b 1
           out\vma_test.exe
       - name: "G2-3 Measure: MADV_DONTNEED 1GB Working Set, Commit Charge & g_lock hold time (Windows)"
         shell: cmd
         run: |
           if not exist out\benchobj mkdir out\benchobj
-          clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Fe:out\g2_dontneed_bench.exe /Foout\benchobj\ tools\g2_dontneed_bench.c src\vma.c src\filemap.c src\syscall.c src\fd.c src\platform.c /link psapi.lib
+          clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Fe:out\g2_dontneed_bench.exe /Foout\benchobj\ tools\g2_dontneed_bench.c src\vma.c src\filemap.c src\syscall.c src\thread.c src\fd.c src\platform.c /link psapi.lib
           if errorlevel 1 exit /b 1
           out\g2_dontneed_bench.exe
       - name: "G2-2: Read-only file-backed mmap (MAP_SHARED/MAP_PRIVATE, 4KB delta, partial munmap) on Windows"
         shell: cmd
         run: |
           if not exist out\fmobj mkdir out\fmobj
-          clang-cl /nologo /O2 /W3 /DAFW_TEST /D_CRT_SECURE_NO_WARNINGS /Fe:out\filemap_test.exe /Foout\fmobj\ tools\filemap_test.c src\vma.c src\filemap.c src\syscall.c src\fd.c src\platform.c
+          clang-cl /nologo /O2 /W3 /DAFW_TEST /D_CRT_SECURE_NO_WARNINGS /Fe:out\filemap_test.exe /Foout\fmobj\ tools\filemap_test.c src\vma.c src\filemap.c src\syscall.c src\thread.c src\fd.c src\platform.c
           if errorlevel 1 exit /b 1
           out\filemap_test.exe
+      - name: "G2-4b Host Unit Tests: clone validation, stack bounds, sigprocmask, futex CLOCK_REALTIME"
+        shell: cmd
+        run: |
+          if not exist out\thobj mkdir out\thobj
+          clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Fe:out\thread_test.exe /Foout\thobj\ tools\thread_test.c src\vma.c src\filemap.c src\syscall.c src\thread.c src\fd.c src\platform.c
+          if errorlevel 1 exit /b 1
+          out\thread_test.exe
       - name: "C++ exceptions: every landing pad found, nothing unproven (static)"
         shell: cmd
         run: out\afw-loader.exe out\libcxx_exception_test.so --patch-report --strict --min-landing-pads=1
@@ -528,18 +547,17 @@ jobs:
         continue-on-error: true
         shell: cmd
         run: out\afw-loader.exe out\libc++_shared.so --patch-report
-      - name: "G2-4a Gate (Item 1a+1b): real bionic pthread_create reaching clone(56) -> ENOSYS (required)"
-        timeout-minutes: 2
+      - name: "G2-4b Gate: real bionic multi-threaded pthreads (joinable, detached, .tdata, mutex, cond, rwlock, sigmask) (required)"
+        timeout-minutes: 3
         shell: cmd
         run: |
-          set AFW_LIB_PATH=out\bionic
-          out\afw-loader.exe out\pthread_probe --with-deps --probe-syscalls --watchdog=60 --exec > out\g2-item1.txt 2>&1
+          set AFW_LIB_PATH=out\bionic;out
+          out\afw-loader.exe out\pthread_mt_test --with-deps --watchdog=60 --exec > out\g2-pthread-mt.txt 2>&1
           set rc=%errorlevel%
-          type out\g2-item1.txt
-          echo pthread_probe exit code %rc%
-          if not "%rc%"=="0" (echo pthread_probe exited %rc%, not 0 & exit /b 1)
-          findstr /c:"VERDICT Item 1a" out\g2-item1.txt | findstr /c:"PASS" >nul || (echo Item 1a did not PASS & exit /b 1)
-          findstr /c:"VERDICT Item 1b" out\g2-item1.txt | findstr /c:"PASS" >nul || (echo Item 1b did not PASS & exit /b 1)
+          type out\g2-pthread-mt.txt
+          echo pthread_mt_test exit code %rc%
+          if not "%rc%"=="0" (echo pthread_mt_test exited %rc%, not 0 & exit /b 1)
+          findstr /c:"PTHREAD MT TEST PASSED" out\g2-pthread-mt.txt >nul || (echo G2-4b pthread_mt_test did not pass & exit /b 1)
           exit /b 0
       - name: "G2-1 Probe (Items 2-5): Windows stack / NT_TIB / VEH / ExitThread probe (informational)"
         continue-on-error: true
