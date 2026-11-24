@@ -420,11 +420,15 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
      * only these, not whole PT_LOAD segments that also hold .dynstr/.rodata */
     if (eh->e_shoff && eh->e_shnum && eh->e_shoff + (uint64_t)eh->e_shnum * sizeof(Elf64_Shdr) <= fsize) {
         const Elf64_Shdr *sh = (const Elf64_Shdr *)(file + eh->e_shoff);
-        for (i = 0; i < eh->e_shnum && lib->nxsec < 16; i++)
+        for (i = 0; i < eh->e_shnum; i++)
             if ((sh[i].sh_flags & (SHF_ALLOC | SHF_EXECINSTR)) == (SHF_ALLOC | SHF_EXECINSTR) && sh[i].sh_size) {
-                lib->xsec_vaddr[lib->nxsec] = sh[i].sh_addr;
-                lib->xsec_size[lib->nxsec] = sh[i].sh_size;
-                lib->nxsec++;
+                if (lib->nxsec < 16) {
+                    lib->xsec_vaddr[lib->nxsec] = sh[i].sh_addr;
+                    lib->xsec_size[lib->nxsec] = sh[i].sh_size;
+                    lib->nxsec++;
+                } else {
+                    lib->xsec_truncated = 1;
+                }
             }
     }
 
@@ -673,8 +677,8 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
          * fs: access or a syscall and be "patched" into garbage. Fallback,
          * when there is no .eh_frame_hdr: whole executable segments, where
          * patch.c still requires known function bounds before changing bytes. */
-        afw_code_range *cr, segs[8];
-        int nsegs = 0, have_funcs;
+        afw_code_range *cr, segs[16];
+        int nsegs = 0, segs_truncated = 0, have_funcs;
         unsigned char **fstart;
         size_t *fsize;
         int ncr = afw_func_list(lib, &fstart, &fsize), k;
@@ -683,8 +687,8 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
             cr = (afw_code_range *)malloc((size_t)ncr * sizeof *cr);
             for (k = 0; k < ncr; k++) { cr[k].addr = fstart[k]; cr[k].size = fsize[k]; }
         } else {
-            cr = (afw_code_range *)malloc(8 * sizeof *cr);
-            for (i = 0; i < npages && ncr < 8;) {
+            cr = (afw_code_range *)malloc(16 * sizeof *cr);
+            for (i = 0; i < npages && ncr < 16;) {
                 size_t j = i;
                 if (!(pageprot[i] & PF_X)) { i++; continue; }
                 while (j < npages && (pageprot[j] & PF_X)) j++;
@@ -696,28 +700,34 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
         }
         free(fstart); free(fsize);
         if (lib->nxsec) {
-            for (k = 0; k < lib->nxsec && k < 8; k++) {
+            for (k = 0; k < lib->nxsec && k < 16; k++) {
                 segs[k].addr = (unsigned char *)(lib->bias + lib->xsec_vaddr[k]);
                 segs[k].size = (size_t)lib->xsec_size[k];
             }
             nsegs = k;
+            segs_truncated = lib->xsec_truncated || (lib->nxsec > 16);
         } else {
             int nseg = 0;
-            for (i = 0; i < npages && nseg < 8;) {
+            for (i = 0; i < npages;) {
                 size_t j = i;
                 if (!(pageprot[i] & PF_X)) { i++; continue; }
                 while (j < npages && (pageprot[j] & PF_X)) j++;
-                segs[nseg].addr = lib->base + i * AFW_PAGE_SIZE;
-                segs[nseg].size = (j - i) * AFW_PAGE_SIZE;
-                nseg++;
+                if (nseg < 16) {
+                    segs[nseg].addr = lib->base + i * AFW_PAGE_SIZE;
+                    segs[nseg].size = (j - i) * AFW_PAGE_SIZE;
+                    nseg++;
+                } else {
+                    segs_truncated = 1;
+                }
                 i = j;
             }
             nsegs = nseg;
         }
         if (verbose) printf("Code:       %d %s decoded\n", ncr, lib->eh_frame_hdr ? "functions (.eh_frame)" : "segments (no .eh_frame_hdr)");
         afw_patch_ctx pc;
+        memset(&pc, 0, sizeof pc);
         pc.bounds = patch_bounds; pc.ctx = lib; pc.bias = lib->bias; pc.name = lib->soname ? lib->soname : path;
-        pc.ranges_are_functions = have_funcs; pc.segs = segs; pc.nsegs = nsegs;
+        pc.ranges_are_functions = have_funcs; pc.segs = segs; pc.nsegs = nsegs; pc.segs_truncated = segs_truncated;
         pc.entries = patch_entries;
         pc.attest = afw_attest_for(lib->sha256, lib->attest_buf, (int)(sizeof lib->attest_buf / sizeof lib->attest_buf[0]), &pc.nattest);
         pc.readonly = patch_readonly;

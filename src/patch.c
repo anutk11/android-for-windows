@@ -399,14 +399,20 @@ static int must_hold_table(ZydisDecoder *dec, const afw_patch_ctx *c,
                            uint16_t **must_out, unsigned char **seen_out,
                            size_t *max_q_out, size_t *popped_out) {
     size_t qcap = fsize ? fsize : 1;
-    uint16_t *in_m = (uint16_t *)calloc(qcap, sizeof *in_m);
-    unsigned char *seen = (unsigned char *)calloc(qcap, 1);
-    unsigned char *in_q = (unsigned char *)calloc(qcap, 1);
-    size_t *q = (size_t *)malloc(qcap * sizeof *q);
+    uint16_t *in_m = NULL;
+    unsigned char *seen = NULL;
+    unsigned char *in_q = NULL;
+    size_t *q = NULL;
     size_t qh = 0, qt = 0, q_count = 0, max_q = 0, popped = 0;
     uint64_t f0 = (uint64_t)(uintptr_t)fstart;
     uint64_t f1 = f0 + (uint64_t)fsize;
     int i, rc = 0;
+    if (qcap > SIZE_MAX / sizeof *q || qcap > SIZE_MAX / sizeof *in_m)
+        return -1;
+    in_m = (uint16_t *)calloc(qcap, sizeof *in_m);
+    seen = (unsigned char *)calloc(qcap, 1);
+    in_q = (unsigned char *)calloc(qcap, 1);
+    q = (size_t *)malloc(qcap * sizeof *q);
     if (!in_m || !seen || !in_q || !q) {
         free(in_m); free(seen); free(in_q); free(q);
         return -1;
@@ -437,9 +443,12 @@ static int must_hold_table(ZydisDecoder *dec, const afw_patch_ctx *c,
             ENQ_OFF((size_t)(orig_pads[i] - f0), 0);
     }
 
-    /* Seed 0 at any direct branch/call target entering [fstart, fend) from outside. */
-    if (c && c->nsegs > 0) {
+    /* Seed 0 at any direct branch/call target entering [fstart, fend) from outside.
+     * Fail-closed if executable segments were truncated, missing, or contain any
+     * undecodable byte sequence. */
+    if (c) {
         int g;
+        if (c->segs_truncated || c->nsegs <= 0) { rc = 1; goto done; }
         for (g = 0; g < c->nsegs; g++) {
             unsigned char *s0 = c->segs[g].addr;
             unsigned char *s1 = s0 + c->segs[g].size;
@@ -447,8 +456,11 @@ static int must_hold_table(ZydisDecoder *dec, const afw_patch_ctx *c,
             for (sq = s0; sq < s1;) {
                 ZydisDecodedInstruction sins;
                 ZydisDecodedOperand sops[ZYDIS_MAX_OPERAND_COUNT];
-                int sok = ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, sq, (ZyanUSize)(s1 - sq), &sins, sops));
-                if (sok && is_branch(&sins) && sins.operand_count_visible >= 1 &&
+                if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, sq, (ZyanUSize)(s1 - sq), &sins, sops))) {
+                    rc = 1;
+                    goto done;
+                }
+                if (is_branch(&sins) && sins.operand_count_visible >= 1 &&
                     sops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
                     uint64_t qaddr = (uint64_t)(uintptr_t)sq;
                     if (qaddr < f0 || qaddr >= f1) {
@@ -459,7 +471,7 @@ static int must_hold_table(ZydisDecoder *dec, const afw_patch_ctx *c,
                         }
                     }
                 }
-                sq += sok ? sins.length : 1;
+                sq += sins.length;
             }
         }
     }
@@ -701,6 +713,112 @@ int afw_patch_test_must_queue(void) {
         free(seen);
     }
 
+    /* Cases 4, 5, 6: external segment scanning via afw_patch_ctx.segs
+     *   4a: baseline (no external branch) -> r15 IS proven at off_chain
+     *   4b: external jmp lands directly at off_chain (movsxd) -> r15 MUST be cleared
+     *   4c: external jmp lands before off_chain (mov edx, esi) -> r15 MUST be cleared at off_chain
+     *   5:  undecodable byte (0x06, PUSH ES invalid in 64-bit) in external seg -> fail closed (rc == 1)
+     *   6:  segs_truncated == 1 -> fail closed (rc == 1) */
+    {
+        unsigned char buf[96];
+        unsigned char map[32];
+        unsigned char *code = buf;
+        unsigned char *ext  = buf + 64;
+        afw_code_range segs[2];
+        afw_patch_ctx ctx;
+        size_t n = 0, off_pre, off_chain;
+        uint64_t T;
+        int32_t disp;
+        uint16_t *must = NULL;
+        unsigned char *seen = NULL;
+        int rc;
+
+        memset(buf, 0x90, sizeof buf);
+        memset(map, 0, sizeof map);
+        T = (uint64_t)(uintptr_t)(buf + 0x100);
+        /* 0: lea r15, [rip + T] (4C 8D 3D disp32) */
+        map[n] = 1;
+        code[n] = 0x4C; code[n + 1] = 0x8D; code[n + 2] = 0x3D;
+        disp = (int32_t)((int64_t)T - (int64_t)(uintptr_t)(code + n + 7));
+        memcpy(code + n + 3, &disp, 4); n += 7;
+        /* 7: call +0 (E8 00 00 00 00) */
+        map[n] = 1;
+        code[n] = 0xE8; memset(code + n + 1, 0, 4); n += 5;
+        /* 12: mov edx, esi (89 F2) */
+        off_pre = n; map[n] = 1;
+        code[n] = 0x89; code[n + 1] = 0xF2; n += 2;
+        /* 14: movsxd rax, dword [r15 + rdx*4] (49 63 04 97) */
+        off_chain = n; map[n] = 1;
+        code[n] = 0x49; code[n + 1] = 0x63; code[n + 2] = 0x04; code[n + 3] = 0x97; n += 4;
+        /* 18: ret (C3) */
+        map[n] = 1;
+        code[n] = 0xC3; n += 1;
+
+        segs[0].addr = code; segs[0].size = n;
+        segs[1].addr = ext;  segs[1].size = 5;
+        memset(&ctx, 0, sizeof ctx);
+        ctx.segs = segs;
+        ctx.nsegs = 2;
+
+        /* 4a: ext is 5x nop -> r15 must hold T at off_chain */
+        rc = must_hold_table(&dec, &ctx, code, n, map, T,
+                             NULL, 0, NULL, 0, NULL, 0, &must, &seen, NULL, NULL);
+        if (rc != 0 || !must || !seen || !seen[off_chain] || (must[off_chain] & (1u << 15)) == 0) {
+            fprintf(stderr, "[must_queue] FAIL case4a baseline: rc=%d mask=0x%x\n",
+                    rc, must ? must[off_chain] : 0u);
+            fails++;
+        }
+        free(must); free(seen); must = NULL; seen = NULL;
+
+        /* 4b: ext has jmp rel32 landing directly at off_chain -> r15 MUST be cleared */
+        ext[0] = 0xE9;
+        disp = (int32_t)((int64_t)(uintptr_t)(code + off_chain) - (int64_t)(uintptr_t)(ext + 5));
+        memcpy(ext + 1, &disp, 4);
+        rc = must_hold_table(&dec, &ctx, code, n, map, T,
+                             NULL, 0, NULL, 0, NULL, 0, &must, &seen, NULL, NULL);
+        if (rc != 0 || !must || !seen || !seen[off_chain] || (must[off_chain] & (1u << 15)) != 0) {
+            fprintf(stderr, "[must_queue] FAIL case4b ext->chain: rc=%d mask=0x%x (want r15=0)\n",
+                    rc, must ? must[off_chain] : 0u);
+            fails++;
+        }
+        free(must); free(seen); must = NULL; seen = NULL;
+
+        /* 4c: ext has jmp rel32 landing at off_pre -> propagates 0 into off_chain */
+        ext[0] = 0xE9;
+        disp = (int32_t)((int64_t)(uintptr_t)(code + off_pre) - (int64_t)(uintptr_t)(ext + 5));
+        memcpy(ext + 1, &disp, 4);
+        rc = must_hold_table(&dec, &ctx, code, n, map, T,
+                             NULL, 0, NULL, 0, NULL, 0, &must, &seen, NULL, NULL);
+        if (rc != 0 || !must || !seen || !seen[off_chain] || (must[off_chain] & (1u << 15)) != 0) {
+            fprintf(stderr, "[must_queue] FAIL case4c ext->pre: rc=%d mask=0x%x (want r15=0)\n",
+                    rc, must ? must[off_chain] : 0u);
+            fails++;
+        }
+        free(must); free(seen); must = NULL; seen = NULL;
+
+        /* 5: undecodable byte (0x06) in external seg -> fail closed (rc == 1) */
+        memset(ext, 0x90, 5);
+        ext[0] = 0x06;
+        rc = must_hold_table(&dec, &ctx, code, n, map, T,
+                             NULL, 0, NULL, 0, NULL, 0, &must, &seen, NULL, NULL);
+        if (rc != 1 || must != NULL || seen != NULL) {
+            fprintf(stderr, "[must_queue] FAIL case5 undecodable ext seg: rc=%d\n", rc);
+            fails++;
+        }
+        free(must); free(seen); must = NULL; seen = NULL;
+
+        /* 6: segs_truncated == 1 -> fail closed (rc == 1) */
+        memset(ext, 0x90, 5);
+        ctx.segs_truncated = 1;
+        rc = must_hold_table(&dec, &ctx, code, n, map, T,
+                             NULL, 0, NULL, 0, NULL, 0, &must, &seen, NULL, NULL);
+        if (rc != 1 || must != NULL || seen != NULL) {
+            fprintf(stderr, "[must_queue] FAIL case6 segs_truncated: rc=%d\n", rc);
+            fails++;
+        }
+        free(must); free(seen);
+    }
+
     printf("must_queue_test: %s (%d failures)\n", fails ? "FAILED" : "PASSED", fails);
     return fails != 0;
 }
@@ -839,14 +957,21 @@ static int jump_uses_table(ZydisDecoder *dec, const afw_patch_ctx *c, unsigned c
     lo = (uint64_t)(uintptr_t)chain_start; hi = (uint64_t)(uintptr_t)J;
     for (ti = 0; ti < ntt; ti++)
         if (tt[ti] > lo && tt[ti] <= hi) goto inside;
+    if (c->segs_truncated) {
+        *why = "executable segment list truncated; cannot prove no external branch enters the dispatch chain";
+        return 0;
+    }
     {
         int g, nsweep = c->nsegs;
         for (g = 0; g < (nsweep ? nsweep : 1); g++) {
             unsigned char *s0 = nsweep ? c->segs[g].addr : fstart;
             unsigned char *s1 = nsweep ? s0 + c->segs[g].size : fend;
             for (q = s0; q < s1;) {
-                int ok = ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, q, (ZyanUSize)(s1 - q), &ins, ops));
-                if (ok && is_branch(&ins) && ins.operand_count_visible >= 1 &&
+                if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, q, (ZyanUSize)(s1 - q), &ins, ops))) {
+                    *why = "undecodable bytes in executable segment during branch scan";
+                    return 0;
+                }
+                if (is_branch(&ins) && ins.operand_count_visible >= 1 &&
                     ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
                     ZyanU64 t;
                     if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&ins, &ops[0], (ZyanU64)(uintptr_t)q, &t))) {
@@ -856,7 +981,7 @@ static int jump_uses_table(ZydisDecoder *dec, const afw_patch_ctx *c, unsigned c
                         if (cross_block && external && (uint64_t)t == lo) goto inside;
                     }
                 }
-                q += ok ? ins.length : 1;
+                q += ins.length;
             }
         }
     }

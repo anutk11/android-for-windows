@@ -18,6 +18,8 @@
  *   VARIANT 11 xblock_caller  second dispatch reuses caller-saved rcx = T across a call: REJECTED
  *   VARIANT 12 xblock_switch  another bounded switch in the same function clobbers r15: REJECTED (fail-closed)
  *   VARIANT 13 xblock_subreg  32-bit sub-register write (xor r15d, r15d) clobbers r15: REJECTED
+ *   VARIANT 14 xblock_ext_pre another function jumps just before cross-block movsxd: REJECTED (must_hold_table seeding)
+ *   VARIANT 15 xblock_ext_at  another function jumps directly onto cross-block movsxd: REJECTED
  */
 #ifndef VARIANT
 #define VARIANT 1
@@ -31,6 +33,12 @@
 
 #if VARIANT >= 9
 __attribute__((noinline, used, visibility("hidden"))) void afw_at_helper(void) { __asm__ volatile(""); }
+#endif
+
+#if VARIANT == 14 || VARIANT == 15
+__attribute__((naked, used)) void afw_at_ext_caller(void) {
+    __asm__("jmp afw_at_ext_tgt\n");
+}
 #endif
 
 __attribute__((naked)) int afw_at_dispatch(int i) {
@@ -57,7 +65,7 @@ __attribute__((naked)) int afw_at_dispatch(int i) {
         "lea other_tbl(%rip), %rdx\n\t"
         "movslq (%rdx,%rdi,4), %rax\n\t"
         "add %rdx, %rax\n\t"
-#elif VARIANT == 9 || VARIANT == 10 || VARIANT == 12 || VARIANT == 13
+#elif VARIANT == 9 || VARIANT == 10 || VARIANT == 12 || VARIANT == 13 || VARIANT == 14 || VARIANT == 15
         "lea afw_at_tbl(%rip), %r15\n\t"          /* callee-saved table base, like libc++ 0xd54e1 */
         "movslq (%r15,%rdi,4), %rax\n\t"
         "add %r15, %rax\n\t"
@@ -145,6 +153,30 @@ __attribute__((naked)) int afw_at_dispatch(int i) {
         "add %r15, %rax\n\t"
         "jmp *%rax\n"
         "3:\n\t"
+#elif VARIANT == 14
+        "test %esi, %esi\n\t"                    /* external function jumps just before movsxd -> MUST reject via must_hold_table seeding */
+        "jz 3f\n\t"
+        "call afw_at_helper\n\t"
+        ".globl afw_at_ext_tgt\n"
+        ".hidden afw_at_ext_tgt\n"
+        "afw_at_ext_tgt:\n\t"
+        "mov %esi, %edx\n\t"
+        "movslq (%r15,%rdx,4), %rax\n\t"
+        "add %r15, %rax\n\t"
+        "jmp *%rax\n"
+        "3:\n\t"
+#elif VARIANT == 15
+        "test %esi, %esi\n\t"                    /* external function jumps directly onto movsxd -> MUST reject */
+        "jz 3f\n\t"
+        "call afw_at_helper\n\t"
+        "mov %esi, %edx\n\t"
+        ".globl afw_at_ext_tgt\n"
+        ".hidden afw_at_ext_tgt\n"
+        "afw_at_ext_tgt:\n\t"
+        "movslq (%r15,%rdx,4), %rax\n\t"
+        "add %r15, %rax\n\t"
+        "jmp *%rax\n"
+        "3:\n\t"
 #endif
         "mov $1, %eax\n\t"
         "ret\n"
@@ -164,11 +196,11 @@ __attribute__((naked)) int afw_at_dispatch(int i) {
         ".long c1 - afw_at_tbl\n"
         "other_tbl:\n\t"
         ".long c0 - other_tbl\n\t"
-        ".long c1 - other_tbl\n\t"
+        ".long c1 - other_tbl\n"
 #if VARIANT == 12
         "sub_tbl:\n\t"
         ".long sub0 - sub_tbl\n\t"
-        ".long sub1 - sub_tbl\n\t"
+        ".long sub1 - sub_tbl\n"
 #endif
         ".text\n");
 }

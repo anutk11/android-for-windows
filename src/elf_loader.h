@@ -41,6 +41,7 @@ typedef struct afw_lib_s {
     const unsigned char *eh_frame_hdr;   /* for function boundaries */
     uint64_t xsec_vaddr[16], xsec_size[16]; /* SHF_EXECINSTR sections */
     int nxsec;
+    int xsec_truncated;                     /* >16 SHF_ALLOC|SHF_EXECINSTR sections */
     afw_patch_report patch;
 
     char sha256[65];            /* of the file as read, before mapping or patching */

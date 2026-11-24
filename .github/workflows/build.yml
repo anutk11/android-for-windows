@@ -37,7 +37,7 @@ jobs:
             -Wl,--pack-dyn-relocs=none -o out/libgs_gate_test.so test/gs_gate_test.c
           "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 \
             -Wl,--pack-dyn-relocs=none -o out/libtls_ie_test.so test/tls_ie_test.c
-          for v in 1 2 3 4 5 6 7 8 9 10 11 12 13; do
+          for v in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
             "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 -DVARIANT=$v \
               -Wl,--pack-dyn-relocs=none -o out/libattest$v.so test/attest_test.c
             "$TC/llvm-nm" out/libattest$v.so | awk '/ afw_at_(jmp|tbl)$/{print $3"="$1}' > out/libattest$v.syms
@@ -326,13 +326,13 @@ jobs:
              -o out/fd_test tools/fd_test.c src/fd.c src/platform.c
           cc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall -Wextra \
              -o out/tls_layout_test tools/tls_layout_test.c src/tls_layout.c
-      - name: "Attestation checks (PR #7 + cross-block must_hold_table): queue self-test, variants 1-13 & stale"
+      - name: "Attestation checks (PR #7 + cross-block must_hold_table): queue self-test, variants 1-15 & stale"
         run: |
           set -euo pipefail
           export ASAN_OPTIONS=detect_invalid_pointer_pairs=2
           out/afw-asan-test --test-must-queue
           run() { f=$1; shift; out/afw-asan-test "$f" --patch-report "$@" 2>&1 | grep -E "\[attest\]|^ATTEST |^GATE" ; }
-          for v in 1 2 3 4 5 6 7 8 9 10 11 12 13; do
+          for v in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
             . out/libattest$v.syms
             A="$afw_at_jmp,$afw_at_tbl,2"
             echo "== variant $v"; run out/libattest$v.so --attest-add=$A | tee out/at$v.txt
@@ -352,6 +352,8 @@ jobs:
           grep -q "code reached through the attested entries has another unresolved indirect jump" out/at11.txt && grep -q "would REFUSE" out/at11.txt
           grep -q "code reached through the attested entries has another unresolved indirect jump" out/at12.txt && grep -q "would REFUSE" out/at12.txt
           grep -q "code reached through the attested entries has another unresolved indirect jump" out/at13.txt && grep -q "would REFUSE" out/at13.txt
+          grep -q "code reached through the attested entries has another unresolved indirect jump" out/at14.txt && grep -q "would REFUSE" out/at14.txt
+          grep -q "code reached through the attested entries has another unresolved indirect jump" out/at15.txt && grep -q "would REFUSE" out/at15.txt
           . out/libattest1.syms
           echo "== stale: an attestation for a jump that is not undecided"
           run out/libattest1.so --attest-add=$afw_at_jmp,$afw_at_tbl,2 --attest-add=10,$afw_at_tbl,2 | tee out/at-stale.txt

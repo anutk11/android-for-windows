@@ -115,6 +115,7 @@ typedef struct {
     /* extra entry points of a function (C++ landing pads) */
     int (*entries)(const void *ctx, uint64_t func, uint64_t *out, int max);
     const afw_code_range *segs; int nsegs; /* executable segments, for the audit */
+    int segs_truncated;                    /* executable segment list exceeded capacity */
     const afw_attest *attest; int nattest;  /* attestations for THIS binary (hash matched) */
 } afw_patch_ctx;
 
