@@ -126,8 +126,9 @@ int afw_os_filemap_protect(void *addr, size_t len, int prot);
  * afw_os_ww_get queries dirty pages in [addr, addr + len) (if reset != 0, passes
  * WRITE_WATCH_FLAG_RESET atomically BEFORE caller zeroes pages). Returns 0 on
  * success, -1 on any OS failure or unsupported platform.
- * afw_os_ww_reset clears write-watch state on [addr, addr + len) (called ONLY
- * after os_decommit on inaccessible pages). Returns 0 on success, -1 on failure. */
+ * afw_os_ww_reset clears write-watch state on freshly committed [addr, addr + len)
+ * MEM_COMMIT pages under g_lock (never on MEM_RESERVE, never after memset on
+ * accessible pages). Returns 0 on success, -1 on failure. */
 int afw_os_ww_reserve(uint64_t addr, uint64_t size, uint64_t *out, int *ww_out);
 int afw_os_ww_get(uint64_t addr, uint64_t len, int reset,
                   void **addrs, size_t *count_io, uint32_t *gran_out);

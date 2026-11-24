@@ -455,8 +455,9 @@ static int os_reserve_anon(uint64_t addr, uint64_t size, uint64_t *out, int *ww_
     return afw_os_ww_reserve(addr, size, out, ww_out);
 }
 
-/* Reset write-watch state ONLY after os_decommit on inaccessible pages (never
- * after memset on accessible pages). Fail-closed: disables write_watch on error. */
+/* Reset write-watch state ONLY right after os_commit on freshly-zeroed MEM_COMMIT
+ * pages under g_lock (never on MEM_RESERVE, and never after memset on accessible
+ * pages). Fail-closed: disables write_watch on error. */
 static void ww_reset_or_disable(winalloc *w, uint64_t a, uint64_t len) {
     if (!w->write_watch) return;
 #ifdef AFW_TEST
@@ -471,9 +472,12 @@ static void ww_reset_or_disable(winalloc *w, uint64_t a, uint64_t len) {
 
 /* Zero committed accessible private anonymous range [start, start + len).
  * When MEM_WRITE_WATCH is active (owned VMA_ANON on Windows):
- *   1. Atomically queries and resets write-watch BEFORE zeroing (WRITE_WATCH_FLAG_RESET)
- *      in 16MB (4096-page) chunks — never calls ResetWriteWatch after memset(0), so a
- *      concurrent write cannot silently lose its dirty bit (Reviewers 1 & 3).
+ *   1. Queries dirty pages with reset=0 (GetWriteWatch(0, ...)) in 16MB (4096-page)
+ *      chunks. Passing reset=0 avoids disarming writable PTEs and triggering a soft
+ *      write-watch page fault on every page we are about to memset(0), AND never
+ *      clears any dirty bit on accessible pages so concurrent writes cannot lose
+ *      their dirty state (Reviewers 1 & 3). Dirty bits are cleared only on fresh
+ *      os_commit (map_extents / do_protect).
  *   2. Skips untouched demand-zero chunks (0 writes, 0 Working Set inflation).
  *   3. Fast-paths 100%-dirty chunks and coalesces contiguous dirty runs into single memsets.
  *   4. Fail-closed on any API error, bad granularity, or out-of-range page: disables
@@ -499,7 +503,7 @@ static void zero_range_ww(winalloc *w, uint64_t start, uint64_t len) {
         if (g_fail_ww > 0 && --g_fail_ww == 0) ww_rc = -1;
         else
 #endif
-        ww_rc = afw_os_ww_get(cur, chunk_len, 1, g_ww_addrs, &cnt, &gran);
+        ww_rc = afw_os_ww_get(cur, chunk_len, 0, g_ww_addrs, &cnt, &gran);
 
         if (ww_rc != 0 || gran != (uint32_t)PG || cnt > n_pages) {
             w->write_watch = 0;
