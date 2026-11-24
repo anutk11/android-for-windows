@@ -34,6 +34,13 @@ uint64_t afw_tls_static_off(int mod);
  * Returns 0 on success, -1 if not yet finalized. */
 int afw_tls_static_get_bionic_layout(afw_bionic_static_tls *out);
 
+/* Thread pointer offset below static TLS base (0 if not finished). */
+uint64_t afw_tls_static_tp_off(void);
+
+/* Initialize static ELF TLS .tdata images (p_filesz > 0) below an externally
+ * allocated thread pointer `tp` (e.g. Bionic pthread_create newtls). */
+void afw_tls_static_init_external(uintptr_t *tp);
+
 /* Allocate and initialise one thread's block. Returns tp (the bionic slot
  * array), or NULL; *block gets the allocation, which is what
  * afw_tls_static_free() takes (tp's offset in it depends on the layout at

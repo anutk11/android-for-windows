@@ -18,6 +18,7 @@
 #include <windows.h>
 #include <winioctl.h>
 #include <wchar.h>
+#pragma comment(lib, "synchronization.lib")
 
 int afw_check_security(void) {
     PROCESS_MITIGATION_DYNAMIC_CODE_POLICY dyn = {0};
@@ -750,12 +751,186 @@ int afw_os_ww_reset(uint64_t addr, uint64_t len) {
     return ResetWriteWatch((void *)(uintptr_t)addr, (SIZE_T)len) == 0 ? 0 : -1;
 }
 
+/* ---- G2-4b Windows thread-clone, FLS, event, atomic & NT_TIB trampoline ---- */
+_Static_assert(offsetof(afw_os_clone_trampoline, host_rsp)             == 0x00, "host_rsp");
+_Static_assert(offsetof(afw_os_clone_trampoline, orig_tib_base)        == 0x08, "orig_tib_base");
+_Static_assert(offsetof(afw_os_clone_trampoline, orig_tib_limit)       == 0x10, "orig_tib_limit");
+_Static_assert(offsetof(afw_os_clone_trampoline, orig_teb_dealloc)     == 0x18, "orig_teb_dealloc");
+_Static_assert(offsetof(afw_os_clone_trampoline, bionic_stack_base)    == 0x20, "bionic_stack_base");
+_Static_assert(offsetof(afw_os_clone_trampoline, bionic_stack_limit)   == 0x28, "bionic_stack_limit");
+_Static_assert(offsetof(afw_os_clone_trampoline, bionic_dealloc_stack) == 0x30, "bionic_dealloc_stack");
+_Static_assert(offsetof(afw_os_clone_trampoline, child_rsp)            == 0x38, "child_rsp");
+_Static_assert(offsetof(afw_os_clone_trampoline, child_rip)            == 0x40, "child_rip");
+_Static_assert(offsetof(afw_os_clone_trampoline, rbx)                  == 0x48, "rbx");
+_Static_assert(offsetof(afw_os_clone_trampoline, rbp)                  == 0x50, "rbp");
+_Static_assert(offsetof(afw_os_clone_trampoline, r12)                  == 0x58, "r12");
+_Static_assert(offsetof(afw_os_clone_trampoline, r13)                  == 0x60, "r13");
+_Static_assert(offsetof(afw_os_clone_trampoline, r14)                  == 0x68, "r14");
+_Static_assert(offsetof(afw_os_clone_trampoline, r15)                  == 0x70, "r15");
+
+uint32_t afw_os_current_tid(void) {
+    return (uint32_t)GetCurrentThreadId();
+}
+
+int afw_os_thread_spawn_detached(void (*fn)(void *), void *arg) {
+    afw_win_thr *p;
+    HANDLE h;
+    if (!fn) return -22;
+    p = (afw_win_thr *)malloc(sizeof *p);
+    if (!p) return -12;
+    p->fn = fn; p->arg = arg;
+    h = CreateThread(NULL, 0, afw_win_thr_entry, p, 0, NULL);
+    if (!h) {
+        DWORD e = GetLastError();
+        free(p);
+        return win_err_to_lnx(e);
+    }
+    CloseHandle(h);
+    return 0;
+}
+
+int afw_os_event_init(afw_os_event *ev) {
+    HANDLE h;
+    if (!ev) return -22;
+    h = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!h) return win_err_to_lnx(GetLastError());
+    *ev = (afw_os_event)h;
+    return 0;
+}
+
+void afw_os_event_signal(afw_os_event ev) {
+    if (ev) SetEvent((HANDLE)ev);
+}
+
+void afw_os_event_wait(afw_os_event ev) {
+    if (ev) WaitForSingleObject((HANDLE)ev, INFINITE);
+}
+
+void afw_os_event_destroy(afw_os_event ev) {
+    if (ev) CloseHandle((HANDLE)ev);
+}
+
+static INIT_ONCE g_ctx_fls_once = INIT_ONCE_STATIC_INIT;
+static DWORD g_ctx_fls = FLS_OUT_OF_INDEXES;
+static void (*g_ctx_fls_cb)(void *);
+
+static VOID WINAPI win_ctx_fls_thunk(PVOID p) {
+    if (p && g_ctx_fls_cb) g_ctx_fls_cb(p);
+}
+
+static BOOL CALLBACK win_ctx_fls_init_cb(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+    (void)once; (void)ctx;
+    g_ctx_fls_cb = (void (*)(void *))param;
+    g_ctx_fls = FlsAlloc(win_ctx_fls_thunk);
+    return g_ctx_fls != FLS_OUT_OF_INDEXES;
+}
+
+int afw_os_thread_ctx_fls_set(void (*release_cb)(void *), void *ctx) {
+    if (!InitOnceExecuteOnce(&g_ctx_fls_once, win_ctx_fls_init_cb, (PVOID)release_cb, NULL))
+        return -1;
+    if (g_ctx_fls == FLS_OUT_OF_INDEXES) return -1;
+    return FlsSetValue(g_ctx_fls, ctx) ? 0 : -1;
+}
+
+void afw_os_atomic_store_i32(void *addr, int32_t val) {
+    InterlockedExchange((volatile LONG *)addr, (LONG)val);
+}
+
+int32_t afw_os_atomic_xchg_i32(int32_t *addr, int32_t val) {
+    return (int32_t)InterlockedExchange((volatile LONG *)addr, (LONG)val);
+}
+
+uintptr_t afw_os_atomic_xchg_uptr(uintptr_t *addr, uintptr_t val) {
+    return (uintptr_t)InterlockedExchangePointer((PVOID volatile *)addr, (PVOID)val);
+}
+
+void afw_os_atomic_store_uptr(uintptr_t *addr, uintptr_t val) {
+    (void)InterlockedExchangePointer((PVOID volatile *)addr, (PVOID)val);
+}
+
+void afw_os_wake_address_all(void *addr) {
+    WakeByAddressAll(addr);
+}
+
+void afw_os_exit_thread(int code) {
+    ExitThread((DWORD)code);
+}
+
+int afw_os_clone_supported(void) {
+    return 1;
+}
+
+/* Windows x64 assembly trampolines for entering Bionic's child_stack on clone(56)
+ * and returning to the original Windows host_rsp + NT_TIB on SYS_exit(60).
+ * Validated in Stage-0 (tools/g2_stack_probe.c, Items 2a, 4a, 4b, 4c-win, 5). */
+__asm__(
+    ".att_syntax prefix\n"
+    ".text\n"
+
+    /* void afw_os_clone_enter_bionic(afw_os_clone_trampoline *t) [rcx = t] */
+    ".globl afw_os_clone_enter_bionic\n"
+    "afw_os_clone_enter_bionic:\n\t"
+    "mov %rsp, %rax\n\t"
+    "sub $64, %rax\n\t"
+    "and $-16, %rax\n\t"
+    "mov %rax, 0x00(%rcx)\n\t"         /* host_rsp (16-byte aligned, 64B headroom) */
+    "mov %gs:0x08, %rax\n\t"
+    "mov %rax, 0x08(%rcx)\n\t"         /* orig_tib_base */
+    "mov %gs:0x10, %rax\n\t"
+    "mov %rax, 0x10(%rcx)\n\t"         /* orig_tib_limit */
+    "mov %gs:0x1478, %rax\n\t"
+    "mov %rax, 0x18(%rcx)\n\t"         /* orig_teb_dealloc */
+    "mov 0x20(%rcx), %rax\n\t"
+    "mov %rax, %gs:0x08\n\t"           /* bionic_stack_base */
+    "mov 0x28(%rcx), %rax\n\t"
+    "mov %rax, %gs:0x10\n\t"           /* bionic_stack_limit */
+    "mov 0x30(%rcx), %rax\n\t"
+    "mov %rax, %gs:0x1478\n\t"         /* bionic_dealloc_stack */
+    /* Note: volatile registers (rdi/rsi/rdx/r8/r9/r10) are not restored in the
+     * child — matches Android 14 __bionic_clone, which tests rax == 0 and
+     * immediately pops fn/arg into rdi/rsi from child_stack. */
+    "cld\n\t"
+    "mov 0x40(%rcx), %r11\n\t"         /* child_rip (stub_ret) */
+    "mov 0x48(%rcx), %rbx\n\t"
+    "mov 0x50(%rcx), %rbp\n\t"
+    "mov 0x58(%rcx), %r12\n\t"
+    "mov 0x60(%rcx), %r13\n\t"
+    "mov 0x68(%rcx), %r14\n\t"
+    "mov 0x70(%rcx), %r15\n\t"
+    "mov 0x38(%rcx), %rsp\n\t"         /* child_rsp */
+    "xor %eax, %eax\n\t"               /* rax = 0 (child return value of clone) */
+    "jmp *%r11\n"
+
+    /* void afw_os_clone_exit_on_host(afw_os_clone_trampoline *t, void *ctx,
+     *                                int exit_code, void (*fn)(void *, int))
+     * rcx = t, rdx = ctx, r8d = exit_code, r9 = fn */
+    ".globl afw_os_clone_exit_on_host\n"
+    "afw_os_clone_exit_on_host:\n\t"
+    "mov 0x00(%rcx), %rsp\n\t"         /* switch to Windows host_rsp FIRST */
+    "mov 0x08(%rcx), %rax\n\t"
+    "mov %rax, %gs:0x08\n\t"           /* restore orig_tib_base */
+    "mov 0x10(%rcx), %rax\n\t"
+    "mov %rax, %gs:0x10\n\t"           /* restore orig_tib_limit */
+    "mov 0x18(%rcx), %rax\n\t"
+    "mov %rax, %gs:0x1478\n\t"         /* restore orig_teb_dealloc */
+    "cld\n\t"
+    "mov %rdx, %rcx\n\t"               /* arg1 = ctx */
+    "mov %r8d, %edx\n\t"               /* arg2 = exit_code */
+    "sub $32, %rsp\n\t"                /* host_rsp % 16 == 0; 32B Win64 shadow space */
+    "call *%r9\n\t"
+    "ud2\n"
+
+    ".intel_syntax noprefix\n"
+);
+
 #else
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 int afw_check_security(void) { return 0; }
@@ -1028,5 +1203,128 @@ int afw_os_ww_get(uint64_t addr, uint64_t len, int reset,
 int afw_os_ww_reset(uint64_t addr, uint64_t len) {
     (void)addr; (void)len;
     return -1;
+}
+
+uint32_t afw_os_current_tid(void) {
+    return (uint32_t)syscall(SYS_gettid);
+}
+
+int afw_os_thread_spawn_detached(void (*fn)(void *), void *arg) {
+    afw_posix_thr *p;
+    pthread_t pt;
+    int rc;
+    if (!fn) return -EINVAL;
+    p = (afw_posix_thr *)malloc(sizeof *p);
+    if (!p) return -ENOMEM;
+    p->fn = fn; p->arg = arg;
+    rc = pthread_create(&pt, NULL, afw_posix_thr_entry, p);
+    if (rc != 0) { free(p); return -rc; }
+    pthread_detach(pt);
+    return 0;
+}
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    int signaled;
+} afw_posix_event;
+
+int afw_os_event_init(afw_os_event *ev) {
+    afw_posix_event *e;
+    if (!ev) return -EINVAL;
+    e = (afw_posix_event *)calloc(1, sizeof *e);
+    if (!e) return -ENOMEM;
+    if (pthread_mutex_init(&e->mu, NULL) != 0) { free(e); return -ENOMEM; }
+    if (pthread_cond_init(&e->cv, NULL) != 0) {
+        pthread_mutex_destroy(&e->mu); free(e); return -ENOMEM;
+    }
+    *ev = (afw_os_event)(uintptr_t)e;
+    return 0;
+}
+
+void afw_os_event_signal(afw_os_event ev) {
+    afw_posix_event *e = (afw_posix_event *)(uintptr_t)ev;
+    if (!e) return;
+    pthread_mutex_lock(&e->mu);
+    e->signaled = 1;
+    pthread_cond_broadcast(&e->cv);
+    pthread_mutex_unlock(&e->mu);
+}
+
+void afw_os_event_wait(afw_os_event ev) {
+    afw_posix_event *e = (afw_posix_event *)(uintptr_t)ev;
+    if (!e) return;
+    pthread_mutex_lock(&e->mu);
+    while (!e->signaled) pthread_cond_wait(&e->cv, &e->mu);
+    pthread_mutex_unlock(&e->mu);
+}
+
+void afw_os_event_destroy(afw_os_event ev) {
+    afw_posix_event *e = (afw_posix_event *)(uintptr_t)ev;
+    if (!e) return;
+    pthread_cond_destroy(&e->cv);
+    pthread_mutex_destroy(&e->mu);
+    free(e);
+}
+
+static pthread_once_t g_ctx_key_once = PTHREAD_ONCE_INIT;
+static pthread_key_t g_ctx_key;
+static int g_ctx_key_ok;
+static void (*g_ctx_key_cb)(void *);
+
+static void posix_ctx_key_dtor(void *p) {
+    if (p && g_ctx_key_cb) g_ctx_key_cb(p);
+}
+
+static void posix_ctx_key_init(void) {
+    if (pthread_key_create(&g_ctx_key, posix_ctx_key_dtor) == 0)
+        g_ctx_key_ok = 1;
+}
+
+int afw_os_thread_ctx_fls_set(void (*release_cb)(void *), void *ctx) {
+    if (!g_ctx_key_cb) g_ctx_key_cb = release_cb;
+    pthread_once(&g_ctx_key_once, posix_ctx_key_init);
+    if (!g_ctx_key_ok) return -1;
+    return pthread_setspecific(g_ctx_key, ctx) == 0 ? 0 : -1;
+}
+
+void afw_os_atomic_store_i32(void *addr, int32_t val) {
+    __atomic_store_n((int32_t *)addr, val, __ATOMIC_SEQ_CST);
+}
+
+int32_t afw_os_atomic_xchg_i32(int32_t *addr, int32_t val) {
+    return __atomic_exchange_n(addr, val, __ATOMIC_ACQ_REL);
+}
+
+uintptr_t afw_os_atomic_xchg_uptr(uintptr_t *addr, uintptr_t val) {
+    return __atomic_exchange_n(addr, val, __ATOMIC_ACQ_REL);
+}
+
+void afw_os_atomic_store_uptr(uintptr_t *addr, uintptr_t val) {
+    __atomic_store_n(addr, val, __ATOMIC_RELEASE);
+}
+
+void afw_os_wake_address_all(void *addr) {
+    (void)syscall(SYS_futex, addr, 1 /* FUTEX_WAKE */, INT_MAX, NULL, NULL, 0);
+}
+
+void afw_os_exit_thread(int code) {
+    (void)code;
+    pthread_exit(NULL);
+}
+
+int afw_os_clone_supported(void) {
+    return 0;
+}
+
+void afw_os_clone_enter_bionic(afw_os_clone_trampoline *t) {
+    (void)t;
+    abort();
+}
+
+void afw_os_clone_exit_on_host(afw_os_clone_trampoline *t, void *ctx,
+                               int exit_code, void (*fn)(void *, int)) {
+    (void)t; (void)ctx; (void)exit_code; (void)fn;
+    abort();
 }
 #endif

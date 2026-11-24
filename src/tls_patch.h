@@ -31,6 +31,16 @@ int afw_tls_thread_init(void);
  * TLS layout (bionic slots carried over). Returns 0 or -1. */
 int afw_tls_thread_rebuild(void);
 
+/* Attach an externally owned bionic_tcb (`newtls` from SYS_clone(CLONE_SETTLS))
+ * to the calling thread's TEB slots (fs:[0], fs:[0x28]) and t_block without
+ * registering it for FLS release (Bionic owns the mmap). Returns 0 or -1. */
+int afw_tls_thread_attach_external(uintptr_t *tp);
+
+/* Detach the calling thread's externally owned bionic_tcb (clear t_block and
+ * TEB TLS_SLOT_SELF) before clear_child_tid / ExitThread so no dangling pointer
+ * to Bionic's newtls survives into LdrShutdownThread. */
+void afw_tls_thread_detach_external(void);
+
 /* Test hooks: the next publish fails at step n (0..15: after n TLS slots
  * were set, 16: at the FLS step; -1 off); what slot i holds for the CPU. */
 void afw_tls_test_fail_publish(int step);

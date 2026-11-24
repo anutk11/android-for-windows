@@ -12,6 +12,7 @@
  */
 #include "tls_patch.h"
 #include "tls_static.h"
+#include "thread.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -151,6 +152,10 @@ int afw_tls_init(void) {
         if (!g_veh) g_veh = AddVectoredExceptionHandler(1, fs_handler);
         if (!g_veh) { fprintf(stderr, "[tls] cannot install the fs: handler\n"); return -1; }
         g_ready = 1;
+        afw_thread_set_tls_ops(afw_tls_static_init_external,
+                               afw_tls_thread_attach_external,
+                               afw_tls_thread_detach_external,
+                               afw_tls_static_tp_off);
     }
     return afw_tls_thread_init();
 }
@@ -178,6 +183,34 @@ undo:
     return -1;
 }
 
+int afw_tls_thread_attach_external(uintptr_t *tp) {
+    void *prev_self, *prev_guard;
+    uintptr_t guard;
+    if (!g_ready || !tp) return -1;
+    guard = tp[TLS_SLOT_STACK_GUARD] ? tp[TLS_SLOT_STACK_GUARD] : g_guard;
+    prev_self = TlsGetValue(g_slot[TLS_SLOT_SELF]);
+    prev_guard = TlsGetValue(g_slot[TLS_SLOT_STACK_GUARD]);
+    if (!TlsSetValue(g_slot[TLS_SLOT_SELF], (void *)tp)) return -1;
+    if (!TlsSetValue(g_slot[TLS_SLOT_STACK_GUARD], (void *)guard)) {
+        TlsSetValue(g_slot[TLS_SLOT_SELF], prev_self);
+        TlsSetValue(g_slot[TLS_SLOT_STACK_GUARD], prev_guard);
+        return -1;
+    }
+    /* Bionic owns newtls inside its mmap: do NOT register in g_fls. */
+    t_block = tp;
+    t_alloc = NULL;
+    t_area = NULL;
+    return 0;
+}
+
+void afw_tls_thread_detach_external(void) {
+    if (g_ready)
+        TlsSetValue(g_slot[TLS_SLOT_SELF], NULL);
+    t_block = NULL;
+    t_alloc = NULL;
+    t_area = NULL;
+}
+
 /* What the CPU-visible copy of slot i holds right now (tests). */
 uintptr_t afw_tls_published_slot(int i) { return (uintptr_t)TlsGetValue(g_slot[i]); }
 static uintptr_t thread_id(void) { return (uintptr_t)GetCurrentThreadId(); }
@@ -199,6 +232,18 @@ static int publish(uintptr_t *blk, void *alloc) {   /* one step only: nothing to
     if (fail >= 0) return -1;
     return pthread_setspecific(g_key, alloc) == 0 ? 0 : -1;
 }
+int afw_tls_thread_attach_external(uintptr_t *tp) {
+    if (!tp) return -1;
+    t_block = tp;
+    t_alloc = NULL;
+    t_area = NULL;
+    return 0;
+}
+void afw_tls_thread_detach_external(void) {
+    t_block = NULL;
+    t_alloc = NULL;
+    t_area = NULL;
+}
 uintptr_t afw_tls_published_slot(int i) { return t_block ? t_block[i] : 0; }   /* fs: is native here */
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -208,6 +253,10 @@ int afw_tls_init(void) {   /* the key once; the thread's block until it succeeds
     if (!g_key_ready) {
         if (pthread_key_create(&g_key, key_release) != 0) return -1;
         g_key_ready = 1;
+        afw_thread_set_tls_ops(afw_tls_static_init_external,
+                               afw_tls_thread_attach_external,
+                               afw_tls_thread_detach_external,
+                               afw_tls_static_tp_off);
     }
     return afw_tls_thread_init();
 }

@@ -135,4 +135,43 @@ int afw_os_ww_get(uint64_t addr, uint64_t len, int reset,
                   void **addrs, size_t *count_io, uint32_t *gran_out);
 int afw_os_ww_reset(uint64_t addr, uint64_t len);
 
+/* ---- G2-4b SYS_clone / thread-lifecycle OS primitives (isolated in platform.c, Rule 8) ---- */
+typedef struct {
+    uint64_t host_rsp;             /* 0x00: saved Windows host stack pointer (16-byte aligned) */
+    uint64_t orig_tib_base;        /* 0x08: original gs:[0x08] NT_TIB StackBase */
+    uint64_t orig_tib_limit;       /* 0x10: original gs:[0x10] NT_TIB StackLimit */
+    uint64_t orig_teb_dealloc;     /* 0x18: original gs:[0x1478] TEB DeallocationStack */
+    uint64_t bionic_stack_base;    /* 0x20: Bionic RW stack top */
+    uint64_t bionic_stack_limit;   /* 0x28: Bionic RW stack bottom (above guard page) */
+    uint64_t bionic_dealloc_stack; /* 0x30: underlying VMA allocation base */
+    uint64_t child_rsp;            /* 0x38: Bionic child_stack (16-byte aligned) */
+    uint64_t child_rip;            /* 0x40: patched clone stub return address */
+    uint64_t rbx;                  /* 0x48 */
+    uint64_t rbp;                  /* 0x50 */
+    uint64_t r12;                  /* 0x58 */
+    uint64_t r13;                  /* 0x60 */
+    uint64_t r14;                  /* 0x68 */
+    uint64_t r15;                  /* 0x70 */
+} afw_os_clone_trampoline;
+
+typedef intptr_t afw_os_event;
+
+uint32_t  afw_os_current_tid(void);
+int       afw_os_thread_spawn_detached(void (*fn)(void *), void *arg);
+int       afw_os_event_init(afw_os_event *ev);
+void      afw_os_event_signal(afw_os_event ev);
+void      afw_os_event_wait(afw_os_event ev);
+void      afw_os_event_destroy(afw_os_event ev);
+int       afw_os_thread_ctx_fls_set(void (*release_cb)(void *), void *ctx);
+void      afw_os_atomic_store_i32(void *addr, int32_t val);
+int32_t   afw_os_atomic_xchg_i32(int32_t *addr, int32_t val);
+uintptr_t afw_os_atomic_xchg_uptr(uintptr_t *addr, uintptr_t val);
+void      afw_os_atomic_store_uptr(uintptr_t *addr, uintptr_t val);
+void      afw_os_wake_address_all(void *addr);
+void      afw_os_exit_thread(int code);
+int       afw_os_clone_supported(void);
+void      afw_os_clone_enter_bionic(afw_os_clone_trampoline *t);
+void      afw_os_clone_exit_on_host(afw_os_clone_trampoline *t, void *ctx,
+                                    int exit_code, void (*fn)(void *, int));
+
 #endif
