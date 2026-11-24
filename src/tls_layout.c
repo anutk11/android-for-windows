@@ -39,7 +39,7 @@ int afw_tls_layout_finish(afw_tls_layout *l) {
 }
 
 int afw_tls_layout_to_bionic(const afw_tls_layout *l, afw_bionic_static_tls *out) {
-    uint64_t tcb_end, bionic_tls_off, size, align;
+    uint64_t tcb_end, bionic_tls_off, size, align, size_align;
     if (!l || !out) return -5;
     if (l->max_align < 16 || (l->max_align & (l->max_align - 1)) != 0 ||
         l->max_align > AFW_TLS_MAX_ALIGN)
@@ -50,11 +50,12 @@ int afw_tls_layout_to_bionic(const afw_tls_layout *l, afw_bionic_static_tls *out
     tcb_end = l->tp_off + AFW_TLS_SLOTS_BYTES;
     if (round_up(tcb_end, AFW_BIONIC_TLS_ALIGN, &bionic_tls_off)) return -5;
     if (bionic_tls_off > UINT64_MAX - AFW_BIONIC_TLS_SIZE) return -5;
-    if (round_up(bionic_tls_off + AFW_BIONIC_TLS_SIZE, 4096, &size)) return -5;
-    align = l->max_align < 4096 ? 4096 : l->max_align;
+    align = l->max_align < AFW_BIONIC_TLS_ALIGN ? AFW_BIONIC_TLS_ALIGN : l->max_align;
+    size_align = align < 4096 ? 4096 : align;
+    if (round_up(bionic_tls_off + AFW_BIONIC_TLS_SIZE, size_align, &size)) return -5;
     out->size = size;
     out->align = align;
-    out->offset_bionic_tcb = l->tp_off;
+    out->overflowed = 0;
     out->offset_thread_pointer = l->tp_off;
     out->offset_bionic_tls = bionic_tls_off;
     return 0;

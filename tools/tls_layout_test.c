@@ -31,14 +31,17 @@ static void verify(const char *name, const afw_tls_layout *l, const afw_tls_segm
     {
         afw_bionic_static_tls stl;
         CHECK(afw_tls_layout_to_bionic(l, &stl) == 0, "%s: layout_to_bionic failed", name);
+        CHECK(stl.overflowed == 0, "%s: overflowed must be 0", name);
         CHECK(stl.offset_thread_pointer == l->tp_off, "%s: tp_off mismatch", name);
-        CHECK(stl.offset_bionic_tcb == l->tp_off, "%s: tcb_off mismatch", name);
         CHECK(stl.offset_bionic_tls >= l->tp_off + AFW_TLS_SLOTS_BYTES, "%s: bionic_tls overlaps TCB", name);
+        CHECK(stl.offset_bionic_tls >= l->tp_off + AFW_BIONIC_TCB_SIZE, "%s: bionic_tls overlaps 0x50 TCB", name);
         CHECK(stl.offset_bionic_tls % AFW_BIONIC_TLS_ALIGN == 0, "%s: bionic_tls not aligned", name);
         CHECK(stl.size >= stl.offset_bionic_tls + AFW_BIONIC_TLS_SIZE, "%s: size too small for bionic_tls", name);
         CHECK(stl.size % 4096 == 0, "%s: bionic static_tls size not page multiple", name);
-        CHECK(stl.align >= 4096 && stl.align >= l->max_align && (stl.align & (stl.align - 1)) == 0,
+        CHECK(stl.align >= AFW_BIONIC_TLS_ALIGN && stl.align >= l->max_align &&
+              (stl.align & (stl.align - 1)) == 0,
               "%s: bad bionic static_tls align %llu", name, (unsigned long long)stl.align);
+        CHECK(stl.size % stl.align == 0, "%s: bionic static_tls size not multiple of align", name);
         /* Main-thread compatibility: [0, stl.size) fits inside afw_tls_static_alloc's
          * alloc_size + 128KB (AFW_THREAD_AREA_SIZE) buffer so __libc_get_static_tls_bounds stays in-bounds. */
         CHECK(stl.size <= l->alloc_size + (128u * 1024u), "%s: stl.size exceeds main-thread allocation", name);

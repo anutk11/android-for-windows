@@ -150,15 +150,16 @@ typedef struct { const char *name; void *addr; } shim_entry;
 #define SG_SIZE              0x1000   /* last field measured: 0x680 */
 #define SG_AUXV              0x418
 /* StaticTlsLayout inside libc_shared_globals (pinned Build ID fa337969c798946280caa45e2d71a2e7):
- *   0x450: size_                    (measured: __allocate_thread_mapping, __libc_get_static_tls_bounds)
- *   0x458: align_                   (oracle-checked in bionic-probe)
- *   0x460: offset_bionic_tcb_       (x86_64 Variant II: equals offset_thread_pointer_)
- *   0x468: offset_thread_pointer_   (measured: pthread_create, __libc_get_static_tls_bounds, tls_get_addr_slow_path)
- *   0x470: offset_bionic_tls_       (measured: pthread_create)
+ * Measured directly from libc.so + linker64 disassembly in bionic-probe:
+ *   0x450 (+0x00): size_                  (__allocate_thread_mapping, __libc_get_static_tls_bounds, finish_layout)
+ *   0x458 (+0x08): align_                 (linker64 StaticTlsLayout::reserve / finish_layout)
+ *   0x460 (+0x10): overflowed_            (bool + 7B pad: linker64 0x146048/0x1460da; MUST be 0)
+ *   0x468 (+0x18): offset_thread_pointer_ (linker64 0x97370, pthread_create, __libc_get_static_tls_bounds)
+ *   0x470 (+0x20): offset_bionic_tls_     (linker64 0x1460ac, pthread_create)
  * Followed immediately by tls_modules.generation at 0x478 (measured: __libc_preinit_impl). */
 #define SG_STL_SIZE                  0x450
 #define SG_STL_ALIGN                 0x458
-#define SG_STL_OFFSET_BIONIC_TCB     0x460
+#define SG_STL_OVERFLOWED            0x460
 #define SG_STL_OFFSET_THREAD_POINTER 0x468
 #define SG_STL_OFFSET_BIONIC_TLS     0x470
 #define SG_INIT_PROGNAME     0x630
@@ -230,7 +231,7 @@ void afw_shared_globals_set_static_tls(const afw_bionic_static_tls *stl) {
     sg = (unsigned char *)afw_shared_globals();
     memcpy(sg + SG_STL_SIZE,                  &stl->size,                  8);
     memcpy(sg + SG_STL_ALIGN,                 &stl->align,                 8);
-    memcpy(sg + SG_STL_OFFSET_BIONIC_TCB,     &stl->offset_bionic_tcb,     8);
+    memcpy(sg + SG_STL_OVERFLOWED,            &stl->overflowed,            8);
     memcpy(sg + SG_STL_OFFSET_THREAD_POINTER, &stl->offset_thread_pointer, 8);
     memcpy(sg + SG_STL_OFFSET_BIONIC_TLS,     &stl->offset_bionic_tls,     8);
 }
