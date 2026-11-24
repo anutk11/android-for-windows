@@ -482,8 +482,19 @@ static void ww_reset_or_disable(winalloc *w, uint64_t a, uint64_t len) {
  *   3. Fast-paths 100%-dirty chunks and coalesces contiguous dirty runs into single memsets.
  *   4. Fail-closed on any API error, bad granularity, or out-of-range page: disables
  *      w->write_watch and zeroes the entire remaining range with memset(0) (Reviewer 2). */
+static void flush_zero_run(uint64_t *ps, uint64_t *pe, uint64_t rs, uint64_t re) {
+    if (*pe > *ps && *pe == rs) {
+        *pe = re;
+        return;
+    }
+    if (*pe > *ps) memset((void *)(uintptr_t)*ps, 0, (size_t)(*pe - *ps));
+    *ps = rs;
+    *pe = re;
+}
+
 static void zero_range_ww(winalloc *w, uint64_t start, uint64_t len) {
     uint64_t cur = start, end = start + len;
+    uint64_t ps = 0, pe = 0;
     if (!w->write_watch) {
         memset((void *)(uintptr_t)start, 0, (size_t)len);
         return;
@@ -506,6 +517,7 @@ static void zero_range_ww(winalloc *w, uint64_t start, uint64_t len) {
         ww_rc = afw_os_ww_get(cur, chunk_len, 0, g_ww_addrs, &cnt, &gran);
 
         if (ww_rc != 0 || gran != (uint32_t)PG || cnt > n_pages) {
+            if (pe > ps) memset((void *)(uintptr_t)ps, 0, (size_t)(pe - ps));
             w->write_watch = 0;
             memset((void *)(uintptr_t)cur, 0, (size_t)(end - cur));
             return;
@@ -514,14 +526,15 @@ static void zero_range_ww(winalloc *w, uint64_t start, uint64_t len) {
         if (cnt == 0) {
             /* Untouched demand-zero chunk: leave untouched (0 MB Working Set inflation). */
         } else if (cnt == n_pages) {
-            /* Fast-path: all pages in this chunk are dirty -> single contiguous memset. */
-            memset((void *)(uintptr_t)cur, 0, (size_t)chunk_len);
+            /* Fast-path: extend pending contiguous dirty run across 16MB chunks. */
+            flush_zero_run(&ps, &pe, cur, cur + chunk_len);
         } else {
             size_t k = 0;
             while (k < cnt) {
                 uint64_t run_start = (uint64_t)(uintptr_t)g_ww_addrs[k];
                 uint64_t run_end;
                 if (run_start < cur || run_start > cur + chunk_len - PG || (run_start & (PG - 1))) {
+                    if (pe > ps) memset((void *)(uintptr_t)ps, 0, (size_t)(pe - ps));
                     w->write_watch = 0;
                     memset((void *)(uintptr_t)cur, 0, (size_t)(end - cur));
                     return;
@@ -533,11 +546,12 @@ static void zero_range_ww(winalloc *w, uint64_t start, uint64_t len) {
                     run_end += PG;
                     k++;
                 }
-                memset((void *)(uintptr_t)run_start, 0, (size_t)(run_end - run_start));
+                flush_zero_run(&ps, &pe, run_start, run_end);
             }
         }
         cur += chunk_len;
     }
+    if (pe > ps) memset((void *)(uintptr_t)ps, 0, (size_t)(pe - ps));
 }
 
 /* Release a VMA-owned Windows allocation or file view once nothing in it is
