@@ -35,6 +35,7 @@
 /* per-extent state bits */
 #define P_MAPPED 0x08
 #define P_COMMIT 0x10
+#define P_SHARED 0x20   /* MAP_SHARED: MADV_DONTNEED is a safe no-op */
 #define P_PROT   0x07   /* Linux PROT_* bits */
 
 enum {
@@ -57,15 +58,20 @@ typedef struct {
     unsigned char owned;         /* 1 = VMA owns the OS reservation/view; 0 = adopted */
     unsigned char linux_touched; /* 1 = a Linux VMA call touched this region */
     unsigned char kind;          /* VMA_ANON / VMA_FILEMAP / VMA_FILEMAP_EMPTY */
+    unsigned char write_watch;   /* 1 = MEM_WRITE_WATCH active (owned VMA_ANON on Windows) */
 } winalloc;
+
+#define WW_CHUNK_PAGES 4096u
 
 /* Sorted by base, pairwise disjoint. */
 static winalloc *g_a;
 static size_t g_n, g_cap;
 static uint64_t g_os_calls;
+static void *g_ww_addrs[WW_CHUNK_PAGES]; /* protected by g_lock */
 #ifdef AFW_TEST
 static int g_fail_os;
 static int g_fail_meta;
+static int g_fail_ww;
 #endif
 
 #if defined(_WIN32)
@@ -128,6 +134,12 @@ void afw_vma_test_fail_meta(int nth) {
     g_fail_meta = nth > 0 ? nth : 0;
     UNLOCK();
 }
+
+void afw_vma_test_fail_ww(int nth) {
+    LOCK();
+    g_fail_ww = nth > 0 ? nth : 0;
+    UNLOCK();
+}
 #endif
 
 /* Round len up to pages; reject overflow of len, size_t truncation, or addr + n. */
@@ -155,6 +167,18 @@ static winalloc *find(uint64_t addr) {
     if (i < g_n && addr >= g_a[i].base) return &g_a[i];
     return NULL;
 }
+
+#ifdef AFW_TEST
+int afw_vma_test_ww_active(uint64_t addr) {
+    int active = 0;
+    winalloc *w;
+    LOCK();
+    w = find(addr);
+    if (w && w->write_watch) active = 1;
+    UNLOCK();
+    return active;
+}
+#endif
 
 /* Unique extent containing addr (caller guarantees w->base <= addr < w->base + w->size). */
 static size_t find_ext(const winalloc *w, uint64_t addr) {
@@ -303,6 +327,7 @@ static winalloc *add(uint64_t base, uint64_t size) {
     w->owned = 1;
     w->linux_touched = 0;
     w->kind = VMA_ANON;
+    w->write_watch = 0;
     w->ext[0].start = base;
     w->ext[0].end = base + size;
     w->ext[0].state = 0;
@@ -423,6 +448,112 @@ static int os_filemap_protect(uint64_t a, uint64_t n, int prot) {
     return afw_os_filemap_protect((void *)(uintptr_t)a, (size_t)n, p) == 0 ? 0 : -1;
 }
 
+/* Owned VMA_ANON reservation routed through platform.c (Rule 8): enables
+ * MEM_WRITE_WATCH on Windows (with fallback to plain MEM_RESERVE). */
+static int os_reserve_anon(uint64_t addr, uint64_t size, uint64_t *out, int *ww_out) {
+    if (os_tick() != 0) return -1;
+    return afw_os_ww_reserve(addr, size, out, ww_out);
+}
+
+/* Reset write-watch state ONLY right after os_commit on freshly-zeroed MEM_COMMIT
+ * pages under g_lock (never on MEM_RESERVE, and never after memset on accessible
+ * pages). Fail-closed: disables write_watch on error. */
+static void ww_reset_or_disable(winalloc *w, uint64_t a, uint64_t len) {
+    if (!w->write_watch) return;
+#ifdef AFW_TEST
+    if (g_fail_ww > 0 && --g_fail_ww == 0) {
+        w->write_watch = 0;
+        return;
+    }
+#endif
+    if (afw_os_ww_reset(a, len) != 0)
+        w->write_watch = 0;
+}
+
+/* Zero committed accessible private anonymous range [start, start + len).
+ * When MEM_WRITE_WATCH is active (owned VMA_ANON on Windows):
+ *   1. Queries dirty pages with reset=0 (GetWriteWatch(0, ...)) in 16MB (4096-page)
+ *      chunks. Passing reset=0 avoids disarming writable PTEs and triggering a soft
+ *      write-watch page fault on every page we are about to memset(0), AND never
+ *      clears any dirty bit on accessible pages so concurrent writes cannot lose
+ *      their dirty state (Reviewers 1 & 3). Dirty bits are cleared only on fresh
+ *      os_commit (map_extents / do_protect).
+ *   2. Skips untouched demand-zero chunks (0 writes, 0 Working Set inflation).
+ *   3. Fast-paths 100%-dirty chunks and coalesces contiguous dirty runs into single memsets.
+ *   4. Fail-closed on any API error, bad granularity, or out-of-range page: disables
+ *      w->write_watch and zeroes the entire remaining range with memset(0) (Reviewer 2). */
+static void flush_zero_run(uint64_t *ps, uint64_t *pe, uint64_t rs, uint64_t re) {
+    if (*pe > *ps && *pe == rs) {
+        *pe = re;
+        return;
+    }
+    if (*pe > *ps) memset((void *)(uintptr_t)*ps, 0, (size_t)(*pe - *ps));
+    *ps = rs;
+    *pe = re;
+}
+
+static void zero_range_ww(winalloc *w, uint64_t start, uint64_t len) {
+    uint64_t cur = start, end = start + len;
+    uint64_t ps = 0, pe = 0;
+    if (!w->write_watch) {
+        memset((void *)(uintptr_t)start, 0, (size_t)len);
+        return;
+    }
+    while (cur < end) {
+        uint64_t chunk_len = end - cur;
+        uint64_t max_chunk = (uint64_t)WW_CHUNK_PAGES * PG;
+        size_t n_pages, cnt;
+        uint32_t gran = 0;
+        int ww_rc;
+
+        if (chunk_len > max_chunk) chunk_len = max_chunk;
+        n_pages = (size_t)(chunk_len / PG);
+        cnt = WW_CHUNK_PAGES;
+
+#ifdef AFW_TEST
+        if (g_fail_ww > 0 && --g_fail_ww == 0) ww_rc = -1;
+        else
+#endif
+        ww_rc = afw_os_ww_get(cur, chunk_len, 0, g_ww_addrs, &cnt, &gran);
+
+        if (ww_rc != 0 || gran != (uint32_t)PG || cnt > n_pages) {
+            if (pe > ps) memset((void *)(uintptr_t)ps, 0, (size_t)(pe - ps));
+            w->write_watch = 0;
+            memset((void *)(uintptr_t)cur, 0, (size_t)(end - cur));
+            return;
+        }
+
+        if (cnt == 0) {
+            /* Untouched demand-zero chunk: leave untouched (0 MB Working Set inflation). */
+        } else if (cnt == n_pages) {
+            /* Fast-path: extend pending contiguous dirty run across 16MB chunks. */
+            flush_zero_run(&ps, &pe, cur, cur + chunk_len);
+        } else {
+            size_t k = 0;
+            while (k < cnt) {
+                uint64_t run_start = (uint64_t)(uintptr_t)g_ww_addrs[k];
+                uint64_t run_end;
+                if (run_start < cur || run_start > cur + chunk_len - PG || (run_start & (PG - 1))) {
+                    if (pe > ps) memset((void *)(uintptr_t)ps, 0, (size_t)(pe - ps));
+                    w->write_watch = 0;
+                    memset((void *)(uintptr_t)cur, 0, (size_t)(end - cur));
+                    return;
+                }
+                run_end = run_start + PG;
+                k++;
+                while (k < cnt && (uint64_t)(uintptr_t)g_ww_addrs[k] == run_end &&
+                       run_end <= cur + chunk_len - PG) {
+                    run_end += PG;
+                    k++;
+                }
+                flush_zero_run(&ps, &pe, run_start, run_end);
+            }
+        }
+        cur += chunk_len;
+    }
+    if (pe > ps) memset((void *)(uintptr_t)ps, 0, (size_t)(pe - ps));
+}
+
 /* Release a VMA-owned Windows allocation or file view once nothing in it is
  * mapped. Adopted library regions (owned == 0) are never released here: the
  * loader owns the VirtualAlloc (and its trailing stub reserve) and frees it
@@ -445,7 +576,7 @@ static void release_if_empty(winalloc *w) {
  * Phase 2: if prot != 0, commit [a, a+n) in a single OS call.
  * Metadata changes only after each OS call succeeds.
  */
-static int map_extents(winalloc *w, uint64_t a, uint64_t n, int prot) {
+static int map_extents(winalloc *w, uint64_t a, uint64_t n, int prot, int shared) {
     size_t i0, i1, i, j, k;
     int rc = 0;
     prot &= P_PROT;
@@ -453,25 +584,30 @@ static int map_extents(winalloc *w, uint64_t a, uint64_t n, int prot) {
 
     /* Phase 1: decommit committed runs so MAP_FIXED over live pages reads zeros. */
     for (i = i0; i < i1;) {
+        uint64_t run_len;
         if (!(w->ext[i].state & P_COMMIT)) { i++; continue; }
         j = i + 1;
         while (j < i1 && (w->ext[j].state & P_COMMIT)) j++;
-        if (os_decommit(w->ext[i].start, w->ext[j - 1].end - w->ext[i].start) != 0) {
+        run_len = w->ext[j - 1].end - w->ext[i].start;
+        if (os_decommit(w->ext[i].start, run_len) != 0) {
             rc = -1;
             break;
         }
         for (k = i; k < j; k++)
-            w->ext[k].state = (unsigned char)(w->ext[k].state & P_MAPPED);
+            w->ext[k].state = (unsigned char)(w->ext[k].state & (P_MAPPED | P_SHARED));
         w->linux_touched = 1;
         i = j;
     }
 
-    /* Phase 2: commit whole range in one call (if accessible), then publish. */
+    /* Phase 2: commit whole range in one call (if accessible), then publish.
+     * ResetWriteWatch requires MEM_COMMIT pages; run right after os_commit under g_lock. */
     if (rc == 0 && prot) {
         if (os_commit(a, n, prot) != 0) rc = -1;
+        else ww_reset_or_disable(w, a, n);
     }
     if (rc == 0) {
-        unsigned char st = (unsigned char)(P_MAPPED | (prot ? P_COMMIT : 0) | prot);
+        unsigned char st = (unsigned char)(P_MAPPED | (prot ? P_COMMIT : 0) |
+                                           (shared ? P_SHARED : 0) | prot);
         for (i = i0; i < i1; i++) {
             if (!(w->ext[i].state & P_MAPPED))
                 w->mapped_bytes += w->ext[i].end - w->ext[i].start;
@@ -487,10 +623,14 @@ static int map_extents(winalloc *w, uint64_t a, uint64_t n, int prot) {
 static int64_t mmap_locked(uint64_t addr, uint64_t len, int prot, int flags, int fd, int64_t off) {
     uint64_t n, base;
     int fixed = (flags & (LNX_MAP_FIXED | LNX_MAP_FIXED_NOREPLACE)) != 0;
+    int share_type = flags & (LNX_MAP_SHARED | LNX_MAP_PRIVATE);
+    int shared, ww = 0;
     winalloc *w;
     (void)off;
     if (!len || range(fixed ? addr : 0, len, &n) != 0) return -LNX_EINVAL;
     if (!(flags & LNX_MAP_ANONYMOUS) || fd != -1) return -LNX_ENODEV;
+    if (share_type != LNX_MAP_SHARED && share_type != LNX_MAP_PRIVATE) return -LNX_EINVAL;
+    shared = (share_type == LNX_MAP_SHARED);
     prot &= P_PROT;
     if (fixed) {
         size_t idx;
@@ -506,7 +646,7 @@ static int64_t mmap_locked(uint64_t addr, uint64_t len, int prot, int flags, int
                 return -LNX_EEXIST;
             if (w->kind != VMA_ANON)
                 return -LNX_ENOSYS; /* documented G2 limit: cannot overlay/split a live filemap view */
-            return map_extents(w, addr, n, prot) == 0 ? (int64_t)addr : -LNX_ENOMEM;
+            return map_extents(w, addr, n, prot, shared) == 0 ? (int64_t)addr : -LNX_ENOMEM;
         }
         /* Reject ranges in free space that would collide with a later allocation. */
         idx = lower_bound_alloc(addr);
@@ -524,13 +664,14 @@ static int64_t mmap_locked(uint64_t addr, uint64_t len, int prot, int flags, int
                             "cannot be reserved on Windows (documented limit)\n", (unsigned long long)addr);
             return -LNX_ENOMEM;
         }
-        if (os_reserve(addr, n, &base) != 0) return -LNX_ENOMEM;
+        if (os_reserve_anon(addr, n, &base, &ww) != 0) return -LNX_ENOMEM;
     } else {
-        if (os_reserve(0, n, &base) != 0) return -LNX_ENOMEM;
+        if (os_reserve_anon(0, n, &base, &ww) != 0) return -LNX_ENOMEM;
     }
     w = add(base, n);
     if (!w) { os_release(base, n); return -LNX_ENOMEM; }
-    if (map_extents(w, base, n, prot) != 0) {
+    w->write_watch = (unsigned char)(ww ? 1 : 0);
+    if (map_extents(w, base, n, prot, shared) != 0) {
         /* undo: releasing the whole reservation also drops anything committed */
         if (os_release(base, n) == 0) remove_alloc(w);
         return -LNX_ENOMEM;
@@ -638,9 +779,11 @@ static int do_unmap(winalloc *w, uint64_t a, uint64_t n, int arg) {
     } else {
         for (i = i0; i < i1;) {
             if (w->ext[i].state & P_COMMIT) {
+                uint64_t run_len;
                 j = i + 1;
                 while (j < i1 && (w->ext[j].state & P_COMMIT)) j++;
-                if (os_decommit(w->ext[i].start, w->ext[j - 1].end - w->ext[i].start) != 0) {
+                run_len = w->ext[j - 1].end - w->ext[i].start;
+                if (os_decommit(w->ext[i].start, run_len) != 0) {
                     rc = -LNX_ENOMEM;
                     break;
                 }
@@ -713,22 +856,25 @@ static int do_protect(winalloc *w, uint64_t a, uint64_t n, int prot) {
                 break;
             }
             for (k = i; k < j; k++)
-                w->ext[k].state = (unsigned char)(P_MAPPED | P_COMMIT | prot);
+                w->ext[k].state = (unsigned char)(P_MAPPED | P_COMMIT | (w->ext[k].state & P_SHARED) | prot);
             w->linux_touched = 1;
             i = j;
         } else if (prot) {
+            uint64_t run_len;
             j = i + 1;
             while (j < i1 && !(w->ext[j].state & P_COMMIT)) j++;
-            if (os_commit(w->ext[i].start, w->ext[j - 1].end - w->ext[i].start, prot) != 0) {
+            run_len = w->ext[j - 1].end - w->ext[i].start;
+            if (os_commit(w->ext[i].start, run_len, prot) != 0) {
                 rc = -LNX_ENOMEM;
                 break;
             }
+            ww_reset_or_disable(w, w->ext[i].start, run_len);
             for (k = i; k < j; k++)
-                w->ext[k].state = (unsigned char)(P_MAPPED | P_COMMIT | prot);
+                w->ext[k].state = (unsigned char)(P_MAPPED | P_COMMIT | (w->ext[k].state & P_SHARED) | prot);
             w->linux_touched = 1;
             i = j;
         } else {
-            w->ext[i].state = P_MAPPED;
+            w->ext[i].state = (unsigned char)(P_MAPPED | (w->ext[i].state & P_SHARED));
             i++;
         }
     }
@@ -749,21 +895,48 @@ static int do_dontneed(winalloc *w, uint64_t a, uint64_t n, int arg) {
     for (i = i0; i < i1; i++) {
         uint64_t len = w->ext[i].end - w->ext[i].start;
         int prot = w->ext[i].state & P_PROT;
+        if (w->ext[i].state & P_SHARED) continue;         /* MAP_SHARED: safe no-op */
         if (!(w->ext[i].state & P_COMMIT)) continue;      /* reserved stays reserved */
-        if (os_decommit(w->ext[i].start, len) != 0) {     /* drop contents */
-            rc = -LNX_ENOMEM;
-            break;
-        }
-        w->ext[i].state = P_MAPPED;                       /* now truthfully reserved */
-        w->linux_touched = 1;
-        if (prot) {                                       /* accessible: zeros back now */
-            if (os_commit(w->ext[i].start, len, prot) != 0) {
+        if (prot == 0) {
+            /* PROT_NONE in MEM_COMMIT: decommit drops commit charge with zero VEH/Red Zone risk
+             * because accessing PROT_NONE is already a fault. (ResetWriteWatch runs on later
+             * os_commit because ResetWriteWatch requires MEM_COMMIT pages.) */
+            if (os_decommit(w->ext[i].start, len) != 0) {
                 rc = -LNX_ENOMEM;
                 break;
             }
-            w->ext[i].state = (unsigned char)(P_MAPPED | P_COMMIT | prot);
+            w->ext[i].state = P_MAPPED;
+            w->linux_touched = 1;
+        } else if (prot & LNX_PROT_WRITE) {
+            /* Accessible writable anonymous page: zero dirty pages in place under g_lock
+             * (via MEM_WRITE_WATCH when active, skipping untouched demand-zero pages).
+             * Avoids any MEM_DECOMMIT window (no VEH faults, no KiUserExceptionDispatcher
+             * Red Zone clobber, no ERROR_NOACCESS in kernel syscalls).
+             * Documented limit (docs/design/G2-PLAN.md Section 4.2(4)): memset(0) is not
+             * PTE-atomic; concurrent application access to the same object during
+             * MADV_DONTNEED is a C11 data race and may observe partial zeros. */
+            zero_range_ww(w, w->ext[i].start, len);
+            w->linux_touched = 1;
+        } else {
+            /* Anonymous read-only (or RX) page without PROT_WRITE: temporarily switch
+             * to PAGE_READWRITE (never RWX, per Reviewer 3) under g_lock, zero, and
+             * restore original protection.
+             * Documented limit: during this temporary window, a concurrent write from
+             * another thread could succeed instead of faulting. */
+            int tmp_prot = LNX_PROT_READ | LNX_PROT_WRITE;
+            if (os_protect(w->ext[i].start, len, tmp_prot) != 0) {
+                rc = -LNX_ENOMEM;
+                break;
+            }
+            zero_range_ww(w, w->ext[i].start, len);
+            w->linux_touched = 1;
+            if (os_protect(w->ext[i].start, len, prot) != 0) {
+                /* Keep metadata truthful to actual OS protection on restore failure (Rule 8). */
+                w->ext[i].state = (unsigned char)(P_MAPPED | P_COMMIT | tmp_prot);
+                rc = -LNX_ENOMEM;
+                break;
+            }
         }
-        /* PROT_NONE: stays reserved; a later mprotect commits fresh zero pages */
     }
 
     if (rc == 0) w->linux_touched = 1;
@@ -894,6 +1067,7 @@ int afw_vma_adopt(uint64_t base, uint64_t size, const unsigned char *page_prot) 
     w->owned = 0;
     w->linux_touched = 0;
     w->kind = VMA_ANON;
+    w->write_watch = 0;
     UNLOCK();
     return 0;
 }

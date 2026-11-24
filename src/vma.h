@@ -21,9 +21,13 @@
  *   mprotect         committed extents: VirtualProtect (PROT_NONE keeps the
  *                    contents, as on Linux - NOT a decommit); reserved
  *                    extents made accessible are committed then
- *   madvise          MADV_DONTNEED: mapped committed extents read back as
- *                    zeros (decommit + recommit); other advice is a no-op
- * File-backed mappings are not supported yet (-ENODEV).
+ *   madvise          MADV_DONTNEED: on VMA_ANON committed accessible pages,
+ *                    zeroes in place via memset(0) under g_lock (temporary
+ *                    RW->RO around anonymous PROT_READ); PROT_NONE committed
+ *                    pages decommit back to reserved; reserved pages and
+ *                    VMA_FILEMAP/MAP_SHARED are safe no-ops; other advice is
+ *                    a no-op
+ * File-backed read-only mappings are handled by src/filemap.c (VMA_FILEMAP).
  * Synchronized with a single lock (SRWLOCK on Windows, pthread mutex on host).
  */
 #ifndef AFW_VMA_H
@@ -112,6 +116,10 @@ uint64_t afw_vma_os_call_count(void);
 void afw_vma_test_fail_os(int nth);
 /* Test hook: fail the nth next extent metadata growth (1 = very next, 0 = off). */
 void afw_vma_test_fail_meta(int nth);
+/* Test hook: fail the nth next write-watch API call (1 = very next, 0 = off). */
+void afw_vma_test_fail_ww(int nth);
+/* Test hook: returns 1 if the allocation containing addr has write_watch active, else 0. */
+int afw_vma_test_ww_active(uint64_t addr);
 #endif
 
 #endif

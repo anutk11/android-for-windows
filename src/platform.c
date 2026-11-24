@@ -712,6 +712,44 @@ int afw_os_filemap_protect(void *addr, size_t len, int prot) {
     return VirtualProtect(addr, (SIZE_T)len, wp, &old) ? 0 : win_err_to_lnx(GetLastError());
 }
 
+int afw_os_ww_reserve(uint64_t addr, uint64_t size, uint64_t *out, int *ww_out) {
+    void *p;
+    if (!size || !out || !ww_out) return -1;
+    p = VirtualAlloc((void *)(uintptr_t)addr, (SIZE_T)size,
+                     MEM_RESERVE | MEM_WRITE_WATCH, PAGE_NOACCESS);
+    if (p) {
+        *out = (uint64_t)(uintptr_t)p;
+        *ww_out = 1;
+        return 0;
+    }
+    /* Fallback to plain MEM_RESERVE if MEM_WRITE_WATCH is unavailable. */
+    p = VirtualAlloc((void *)(uintptr_t)addr, (SIZE_T)size, MEM_RESERVE, PAGE_NOACCESS);
+    if (!p) return -1;
+    *out = (uint64_t)(uintptr_t)p;
+    *ww_out = 0;
+    return 0;
+}
+
+int afw_os_ww_get(uint64_t addr, uint64_t len, int reset,
+                  void **addrs, size_t *count_io, uint32_t *gran_out) {
+    ULONG_PTR cnt;
+    DWORD gran = 0;
+    DWORD flags = reset ? WRITE_WATCH_FLAG_RESET : 0;
+    if (!addr || !len || !addrs || !count_io || !*count_io || !gran_out) return -1;
+    cnt = (ULONG_PTR)*count_io;
+    if (GetWriteWatch(flags, (void *)(uintptr_t)addr, (SIZE_T)len,
+                      addrs, &cnt, &gran) != 0)
+        return -1;
+    *count_io = (size_t)cnt;
+    *gran_out = (uint32_t)gran;
+    return 0;
+}
+
+int afw_os_ww_reset(uint64_t addr, uint64_t len) {
+    if (!addr || !len) return -1;
+    return ResetWriteWatch((void *)(uintptr_t)addr, (SIZE_T)len) == 0 ? 0 : -1;
+}
+
 #else
 #include <errno.h>
 #include <fcntl.h>
@@ -968,5 +1006,27 @@ int afw_os_filemap_protect(void *addr, size_t len, int prot) {
     if (prot & (AFW_PROT_W | AFW_PROT_X)) return -EACCES;
     lp = (prot & AFW_PROT_R) ? PROT_READ : PROT_NONE;
     return mprotect(addr, len, lp) == 0 ? 0 : -errno;
+}
+
+int afw_os_ww_reserve(uint64_t addr, uint64_t size, uint64_t *out, int *ww_out) {
+    void *p;
+    if (!size || !out || !ww_out) return -1;
+    p = mmap((void *)(uintptr_t)addr, (size_t)size, PROT_NONE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | (addr ? MAP_FIXED_NOREPLACE : 0), -1, 0);
+    if (p == MAP_FAILED) return -1;
+    *out = (uint64_t)(uintptr_t)p;
+    *ww_out = 0;
+    return 0;
+}
+
+int afw_os_ww_get(uint64_t addr, uint64_t len, int reset,
+                  void **addrs, size_t *count_io, uint32_t *gran_out) {
+    (void)addr; (void)len; (void)reset; (void)addrs; (void)count_io; (void)gran_out;
+    return -1;
+}
+
+int afw_os_ww_reset(uint64_t addr, uint64_t len) {
+    (void)addr; (void)len;
+    return -1;
 }
 #endif
