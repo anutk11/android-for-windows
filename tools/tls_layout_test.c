@@ -97,9 +97,13 @@ int main(void) {
     run("four modules, mixed alignment", many, 4);
     run("no modules", NULL, 0);
 
-    /* Concrete oracle cross-check for pinned Android 14 libc.so (p_align=8, p_memsz=8):
-     * mod_align=8 => align=8, tp_off=0x10, overflowed=0, offset_bionic_tls=0x60,
-     * size=roundup(0x60+0x2fa8, 8)=0x3008 (exact linker64 StaticTlsLayout formulas). */
+    /* Concrete cross-check for pinned Android 14 libc.so (p_align=8, p_memsz=8):
+     * tp_off=0x10 is supplied by the G1-TLS layout contract (minimum TP alignment 16),
+     * not copied from linker64's executable-PT_TLS calculation. The pinned linker64
+     * oracle independently confirms the post-TP layout formulas: TCB size 0x50,
+     * Bionic TLS size 0x2fa8, alignment max(mod_align, 8), overflowed=0,
+     * offset_bionic_tls = roundup(tp_off + 0x50, 8) = 0x60, and
+     * size = roundup(0x60 + 0x2fa8, 8) = 0x3008. */
     memset(&l, 0, sizeof l);
     CHECK(afw_tls_layout_add(&l, &libc[0]) == 0 && afw_tls_layout_finish(&l) == 0, "libc concrete layout");
     CHECK(afw_tls_layout_to_bionic(&l, &stl) == 0, "libc concrete bionic layout");
