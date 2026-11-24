@@ -24,7 +24,8 @@ typedef struct {
 typedef struct {
     int nmod;
     uint64_t off[AFW_TLS_MAX_MODULES];    /* module m (0-based) at tp - off[m] */
-    uint64_t max_align;                    /* >= 16 */
+    uint64_t mod_align;                    /* max PT_TLS p_align registered (0 if none) */
+    uint64_t max_align;                    /* >= 16 (G1-TLS main-thread tp alignment) */
     uint64_t tp_off;                       /* tp = block + tp_off */
     uint64_t alloc_size;                   /* bytes per thread, page multiple */
 } afw_tls_layout;
@@ -38,5 +39,45 @@ int afw_tls_layout_add(afw_tls_layout *l, const afw_tls_segment *seg);
 /* Recompute tp_off and alloc_size after the last add. Returns 0, or -5 on
  * overflow. */
 int afw_tls_layout_finish(afw_tls_layout *l);
+
+/*
+ * Bionic StaticTlsLayout (40 bytes at libc_shared_globals + 0x450,
+ * Android 14 Build ID fa337969c798946280caa45e2d71a2e7 — verified directly
+ * against linker64 + libc.so disassembly in bionic-probe):
+ *   +0x00 (0x450): size_                    (roundup(offset_bionic_tls + 0x2fa8, align_))
+ *   +0x08 (0x458): align_                   (max(mod_align, 8); power of two <= 4096)
+ *   +0x10 (0x460): overflowed_              (bool + 7B pad; MUST be 0)
+ *   +0x18 (0x468): offset_bionic_tcb_ / TP  (x86_64 Variant II: == tp_off)
+ *   +0x20 (0x470): offset_bionic_tls_       (roundup(tp_off + 0x50, 8))
+ *
+ *   low                                                                 high
+ *   [ module N ] ... [ module 1 ] [ bionic_tcb (0x50) ] [ bionic_tls (0x2fa8) ] [pad to align_]
+ *                                 ^ tp (= offset_thread_pointer)
+ *                                                       ^ offset_bionic_tls
+ *   |<---------------------------------------- size ----------------------------------------->|
+ *
+ * Module m lives at tp - l->off[m] inside [0, offset_thread_pointer),
+ * matching R_X86_64_TPOFF64 relocations computed by G1-TLS.
+ * Because libc.so __allocate_thread_mapping (0xcc96c..0xcc974) places
+ * static_tls_base at (mapping_end - 0x1000) - size_ without reading align_,
+ * static_tls_base alignment is bounded by 4096; layouts with max_align > 4096
+ * are explicitly refused.
+ */
+#define AFW_BIONIC_TCB_SIZE             0x50u   /* measured: linker64 0x145ffe (addq $0x50) */
+#define AFW_BIONIC_TLS_SIZE             0x2fa8u /* measured: linker64 0x146087 (addq $0x2fa8) */
+#define AFW_BIONIC_TLS_ALIGN            8u      /* measured: linker64 0x146077 (andq $-0x8) */
+#define AFW_BIONIC_STATIC_TLS_MAX_ALIGN 4096u   /* __allocate_thread_mapping guard-page bound */
+
+typedef struct {
+    uint64_t size;
+    uint64_t align;
+    uint64_t overflowed;                    /* bool overflowed_ + 7B zero padding: always 0 */
+    uint64_t offset_thread_pointer;         /* +0x18: offset_bionic_tcb_ / offset_thread_pointer_ */
+    uint64_t offset_bionic_tls;             /* +0x20: offset_bionic_tls_ */
+} afw_bionic_static_tls;
+
+/* Derive Bionic's StaticTlsLayout from a finished afw_tls_layout.
+ * Returns 0 on success, or -5 on invalid layout / max_align > 4096 / overflow. */
+int afw_tls_layout_to_bionic(const afw_tls_layout *l, afw_bionic_static_tls *out);
 
 #endif

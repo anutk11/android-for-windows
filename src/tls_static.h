@@ -30,6 +30,10 @@ int afw_tls_static_count(void);
 /* Offset of module `mod` (1-based) below tp, or 0 if unknown. */
 uint64_t afw_tls_static_off(int mod);
 
+/* Copy the finalized Bionic StaticTlsLayout (valid after afw_tls_static_finish).
+ * Returns 0 on success, -1 if not yet finalized. */
+int afw_tls_static_get_bionic_layout(afw_bionic_static_tls *out);
+
 /* Allocate and initialise one thread's block. Returns tp (the bionic slot
  * array), or NULL; *block gets the allocation, which is what
  * afw_tls_static_free() takes (tp's offset in it depends on the layout at

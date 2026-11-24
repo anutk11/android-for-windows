@@ -6,6 +6,7 @@
 #ifndef AFW_BIONIC_SHIM_H
 #define AFW_BIONIC_SHIM_H
 #include <stdint.h>
+#include "tls_layout.h"
 
 /* Find a replacement for an Android library symbol. NULL if we have none. */
 void *afw_shim_lookup(const char *name);
@@ -27,5 +28,6 @@ int afw_shim_count(void);
 void *afw_shared_globals(void);
 const unsigned char *afw_shared_globals_random(void);
 void afw_shared_globals_set_process(const uint64_t *auxv, char **envp, const char *progname);
+void afw_shared_globals_set_static_tls(const afw_bionic_static_tls *stl);
 
 #endif

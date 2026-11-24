@@ -1,6 +1,7 @@
 /* tls_static.c - see tls_static.h */
 #include "tls_static.h"
 #include "tls_patch.h"
+#include "bionic_shim.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +13,7 @@
 #endif
 
 static afw_tls_layout g_layout;
+static afw_bionic_static_tls g_bionic_stl;
 static const void *g_image[AFW_TLS_MAX_MODULES];
 static afw_tls_segment g_seg[AFW_TLS_MAX_MODULES];
 static int g_finished;
@@ -48,6 +50,12 @@ int afw_tls_static_unregister(int mod) {
 
 uint64_t afw_tls_static_off(int mod) {
     return (mod >= 1 && mod <= g_layout.nmod) ? g_layout.off[mod - 1] : 0;
+}
+
+int afw_tls_static_get_bionic_layout(afw_bionic_static_tls *out) {
+    if (!g_finished || !out) return -1;
+    *out = g_bionic_stl;
+    return 0;
 }
 
 uintptr_t *afw_tls_static_alloc(void **out, unsigned char **area) {
@@ -91,10 +99,12 @@ void afw_tls_static_free(void *block) {
 
 int afw_tls_static_finish(void) {
     int m;
+    afw_bionic_static_tls stl;
     const void *orig[AFW_TLS_MAX_MODULES] = {0};
     void *copy[AFW_TLS_MAX_MODULES] = {0};
     if (g_finished) return 0;
-    if (afw_tls_layout_finish(&g_layout) != 0) {
+    if (afw_tls_layout_finish(&g_layout) != 0 ||
+        afw_tls_layout_to_bionic(&g_layout, &stl) != 0) {
         fprintf(stderr, "error: static TLS layout overflow\n");
         return -1;
     }
@@ -119,6 +129,8 @@ int afw_tls_static_finish(void) {
         for (m = 0; m < g_layout.nmod; m++) { g_image[m] = orig[m]; free(copy[m]); }
         return -1;
     }
+    g_bionic_stl = stl;
+    afw_shared_globals_set_static_tls(&g_bionic_stl);
     g_finished = 1;
     return 0;
 }
