@@ -779,6 +779,7 @@ int main(int argc, char **argv) {
                 env_overrides[nenv_overrides++] = argv[a] + 6;
             }
             else if (strcmp(argv[a], "--exec") == 0) { exec_from = a + 1; break; }   /* the rest: the program's args */
+            else if (strcmp(argv[a], "--probe-syscalls") == 0) { afw_syscall_probe_log = 1; afw_crash_enable_probe_veh(); }
             else if (strcmp(argv[a], "--call-bad-ip") == 0) call_bad_ip = 1;
             else if (strncmp(argv[a], "--watchdog=", 11) == 0) {
                 int sec = atoi(argv[a] + 11);

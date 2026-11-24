@@ -38,4 +38,8 @@ extern volatile int64_t afw_last_syscall_args[6];
 extern volatile uint64_t afw_last_syscall_ret;
 int64_t afw_syscall_from_entry(int64_t nr, int64_t *args);
 
+/* Opt-in G2-1 measurement logging (--probe-syscalls); 0 by default. */
+extern int afw_syscall_probe_log;
+void afw_syscall_probe_summary(void);
+
 #endif

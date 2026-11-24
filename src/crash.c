@@ -189,7 +189,26 @@ int afw_watchdog_start(unsigned seconds) {
     CloseHandle(t);
     return 0;
 }
+
+static volatile LONG g_probe_veh_logged;
+static LONG CALLBACK probe_veh_handler(EXCEPTION_POINTERS *ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
+        code != EXCEPTION_PRIV_INSTRUCTION && code != EXCEPTION_INT_DIVIDE_BY_ZERO &&
+        code != EXCEPTION_STACK_OVERFLOW)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (InterlockedExchange(&g_probe_veh_logged, 1) == 0) {
+        on_crash(ep);
+        afw_syscall_probe_summary();
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void afw_crash_enable_probe_veh(void) {
+    AddVectoredExceptionHandler(0, probe_veh_handler);
+}
 #else
 void afw_crash_init(void) {}
 int afw_watchdog_start(unsigned seconds) { (void)seconds; return 0; }   /* Windows only */
+void afw_crash_enable_probe_veh(void) {}
 #endif
