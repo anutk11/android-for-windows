@@ -149,6 +149,18 @@ typedef struct { const char *name; void *addr; } shim_entry;
  * it: an empty fd table, an unlocked abort-message mutex, no TLS modules. */
 #define SG_SIZE              0x1000   /* last field measured: 0x680 */
 #define SG_AUXV              0x418
+/* StaticTlsLayout inside libc_shared_globals (pinned Build ID fa337969c798946280caa45e2d71a2e7):
+ *   0x450: size_                    (measured: __allocate_thread_mapping, __libc_get_static_tls_bounds)
+ *   0x458: align_                   (oracle-checked in bionic-probe)
+ *   0x460: offset_bionic_tcb_       (x86_64 Variant II: equals offset_thread_pointer_)
+ *   0x468: offset_thread_pointer_   (measured: pthread_create, __libc_get_static_tls_bounds, tls_get_addr_slow_path)
+ *   0x470: offset_bionic_tls_       (measured: pthread_create)
+ * Followed immediately by tls_modules.generation at 0x478 (measured: __libc_preinit_impl). */
+#define SG_STL_SIZE                  0x450
+#define SG_STL_ALIGN                 0x458
+#define SG_STL_OFFSET_BIONIC_TCB     0x460
+#define SG_STL_OFFSET_THREAD_POINTER 0x468
+#define SG_STL_OFFSET_BIONIC_TLS     0x470
 #define SG_INIT_PROGNAME     0x630
 #define SG_INIT_ENVIRON      0x638
 #define AT_NULL_    0
@@ -210,6 +222,17 @@ void afw_shared_globals_set_process(const uint64_t *auxv, char **envp, const cha
     if (auxv)     { p = (uint64_t)(uintptr_t)auxv;     memcpy(sg + SG_AUXV, &p, 8); }
     if (envp)     { p = (uint64_t)(uintptr_t)envp;     memcpy(sg + SG_INIT_ENVIRON, &p, 8); }
     if (progname) { p = (uint64_t)(uintptr_t)progname; memcpy(sg + SG_INIT_PROGNAME, &p, 8); }
+}
+
+void afw_shared_globals_set_static_tls(const afw_bionic_static_tls *stl) {
+    unsigned char *sg;
+    if (!stl) return;
+    sg = (unsigned char *)afw_shared_globals();
+    memcpy(sg + SG_STL_SIZE,                  &stl->size,                  8);
+    memcpy(sg + SG_STL_ALIGN,                 &stl->align,                 8);
+    memcpy(sg + SG_STL_OFFSET_BIONIC_TCB,     &stl->offset_bionic_tcb,     8);
+    memcpy(sg + SG_STL_OFFSET_THREAD_POINTER, &stl->offset_thread_pointer, 8);
+    memcpy(sg + SG_STL_OFFSET_BIONIC_TLS,     &stl->offset_bionic_tls,     8);
 }
 
 static const shim_entry g_shims[] = {

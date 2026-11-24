@@ -39,4 +39,32 @@ int afw_tls_layout_add(afw_tls_layout *l, const afw_tls_segment *seg);
  * overflow. */
 int afw_tls_layout_finish(afw_tls_layout *l);
 
+/*
+ * Bionic StaticTlsLayout (5 x uint64_t at libc_shared_globals + 0x450,
+ * Android 14 libc.so Build ID fa337969c798946280caa45e2d71a2e7):
+ *
+ *   low                                                                 high
+ *   [ module N ] ... [ module 1 ] [ bionic_tcb (128B) ] [pad] [ bionic_tls ]
+ *                                 ^ tp (= offset_bionic_tcb_ = offset_thread_pointer_)
+ *                                                             ^ offset_bionic_tls_
+ *   |<------------------------------- size_ ------------------------------->|
+ *
+ * Module m lives at tp - l->off[m] inside [0, offset_thread_pointer_),
+ * matching R_X86_64_TPOFF64 relocations computed by G1-TLS.
+ */
+#define AFW_BIONIC_TLS_SIZE  (64u * 1024u)  /* generous upper bound; oracle-checked in bionic-probe */
+#define AFW_BIONIC_TLS_ALIGN 64u            /* cache-line alignment (power of two) */
+
+typedef struct {
+    uint64_t size;
+    uint64_t align;
+    uint64_t offset_bionic_tcb;
+    uint64_t offset_thread_pointer;
+    uint64_t offset_bionic_tls;
+} afw_bionic_static_tls;
+
+/* Derive Bionic's StaticTlsLayout from a finished afw_tls_layout.
+ * Returns 0 on success, or -5 on invalid layout / overflow. */
+int afw_tls_layout_to_bionic(const afw_tls_layout *l, afw_bionic_static_tls *out);
+
 #endif

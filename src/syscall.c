@@ -270,6 +270,30 @@ static int64_t sys_getpid(void) {
 #endif
 }
 
+/* Per-thread signal mask bookkeeping for SYS_rt_sigprocmask(14).
+ * Bionic's __init_static_tls and pthread_create block/restore signals via
+ * rt_sigprocmask(SIG_SETMASK, ..., sigsetsize=8) around thread setup. */
+static _Thread_local uint64_t t_sigmask;
+
+static int64_t sys_rt_sigprocmask(int64_t how, const void *set, void *oldset, uint64_t sigsetsize) {
+    uint64_t prev = t_sigmask;
+    if (sigsetsize != 8) return -LNX_EINVAL;
+    if (set) {
+        uint64_t mask = 0;
+        const uint64_t unmaskable = (1ULL << (9 - 1)) | (1ULL << (19 - 1)); /* SIGKILL, SIGSTOP */
+        memcpy(&mask, set, 8);
+        mask &= ~unmaskable;
+        switch (how) {
+        case 0: /* SIG_BLOCK */   t_sigmask |= mask; break;
+        case 1: /* SIG_UNBLOCK */ t_sigmask &= ~mask; break;
+        case 2: /* SIG_SETMASK */ t_sigmask = mask; break;
+        default: return -LNX_EINVAL;
+        }
+    }
+    if (oldset) memcpy(oldset, &prev, 8);
+    return 0;
+}
+
 /* The last syscall the process made (diagnosis: the watchdog). The
  * entry frame holds the return address into the patched wrapper at
  * rbp+16, 64 bytes above args (rbp-48). Only set when called through the
@@ -490,6 +514,8 @@ int64_t afw_syscall_dispatch(int64_t nr, int64_t *a) {
     case 9:   return afw_mmap((uint64_t)a[0], (uint64_t)a[1], (int)a[2], (int)a[3], (int)a[4], a[5]);
     case 10:  return afw_mprotect((uint64_t)a[0], (uint64_t)a[1], (int)a[2]);
     case 11:  return afw_munmap((uint64_t)a[0], (uint64_t)a[1]);
+    case 14:  return sys_rt_sigprocmask(a[0], (const void *)(uintptr_t)a[1],
+                                        (void *)(uintptr_t)a[2], (uint64_t)a[3]);
     case 28:  return afw_madvise((uint64_t)a[0], (uint64_t)a[1], (int)a[2]);
     case 12:  return -12;  /* brk: no heap break; bionic and Scudo use mmap */
     case 157: /* prctl */
