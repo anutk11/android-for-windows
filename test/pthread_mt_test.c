@@ -111,7 +111,8 @@ static void *mutex_worker(void *p) {
 
 /* ---- Test 5: pthread_cond broadcast + signal ---- */
 static pthread_mutex_t g_bcast_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  g_bcast_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  g_bcast_ready_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  g_bcast_go_cv = PTHREAD_COND_INITIALIZER;
 static int g_bcast_ready;
 static int g_bcast_go;
 static _Atomic int g_bcast_woke;
@@ -120,9 +121,9 @@ static void *bcast_worker(void *p) {
     (void)p;
     pthread_mutex_lock(&g_bcast_mu);
     g_bcast_ready++;
-    pthread_cond_signal(&g_bcast_cv);
+    pthread_cond_signal(&g_bcast_ready_cv);
     while (!g_bcast_go)
-        pthread_cond_wait(&g_bcast_cv, &g_bcast_mu);
+        pthread_cond_wait(&g_bcast_go_cv, &g_bcast_mu);
     pthread_mutex_unlock(&g_bcast_mu);
     atomic_fetch_add(&g_bcast_woke, 1);
     return NULL;
@@ -318,9 +319,9 @@ int main(void) {
             CHECK(pthread_create(&th[i], NULL, bcast_worker, NULL) == 0, "T5 bcast create %d", i);
         pthread_mutex_lock(&g_bcast_mu);
         while (g_bcast_ready < 4)
-            pthread_cond_wait(&g_bcast_cv, &g_bcast_mu);
+            pthread_cond_wait(&g_bcast_ready_cv, &g_bcast_mu);
         g_bcast_go = 1;
-        pthread_cond_broadcast(&g_bcast_cv);
+        pthread_cond_broadcast(&g_bcast_go_cv);
         pthread_mutex_unlock(&g_bcast_mu);
         for (i = 0; i < 4; i++)
             CHECK(pthread_join(th[i], NULL) == 0, "T5 bcast join %d", i);
