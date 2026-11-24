@@ -35,7 +35,7 @@ int afw_attest_dump;
 
 int afw_gate_ok(const afw_lib *lib) {
     const afw_patch_report *r = &lib->patch;
-    return !r->unproven && !r->lsda_failures && !r->sys_untouched && !r->sys_outside_functions &&
+    return !r->unproven && !r->attest_rejected && !r->lsda_failures && !r->sys_untouched && !r->sys_outside_functions &&
            !r->fs_unsupported &&
            !r->gs_unsupported && !r->gs_outside_functions &&   /* gs: is the TEB on Windows (issue #15) */
            !r->fs_outside_functions &&   /* fs: look-alikes outside .eh_frame (reviewer 4); measured 0 in bionic */
