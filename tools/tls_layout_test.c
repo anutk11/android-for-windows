@@ -30,7 +30,7 @@ static void verify(const char *name, const afw_tls_layout *l, const afw_tls_segm
 
     {
         afw_bionic_static_tls stl;
-        uint64_t want_align = l->max_align < AFW_BIONIC_TLS_ALIGN ? AFW_BIONIC_TLS_ALIGN : l->max_align;
+        uint64_t want_align = l->mod_align < AFW_BIONIC_TLS_ALIGN ? AFW_BIONIC_TLS_ALIGN : l->mod_align;
         uint64_t want_bionic_tls = (l->tp_off + AFW_BIONIC_TCB_SIZE + AFW_BIONIC_TLS_ALIGN - 1) &
                                    ~(uint64_t)(AFW_BIONIC_TLS_ALIGN - 1);
         uint64_t want_size = (want_bionic_tls + AFW_BIONIC_TLS_SIZE + want_align - 1) &
@@ -98,11 +98,12 @@ int main(void) {
     run("no modules", NULL, 0);
 
     /* Concrete oracle cross-check for pinned Android 14 libc.so (p_align=8, p_memsz=8):
-     * tp_off=0x10, align=0x10, overflowed=0, offset_bionic_tls=0x60, size=roundup(0x60+0x2fa8, 16)=0x3010 */
+     * mod_align=8 => align=8, tp_off=0x10, overflowed=0, offset_bionic_tls=0x60,
+     * size=roundup(0x60+0x2fa8, 8)=0x3008 (exact linker64 StaticTlsLayout formulas). */
     memset(&l, 0, sizeof l);
     CHECK(afw_tls_layout_add(&l, &libc[0]) == 0 && afw_tls_layout_finish(&l) == 0, "libc concrete layout");
     CHECK(afw_tls_layout_to_bionic(&l, &stl) == 0, "libc concrete bionic layout");
-    CHECK(stl.size == 0x3010 && stl.align == 0x10 && stl.overflowed == 0 &&
+    CHECK(stl.size == 0x3008 && stl.align == 0x8 && stl.overflowed == 0 &&
           stl.offset_thread_pointer == 0x10 && stl.offset_bionic_tls == 0x60,
           "libc oracle mismatch: size=0x%llx align=0x%llx ov=%llu tp=0x%llx btls=0x%llx",
           (unsigned long long)stl.size, (unsigned long long)stl.align, (unsigned long long)stl.overflowed,
@@ -132,7 +133,9 @@ int main(void) {
     CHECK(afw_tls_layout_to_bionic(&l, &stl) == -5, "unfinished layout (max_align=0) must be refused");
     l.max_align = 24;
     CHECK(afw_tls_layout_to_bionic(&l, &stl) == -5, "non-power-of-two max_align must be refused");
-    l.max_align = 16; l.tp_off = 8;
+    l.max_align = 16; l.mod_align = 24; l.tp_off = 0;
+    CHECK(afw_tls_layout_to_bionic(&l, &stl) == -5, "non-power-of-two mod_align must be refused");
+    l.mod_align = 8; l.tp_off = 8;
     CHECK(afw_tls_layout_to_bionic(&l, &stl) == -5, "unaligned tp_off must be refused");
     l.max_align = 16; l.tp_off = UINT64_MAX - 15;
     CHECK(afw_tls_layout_to_bionic(&l, &stl) == -5, "tp_off overflow must be refused");

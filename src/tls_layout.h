@@ -24,7 +24,8 @@ typedef struct {
 typedef struct {
     int nmod;
     uint64_t off[AFW_TLS_MAX_MODULES];    /* module m (0-based) at tp - off[m] */
-    uint64_t max_align;                    /* >= 16 */
+    uint64_t mod_align;                    /* max PT_TLS p_align registered (0 if none) */
+    uint64_t max_align;                    /* >= 16 (G1-TLS main-thread tp alignment) */
     uint64_t tp_off;                       /* tp = block + tp_off */
     uint64_t alloc_size;                   /* bytes per thread, page multiple */
 } afw_tls_layout;
@@ -44,7 +45,7 @@ int afw_tls_layout_finish(afw_tls_layout *l);
  * Android 14 Build ID fa337969c798946280caa45e2d71a2e7 — verified directly
  * against linker64 + libc.so disassembly in bionic-probe):
  *   +0x00 (0x450): size_                    (roundup(offset_bionic_tls + 0x2fa8, align_))
- *   +0x08 (0x458): align_                   (max(max_align, 8); power of two <= 4096)
+ *   +0x08 (0x458): align_                   (max(mod_align, 8); power of two <= 4096)
  *   +0x10 (0x460): overflowed_              (bool + 7B pad; MUST be 0)
  *   +0x18 (0x468): offset_bionic_tcb_ / TP  (x86_64 Variant II: == tp_off)
  *   +0x20 (0x470): offset_bionic_tls_       (roundup(tp_off + 0x50, 8))

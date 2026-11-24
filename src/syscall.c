@@ -275,7 +275,7 @@ static int64_t sys_getpid(void) {
  * rt_sigprocmask(SIG_SETMASK, ..., sigsetsize=8) around thread setup. */
 static _Thread_local uint64_t t_sigmask;
 
-static int64_t sys_rt_sigprocmask(int64_t how, const void *set, void *oldset, uint64_t sigsetsize) {
+static int64_t sys_rt_sigprocmask(int how, const void *set, void *oldset, uint64_t sigsetsize) {
     uint64_t prev = t_sigmask;
     if (sigsetsize != 8) return -LNX_EINVAL;
     if (set) {
@@ -514,7 +514,7 @@ int64_t afw_syscall_dispatch(int64_t nr, int64_t *a) {
     case 9:   return afw_mmap((uint64_t)a[0], (uint64_t)a[1], (int)a[2], (int)a[3], (int)a[4], a[5]);
     case 10:  return afw_mprotect((uint64_t)a[0], (uint64_t)a[1], (int)a[2]);
     case 11:  return afw_munmap((uint64_t)a[0], (uint64_t)a[1]);
-    case 14:  return sys_rt_sigprocmask(a[0], (const void *)(uintptr_t)a[1],
+    case 14:  return sys_rt_sigprocmask((int)a[0], (const void *)(uintptr_t)a[1],
                                         (void *)(uintptr_t)a[2], (uint64_t)a[3]);
     case 28:  return afw_madvise((uint64_t)a[0], (uint64_t)a[1], (int)a[2]);
     case 12:  return -12;  /* brk: no heap break; bionic and Scudo use mmap */
