@@ -9,5 +9,5 @@ if [ ! -f "$ZA/Zydis.c" ]; then
   rmdir "$ROOT/third_party/zydis/amalgamated-dist"
 fi
 OUTBIN="${OUTBIN:-$ROOT/out/afw-loader}"
-cc -O2 -Wall -Wno-unused-function -pthread ${EXTRA_CFLAGS:-} -I"$ZA" -o "$OUTBIN" "$ROOT"/src/*.c "$ZA/Zydis.c"
+cc -O2 -Wall -Wno-unused-function -pthread ${EXTRA_CFLAGS:-} -I"$ZA" -o "$OUTBIN" "$ROOT"/src/*.c "$ZA/Zydis.c" -lm
 echo "built $OUTBIN"

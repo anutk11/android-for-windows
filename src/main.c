@@ -23,6 +23,7 @@
 #include "attest.h"
 #include "tls_static.h"
 #include "vma.h"
+#include "apk_runner.h"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -801,6 +802,8 @@ int main(int argc, char **argv) {
     int call_bad_ip = 0;   /* test: execute address 0x28 - must be a crash report, never a hang */
     static afw_lib deps[32];
     int ndeps = 0;
+    afw_apk_run_opts apk_opts;
+    memset(&apk_opts, 0, sizeof apk_opts);
 
     setvbuf(stdout, NULL, _IONBF, 0); /* never lose output on a crash */
     afw_crash_init();
@@ -808,7 +811,7 @@ int main(int argc, char **argv) {
     printf("bionic-win provides %d functions\n\n", afw_shim_count());
 
     if (argc < 2) {
-        printf("usage: %s <library.so> [-v]\n", argv[0]);
+        printf("usage: %s <app.apk | library.so | executable> [-v] [--headless] [--frames=N] [--screenshot=out.bmp]\n", argv[0]);
         return 2;
     }
 #ifdef AFW_TEST
@@ -848,6 +851,11 @@ int main(int argc, char **argv) {
             else if (strcmp(argv[a], "--exec") == 0) { exec_from = a + 1; break; }   /* the rest: the program's args */
             else if (strcmp(argv[a], "--probe-syscalls") == 0) { afw_syscall_probe_log = 1; afw_crash_enable_probe_veh(); }
             else if (strcmp(argv[a], "--call-bad-ip") == 0) call_bad_ip = 1;
+            else if (strcmp(argv[a], "--headless") == 0) apk_opts.headless = 1;
+            else if (strncmp(argv[a], "--frames=", 9) == 0) apk_opts.max_frames = atoi(argv[a] + 9);
+            else if (strncmp(argv[a], "--width=", 8) == 0) apk_opts.width = atoi(argv[a] + 8);
+            else if (strncmp(argv[a], "--height=", 9) == 0) apk_opts.height = atoi(argv[a] + 9);
+            else if (strncmp(argv[a], "--screenshot=", 13) == 0) apk_opts.screenshot_path = argv[a] + 13;
             else if (strncmp(argv[a], "--watchdog=", 11) == 0) {
                 int sec = atoi(argv[a] + 11);
                 if (sec <= 0 || afw_watchdog_start((unsigned)sec) != 0) {
@@ -859,6 +867,16 @@ int main(int argc, char **argv) {
     }
     if (afw_check_security() != 0) return 1;
     if (afw_tls_init() != 0) return 1;
+
+    /* Direct Android .apk execution mode */
+    {
+        size_t alen = strlen(argv[1]);
+        if (alen >= 4 && (strcmp(argv[1] + alen - 4, ".apk") == 0 ||
+                          strcmp(argv[1] + alen - 4, ".APK") == 0)) {
+            apk_opts.verbose = verbose;
+            return afw_run_apk(argv[1], &apk_opts);
+        }
+    }
 
     /* test: a library that must FAIL to load leaves nothing behind - not in
      * the library list, and its TLS module does not block the next library */

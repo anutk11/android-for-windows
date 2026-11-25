@@ -2,7 +2,7 @@ name: build
 
 on:
   push:
-    branches: [main]
+    branches: [main, exp/apk-runner]
   pull_request:
   workflow_dispatch:
 
@@ -153,8 +153,35 @@ jobs:
           "$TC/clang++" --target=x86_64-linux-android34 -std=c++17 -fPIE -pie -O2 -nostdlib++ \
             -Wl,--pack-dyn-relocs=none -Wl,--export-dynamic \
             -Lout -lcxx_catcher -lcxx_thrower -lc++_shared -ldl -o out/g2b_gate_exe test/g2b_gate_exe.cpp
-          echo "--- G2a/G2b Gate DT_NEEDED (must dynamically link libc++_shared.so across all DSOs and PIEs)"
-          for f in out/libcxx_thrower.so out/libcxx_catcher.so out/libdlopen_cxx.so out/cxx_gate_exe out/libg2b_dlopen_tls.so out/g2b_gate_exe; do
+          # APK Runner Gate #1: Real Android NDK NativeActivity + EGL/GLES2 + AAssetManager APK
+          "$TC/clang++" --target=x86_64-linux-android34 -std=c++17 -shared -fPIC -O2 -nostdlib++ \
+            -Wl,--pack-dyn-relocs=none -Wl,-soname,libnative_demo.so \
+            -Lout -lc++_shared -landroid -llog -lEGL -lGLESv2 \
+            -o out/libnative_demo.so test/apk_native_demo/native_demo.cpp
+          python3 tools/make_apk.py -o out/native_demo.apk \
+            --package com.afw.nativedemo --activity android.app.NativeActivity \
+            --native-lib native_demo --version-code 1 --version-name 1.0 \
+            --lib out/libnative_demo.so --lib out/libc++_shared.so \
+            --asset greeting.txt=test/apk_native_demo/greeting.txt
+          # APK Runner Gate #2: Real Java classes.dex (javac + Android SDK d8) + Bidirectional JNI C++17 APK
+          "$TC/clang++" --target=x86_64-linux-android34 -std=c++17 -shared -fPIC -O2 -nostdlib++ \
+            -Wl,--pack-dyn-relocs=none -Wl,-soname,libdex_jni_demo.so \
+            -Lout -lc++_shared -o out/libdex_jni_demo.so test/apk_dex_jni_demo/dex_jni_demo.cpp
+          mkdir -p out/dex_build/stubs out/dex_build/app out/dex_build/dex
+          javac --release 8 -Xlint:-options -d out/dex_build/stubs $(find test/apk_dex_jni_demo/stubs -name '*.java')
+          javac --release 8 -Xlint:-options -cp out/dex_build/stubs -d out/dex_build/app test/apk_dex_jni_demo/com/afw/dexdemo/*.java
+          D8=$(find "${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}/build-tools" -name d8 -type f | sort -V | tail -n 1)
+          echo "Using d8: $D8"
+          "$D8" --min-api 24 --output out/dex_build/dex $(find out/dex_build/app -name '*.class')
+          ls -la out/dex_build/dex/classes.dex
+          python3 tools/make_apk.py -o out/dex_jni_demo.apk \
+            --package com.afw.dexdemo --activity .MainActivity --utf8-manifest \
+            --version-code 2 --version-name 1.1 \
+            --dex out/dex_build/dex/classes.dex \
+            --lib out/libdex_jni_demo.so --lib out/libc++_shared.so \
+            --asset config.txt=test/apk_dex_jni_demo/config.txt
+          echo "--- G2a/G2b/APK Gate DT_NEEDED (must dynamically link libc++_shared.so)"
+          for f in out/libcxx_thrower.so out/libcxx_catcher.so out/libdlopen_cxx.so out/cxx_gate_exe out/libg2b_dlopen_tls.so out/g2b_gate_exe out/libnative_demo.so out/libdex_jni_demo.so; do
             echo "$f:"
             "$TC/llvm-readelf" -dW "$f" | grep NEEDED
             "$TC/llvm-readelf" -dW "$f" | grep -q "libc++_shared.so" || { echo "$f missing DT_NEEDED libc++_shared.so"; exit 1; }
@@ -164,6 +191,7 @@ jobs:
           name: libhello
           path: |
             out/*.so
+            out/*.apk
             out/*.syms
             out/exec_min
             out/exec_bad_entry
@@ -391,6 +419,8 @@ jobs:
              -o out/loader_lock_test tools/loader_lock_test.c src/platform.c
           cc -g -O1 -DAFW_TEST -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined -Wall -Wextra -pthread \
              -o out/dtv_bridge_test tools/dtv_bridge_test.c src/tls_static.c src/tls_layout.c src/tls_patch.c src/callback_bridge.c src/funcs.c src/platform.c
+          cc -g -O1 -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined -Wall -Wextra \
+             -o out/apk_test tools/apk_test.c src/apk.c src/axml.c
       - name: "Attestation checks (PR #7 + cross-block must_hold_table): queue self-test, variants 1-15 & stale"
         run: |
           set -euo pipefail
@@ -438,6 +468,11 @@ jobs:
           out/tls_layout_test
           out/loader_lock_test
           out/dtv_bridge_test
+          mkdir -p out/apk_t && printf "Hello from compressed APK asset!\n" > out/apk_t/hello.txt
+          python3 -c 'open("out/apk_t/large.txt","wb").write(("".join(f"AFW-DEFLATE-BLOCK-{i:04d}\n" for i in range(1740))[:40000]).encode()); open("out/apk_t/libdemo_native.so","wb").write(b"\x7fELFfake"); open("out/apk_t/classes.dex","wb").write(b"dex\n035\x00"+b"\x00"*104)'
+          python3 tools/make_apk.py -o out/apk_t/s1.apk --package com.afw.testapp --activity android.app.NativeActivity --native-lib demo_native --version-code 42 --version-name 2.5 --lib out/apk_t/libdemo_native.so --asset hello.txt=out/apk_t/hello.txt --asset large.txt=out/apk_t/large.txt
+          python3 tools/make_apk.py -o out/apk_t/s2.apk --package com.afw.dexapp --activity .MainActivity --utf8-manifest --dex out/apk_t/classes.dex
+          out/apk_test out/apk_t/s1.apk out/apk_t/s2.apk
           out/afw-asan out/libhello.so
           out/afw-asan out/libsyscall_test.so
           out/afw-asan out/libredzone_test.so
@@ -528,8 +563,9 @@ jobs:
           clang-cl /nologo /O2 /W3 /DAFW_TEST /D_CRT_SECURE_NO_WARNINGS -Wno-unused-function -Iout\zydis-amalg ^
               /Fe:out\afw-loader-test.exe /Foout\testobj\ ^
               src\main.c src\elf_loader.c src\bionic_shim.c src\platform.c src\tls_patch.c src\crash.c ^
-              src\patch.c src\attest.c src\sha256.c src\syscall.c src\thread.c src\fd.c src\filemap.c src\funcs.c src\vma.c src\tls_layout.c src\tls_static.c src\loader_api.c src\callback_bridge.c src\exec.c out\Zydis.obj ^
-              /link dbghelp.lib
+              src\patch.c src\attest.c src\sha256.c src\syscall.c src\thread.c src\fd.c src\filemap.c src\funcs.c src\vma.c src\tls_layout.c src\tls_static.c src\loader_api.c src\callback_bridge.c ^
+              src\axml.c src\apk.c src\win_gui.c src\android_native.c src\gles_bridge.c src\jni_bridge.c src\dex_vm.c src\apk_runner.c src\exec.c out\Zydis.obj ^
+              /link dbghelp.lib user32.lib gdi32.lib
           if errorlevel 1 exit /b 1
           out\afw-loader-test.exe out\libhello.so --finish-fail-late=tls:out\libtls_test.so
           if errorlevel 1 exit /b 1
@@ -730,6 +766,34 @@ jobs:
           findstr /c:"G2B GATE PASSED" out\g2b-gate.txt >nul || (echo G2b g2b_gate_exe did not pass & exit /b 1)
           findstr /c:"G2B MAIN DYN TLS DTOR OK" out\g2b-gate.txt >nul || (echo G2b main dynamic thread_local dtor did not run cleanly & exit /b 1)
           exit /b 0
+      - name: "APK Gate #1: Real Android NativeActivity APK (native_demo.apk: AXML + DEFLATE assets + pthreads + EGL/GLES2 -> BMP) (required)"
+        timeout-minutes: 3
+        shell: cmd
+        run: |
+          set AFW_LIB_PATH=out\bionic
+          out\afw-loader.exe out\native_demo.apk --headless --frames=5 --width=640 --height=480 --screenshot=out\native_demo.bmp --watchdog=60 > out\apk-native.txt 2>&1
+          set rc=%errorlevel%
+          type out\apk-native.txt
+          echo native_demo.apk exit code %rc%
+          if not "%rc%"=="0" (echo native_demo.apk exited %rc%, not 0 & exit /b 1)
+          findstr /c:"NATIVE_DEMO_APK_PASSED" out\apk-native.txt >nul || (echo native_demo.apk did not pass & exit /b 1)
+          python tools\check_bmp.py out\native_demo.bmp 640 480 10,10:20,41,89:4 320,240:136,136,153:40
+          if errorlevel 1 exit /b 1
+          exit /b 0
+      - name: "APK Gate #2: Real Android Java classes.dex + Bidirectional JNI C++17 + Canvas APK (dex_jni_demo.apk -> BMP) (required)"
+        timeout-minutes: 3
+        shell: cmd
+        run: |
+          set AFW_LIB_PATH=out\bionic
+          out\afw-loader.exe out\dex_jni_demo.apk --headless --frames=3 --width=640 --height=480 --screenshot=out\dex_jni_demo.bmp --watchdog=60 > out\apk-dex.txt 2>&1
+          set rc=%errorlevel%
+          type out\apk-dex.txt
+          echo dex_jni_demo.apk exit code %rc%
+          if not "%rc%"=="0" (echo dex_jni_demo.apk exited %rc%, not 0 & exit /b 1)
+          findstr /c:"DEX_JNI_DEMO_APK_PASSED (JNI_OK:75)" out\apk-dex.txt >nul || (echo dex_jni_demo.apk did not pass & exit /b 1)
+          python tools\check_bmp.py out\dex_jni_demo.bmp 640 480 10,10:24,120,64:3 100,80:240,200,40:3 320,340:220,48,48:3
+          if errorlevel 1 exit /b 1
+          exit /b 0
       - name: "G2-1 Probe (Items 2-5): Windows stack / NT_TIB / VEH / ExitThread probe (informational)"
         continue-on-error: true
         timeout-minutes: 2
@@ -756,9 +820,15 @@ jobs:
           mkdir pkg
           copy out\afw-loader.exe pkg\
           copy out\libhello.so pkg\
+          copy out\native_demo.apk pkg\
+          copy out\dex_jni_demo.apk pkg\
+          copy out\native_demo.bmp pkg\
+          copy out\dex_jni_demo.bmp pkg\
           copy tools\run-test.bat pkg\
-          copy out\fsbase_probe.exe pkg\
+          copy tools\run-native-apk.bat pkg\
+          copy tools\run-dex-apk.bat pkg\
           copy tools\run-fsbase-probe.bat pkg\
+          copy out\fsbase_probe.exe pkg\
       - uses: actions/upload-artifact@v4
         with:
           name: afw-windows
@@ -767,7 +837,7 @@ jobs:
   # 3. Publish a download link: Releases -> nightly
   release:
     needs: windows
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
