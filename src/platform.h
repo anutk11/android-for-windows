@@ -170,6 +170,7 @@ int32_t   afw_os_atomic_cmpxchg_i32(int32_t *addr, int32_t expected, int32_t des
 int32_t   afw_os_atomic_load_i32(const int32_t *addr);
 uintptr_t afw_os_atomic_xchg_uptr(uintptr_t *addr, uintptr_t val);
 void      afw_os_atomic_store_uptr(uintptr_t *addr, uintptr_t val);
+uintptr_t afw_os_atomic_load_uptr(const uintptr_t *addr);
 void      afw_os_wake_address_all(void *addr);
 void      afw_os_exit_thread(int code);
 int       afw_os_clone_supported(void);
@@ -185,5 +186,10 @@ void afw_libs_wrlock(void);
 void afw_libs_wrunlock(void);
 void afw_dlopen_lock(void);
 void afw_dlopen_unlock(void);
+
+/* ---- G2-5b Dynamic TLS (DTV) aligned alloc & per-thread FLS cleanup (Rule 8) ---- */
+void *afw_os_aligned_alloc_zero(size_t align, size_t size);
+void  afw_os_aligned_free(void *p);
+int   afw_os_dtv_fls_set(void (*release_cb)(void *), void *dtv);
 
 #endif

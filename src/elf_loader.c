@@ -290,7 +290,13 @@ static int apply_rela(afw_lib *lib, const Elf64_Rela *rel, size_t count,
             }
             if (type == R_X86_64_DTPMOD64) *where = (uint64_t)lib->tls_module;
             else if (type == R_X86_64_DTPOFF64) *where = sv + (uint64_t)A;
-            else *where = sv + (uint64_t)A - afw_tls_static_off(lib->tls_module);  /* negative */
+            else {
+                if (!afw_tls_is_static_module(lib->tls_module)) {
+                    fprintf(stderr, "error: initial-exec TLS (TPOFF64) in dynamically loaded library is not supported\n");
+                    return -1;
+                }
+                *where = sv + (uint64_t)A - afw_tls_static_off(lib->tls_module);  /* negative */
+            }
             break;
         }
         case R_X86_64_TLSDESC:
@@ -385,8 +391,9 @@ static int apply_android_rela(afw_lib *lib, const unsigned char *buf, size_t sz,
     cur = buf + 4;
     end = buf + sz;
     if (sleb128_read(&cur, end, &reloc_count) != 0 || reloc_count < 0 ||
+        (uint64_t)reloc_count > (uint64_t)lib->size ||
         sleb128_read(&cur, end, &init_off) != 0) {
-        fprintf(stderr, "error: truncated APS2 relocation header\n");
+        fprintf(stderr, "error: invalid or truncated APS2 relocation header\n");
         return -1;
     }
     r_offset = (uint64_t)init_off;
@@ -780,10 +787,17 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
         lib->tls_module = afw_tls_static_register((const void *)(lib->bias + tls_ph->p_vaddr), &seg,
                                                   lib->soname ? lib->soname : path);
         if (!lib->tls_module) return -1;
-        if (verbose) printf("TLS:        module %d, %llu bytes (%llu initialised), align %llu, at tp-%llu\n",
-                            lib->tls_module, (unsigned long long)seg.p_memsz, (unsigned long long)seg.p_filesz,
-                            (unsigned long long)seg.p_align,
-                            (unsigned long long)afw_tls_static_off(lib->tls_module));
+        if (verbose) {
+            if (afw_tls_is_dynamic_module(lib->tls_module))
+                printf("TLS:        module %d, %llu bytes (%llu initialised), align %llu (dynamic DTV)\n",
+                       lib->tls_module, (unsigned long long)seg.p_memsz, (unsigned long long)seg.p_filesz,
+                       (unsigned long long)seg.p_align);
+            else
+                printf("TLS:        module %d, %llu bytes (%llu initialised), align %llu, at tp-%llu\n",
+                       lib->tls_module, (unsigned long long)seg.p_memsz, (unsigned long long)seg.p_filesz,
+                       (unsigned long long)seg.p_align,
+                       (unsigned long long)afw_tls_static_off(lib->tls_module));
+        }
     }
 
     /* 4. Resolve symbols against bionic-win -------------------------- */
@@ -1009,6 +1023,12 @@ static int lib_finish(afw_lib *lib, int verbose) {
         /* 6b. Static TLS layout is final now: every thread block, including this
          *     thread's, gets the relocated .tdata images. Before any library code. */
         if (afw_tls_static_finish() != 0) { free(pageprot); return -1; }
+        /* Dynamic PT_TLS (dlopen after startup): copy relocated .tdata and publish. */
+        if (afw_tls_is_dynamic_module(lib->tls_module) &&
+            afw_tls_dynamic_finalize(lib->tls_module) != 0) {
+            free(pageprot);
+            return -1;
+        }
 
         /* 6c. IFUNC resolvers (this library's and imported ones): the first
          *     library code to run, on patched, executable code, writing into
@@ -1415,7 +1435,10 @@ static void remove_from_registry(afw_lib *lib) {
 
 static int can_discard(const afw_lib *lib) {
     if (lib->code_ran) return 0;
-    if (lib->tls_module && afw_tls_static_is_finished()) return 0;
+    if (lib->tls_module) {
+        if (afw_tls_is_static_module(lib->tls_module) && afw_tls_static_is_finished()) return 0;
+        if (afw_tls_is_dynamic_module(lib->tls_module) && afw_tls_dynamic_is_finalized(lib->tls_module)) return 0;
+    }
     return 1;
 }
 

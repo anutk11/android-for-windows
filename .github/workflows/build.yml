@@ -123,8 +123,38 @@ jobs:
           "$TC/clang++" --target=x86_64-linux-android34 -std=c++17 -fPIE -pie -O2 -nostdlib++ \
             -Wl,--pack-dyn-relocs=none -Wl,--export-dynamic \
             -Lout -lcxx_catcher -lcxx_thrower -lc++_shared -ldl -o out/cxx_gate_exe test/cxx_gate_exe.cpp
-          echo "--- G2a Gate DT_NEEDED (must dynamically link libc++_shared.so across all DSOs and PIE)"
-          for f in out/libcxx_thrower.so out/libcxx_catcher.so out/libdlopen_cxx.so out/cxx_gate_exe; do
+          # G2b Gate: dynamically dlopen'd PT_TLS DSO + G2b gate executable (closes full G2)
+          "$TC/clang++" --target=x86_64-linux-android34 -std=c++17 -shared -fPIC -O2 -nostdlib++ \
+            -Wl,--pack-dyn-relocs=none -Wl,-soname,libg2b_dlopen_tls.so \
+            -Lout -lc++_shared -o out/libg2b_dlopen_tls.so test/g2b_dlopen_tls.cpp
+          echo "--- G2b PT_TLS & relocations for libg2b_dlopen_tls.so (must have FileSiz > 0, Align >= 0x40, DTPMOD64, no TPOFF/TLSDESC)"
+          "$TC/llvm-readelf" -lW out/libg2b_dlopen_tls.so | grep -E "TLS|Type"
+          "$TC/llvm-readelf" -rW out/libg2b_dlopen_tls.so | grep -E "TPOFF|DTP|TLS" || true
+          python3 -c '
+          import struct
+          data = open("out/libg2b_dlopen_tls.so", "rb").read()
+          phoff = struct.unpack_from("<Q", data, 32)[0]
+          phent, phnum = struct.unpack_from("<HH", data, 54)
+          tls = None
+          for i in range(phnum):
+              ptype, pflags, _, pvaddr, _, pfilesz, pmemsz, palign = struct.unpack_from("<IIQQQQQQ", data, phoff + i * phent)
+              if ptype == 7:
+                  tls = (pfilesz, pmemsz, palign)
+                  break
+          assert tls is not None, "libg2b_dlopen_tls.so missing PT_TLS"
+          pfilesz, pmemsz, palign = tls
+          print(f"libg2b_dlopen_tls.so PT_TLS: filesz={pfilesz} memsz={pmemsz} align={palign}")
+          assert pfilesz > 0 and pmemsz > pfilesz and palign >= 64, f"unexpected PT_TLS: {tls}"
+          '
+          "$TC/llvm-readelf" -rW out/libg2b_dlopen_tls.so | grep -q "R_X86_64_DTPMOD64" || { echo "libg2b_dlopen_tls.so missing DTPMOD64"; exit 1; }
+          if "$TC/llvm-readelf" -rW out/libg2b_dlopen_tls.so | grep -qE "TPOFF|TLSDESC"; then
+            echo "libg2b_dlopen_tls.so unexpectedly emitted TPOFF or TLSDESC"; exit 1
+          fi
+          "$TC/clang++" --target=x86_64-linux-android34 -std=c++17 -fPIE -pie -O2 -nostdlib++ \
+            -Wl,--pack-dyn-relocs=none -Wl,--export-dynamic \
+            -Lout -lcxx_catcher -lcxx_thrower -lc++_shared -ldl -o out/g2b_gate_exe test/g2b_gate_exe.cpp
+          echo "--- G2a/G2b Gate DT_NEEDED (must dynamically link libc++_shared.so across all DSOs and PIEs)"
+          for f in out/libcxx_thrower.so out/libcxx_catcher.so out/libdlopen_cxx.so out/cxx_gate_exe out/libg2b_dlopen_tls.so out/g2b_gate_exe; do
             echo "$f:"
             "$TC/llvm-readelf" -dW "$f" | grep NEEDED
             "$TC/llvm-readelf" -dW "$f" | grep -q "libc++_shared.so" || { echo "$f missing DT_NEEDED libc++_shared.so"; exit 1; }
@@ -142,6 +172,7 @@ jobs:
             out/pthread_probe
             out/pthread_mt_test
             out/cxx_gate_exe
+            out/g2b_gate_exe
 
   # Gate G1 experiment: static scan of the real bionic libc.so.
   # The extracted Android files are NOT uploaded (licensing): only the report.
@@ -358,6 +389,8 @@ jobs:
              -o out/tls_layout_test tools/tls_layout_test.c src/tls_layout.c
           cc -g -O1 -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined -Wall -Wextra -pthread \
              -o out/loader_lock_test tools/loader_lock_test.c src/platform.c
+          cc -g -O1 -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined -Wall -Wextra -pthread \
+             -o out/dtv_bridge_test tools/dtv_bridge_test.c src/tls_static.c src/tls_layout.c src/tls_patch.c src/callback_bridge.c src/funcs.c src/platform.c
       - name: "Attestation checks (PR #7 + cross-block must_hold_table): queue self-test, variants 1-15 & stale"
         run: |
           set -euo pipefail
@@ -404,6 +437,7 @@ jobs:
           out/fd_test
           out/tls_layout_test
           out/loader_lock_test
+          out/dtv_bridge_test
           out/afw-asan out/libhello.so
           out/afw-asan out/libsyscall_test.so
           out/afw-asan out/libredzone_test.so
@@ -494,7 +528,7 @@ jobs:
           clang-cl /nologo /O2 /W3 /DAFW_TEST /D_CRT_SECURE_NO_WARNINGS -Wno-unused-function -Iout\zydis-amalg ^
               /Fe:out\afw-loader-test.exe /Foout\testobj\ ^
               src\main.c src\elf_loader.c src\bionic_shim.c src\platform.c src\tls_patch.c src\crash.c ^
-              src\patch.c src\attest.c src\sha256.c src\syscall.c src\thread.c src\fd.c src\filemap.c src\funcs.c src\vma.c src\tls_layout.c src\tls_static.c src\loader_api.c src\exec.c out\Zydis.obj ^
+              src\patch.c src\attest.c src\sha256.c src\syscall.c src\thread.c src\fd.c src\filemap.c src\funcs.c src\vma.c src\tls_layout.c src\tls_static.c src\loader_api.c src\callback_bridge.c src\exec.c out\Zydis.obj ^
               /link dbghelp.lib
           if errorlevel 1 exit /b 1
           out\afw-loader-test.exe out\libhello.so --finish-fail-late=tls:out\libtls_test.so
@@ -612,6 +646,13 @@ jobs:
           clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Fe:out\loader_lock_test.exe /Foout\llobj\ tools\loader_lock_test.c src\platform.c
           if errorlevel 1 exit /b 1
           out\loader_lock_test.exe
+      - name: "G2-5b Host Unit Tests: dynamic PT_TLS DTV + DWARF callback bridge"
+        shell: cmd
+        run: |
+          if not exist out\dtvobj mkdir out\dtvobj
+          clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Fe:out\dtv_bridge_test.exe /Foout\dtvobj\ tools\dtv_bridge_test.c src\tls_static.c src\tls_layout.c src\tls_patch.c src\callback_bridge.c src\funcs.c src\platform.c
+          if errorlevel 1 exit /b 1
+          out\dtv_bridge_test.exe
       - name: "C++ exceptions: every landing pad found, nothing unproven (static)"
         shell: cmd
         run: out\afw-loader.exe out\libcxx_exception_test.so --patch-report --strict --min-landing-pads=1
@@ -675,6 +716,19 @@ jobs:
           if not "%rc%"=="0" (echo cxx_gate_exe exited %rc%, not 0 & exit /b 1)
           findstr /c:"G2A CXX GATE PASSED" out\g2a-cxx-gate.txt >nul || (echo G2a cxx_gate_exe did not pass & exit /b 1)
           findstr /c:"G2A MAIN THREAD_LOCAL DTOR OK" out\g2a-cxx-gate.txt >nul || (echo G2a main thread_local dtor did not run in LIFO order & exit /b 1)
+          exit /b 0
+      - name: "G2b Gate: dlopen+PT_TLS DTV + cross-callback-bridge C++ exception (closes full G2) (required)"
+        timeout-minutes: 3
+        shell: cmd
+        run: |
+          set AFW_LIB_PATH=out\bionic;out
+          out\afw-loader.exe out\g2b_gate_exe --with-deps --watchdog=60 --exec > out\g2b-gate.txt 2>&1
+          set rc=%errorlevel%
+          type out\g2b-gate.txt
+          echo g2b_gate_exe exit code %rc%
+          if not "%rc%"=="0" (echo g2b_gate_exe exited %rc%, not 0 & exit /b 1)
+          findstr /c:"G2B GATE PASSED" out\g2b-gate.txt >nul || (echo G2b g2b_gate_exe did not pass & exit /b 1)
+          findstr /c:"G2B MAIN DYN TLS DTOR OK" out\g2b-gate.txt >nul || (echo G2b main dynamic thread_local dtor did not run cleanly & exit /b 1)
           exit /b 0
       - name: "G2-1 Probe (Items 2-5): Windows stack / NT_TIB / VEH / ExitThread probe (informational)"
         continue-on-error: true

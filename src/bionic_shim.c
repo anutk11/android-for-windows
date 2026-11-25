@@ -8,6 +8,7 @@
 #include "platform.h"
 #include "tls_static.h"
 #include "loader_api.h"
+#include "callback_bridge.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -281,6 +282,8 @@ int afw_shim_count(void) { return (int)(sizeof(g_shims) / sizeof(g_shims[0])); }
 
 void *afw_shim_lookup(const char *name) {
     int i, n = afw_shim_count();
+    if (strcmp(name, "__loader_afw_callback_bridge") == 0)
+        return afw_callback_bridge_entry();
     for (i = 0; i < n; i++)
         if (strcmp(g_shims[i].name, name) == 0) return g_shims[i].addr;
     return NULL;
