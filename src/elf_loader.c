@@ -51,42 +51,56 @@ static unsigned long long g_libs_adds;   /* monotonic finished-library count (dl
 static afw_lib *g_quarantine_head;   /* intrusive list: unbounded, zero-alloc, fail-safe under OOM */
 static int g_nquarantine;
 
+/* Append-only, immutable crash-diagnostic table for VEH (src/crash.c).
+ * Entries are written once in lib_finish() under afw_libs_wrlock() ONLY after
+ * a library reaches pending == 0 (never discarded/freed/moved) and published
+ * via seq_cst store to g_ncrash_libs. */
+typedef struct {
+    uintptr_t        base;
+    size_t           size;
+    intptr_t         bias;
+    const Elf64_Sym *symtab;
+    const char      *strtab;
+    size_t           nsyms;
+    const char      *name;
+} afw_crash_entry;
+
+static afw_crash_entry g_crash_libs[MAX_LIBS];
+static int32_t         g_ncrash_libs;
+
 #ifdef AFW_TEST
 static int g_fail_adopt;
 void afw_load_test_fail_adopt(int nth) { g_fail_adopt = nth; }
 #endif
 
 /* Crash-handler diagnostic (called from VEH in src/crash.c): MUST remain
- * lock-free and never acquire afw_libs_rdlock() or VMA g_lock. */
+ * lock-free and never acquire afw_libs_rdlock() or VMA g_lock. Reads only
+ * immutable entries published before the acquire load of g_ncrash_libs. */
 int afw_describe_address(uintptr_t addr, char *out, size_t outsz) {
-    int k, n = g_nlibs;
+    int32_t k, n = afw_os_atomic_load_i32(&g_ncrash_libs);
     if (n < 0) n = 0;
     if (n > MAX_LIBS) n = MAX_LIBS;
     for (k = 0; k < n; k++) {
-        const afw_lib *lib = g_libs[k];
-        uintptr_t b;
+        const afw_crash_entry *e = &g_crash_libs[k];
         const char *best = NULL;
         uint64_t best_v = 0, off;
         size_t i;
-        if (!lib || !lib->base) continue;
-        b = (uintptr_t)lib->base;
-        if (addr < b || addr - b >= lib->size) continue;
-        off = (uint64_t)(addr - (uintptr_t)lib->bias);
-        for (i = 1; i < lib->nsyms; i++) {
-            const Elf64_Sym *s = &lib->symtab[i];
+        if (!e->base || addr < e->base || addr - e->base >= e->size) continue;
+        off = (uint64_t)(addr - (uintptr_t)e->bias);
+        for (i = 1; i < e->nsyms; i++) {
+            const Elf64_Sym *s = &e->symtab[i];
             if (s->st_shndx == SHN_UNDEF || ELF64_ST_TYPE(s->st_info) != STT_FUNC) continue;
             if (s->st_value <= off && s->st_value >= best_v) {
                 best_v = s->st_value;
-                best = lib->strtab + s->st_name;
+                best = e->strtab + s->st_name;
             }
         }
         if (best)
             snprintf(out, outsz, "%s+0x%llx (%s+0x%llx)",
-                     lib->soname ? lib->soname : lib->path, (unsigned long long)off,
+                     e->name, (unsigned long long)off,
                      best, (unsigned long long)(off - best_v));
         else
-            snprintf(out, outsz, "%s+0x%llx", lib->soname ? lib->soname : lib->path,
-                     (unsigned long long)off);
+            snprintf(out, outsz, "%s+0x%llx", e->name, (unsigned long long)off);
         return 1;
     }
     snprintf(out, outsz, "%p (outside Android libraries)", (void *)addr);
@@ -1047,6 +1061,19 @@ static int lib_finish(afw_lib *lib, int verbose) {
     afw_libs_wrlock();
     lib->pending = 0;
     g_libs_adds++;
+    if (!afw_load_patch_only) {
+        int32_t ci = afw_os_atomic_load_i32(&g_ncrash_libs);
+        if (ci >= 0 && ci < MAX_LIBS) {
+            g_crash_libs[ci].base   = (uintptr_t)lib->base;
+            g_crash_libs[ci].size   = lib->size;
+            g_crash_libs[ci].bias   = lib->bias;
+            g_crash_libs[ci].symtab = lib->symtab;
+            g_crash_libs[ci].strtab = lib->strtab;
+            g_crash_libs[ci].nsyms  = lib->nsyms;
+            g_crash_libs[ci].name   = lib->soname ? lib->soname : lib->path;
+            afw_os_atomic_store_i32(&g_ncrash_libs, ci + 1);
+        }
+    }
     afw_libs_wrunlock();
 
     if (afw_load_patch_only) return 0;

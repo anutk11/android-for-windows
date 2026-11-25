@@ -134,19 +134,25 @@ static void *next_sym(const char *sym, const void *caller) {
     return NULL;
 }
 
+/* Serialized under recursive afw_dlopen_lock so an external thread calling
+ * dlsym() waits until any in-flight dlopen() and its constructors complete,
+ * while a constructor calling dlsym() on the same thread re-enters cleanly. */
 SYSV void *afw_l_dlsym(void *handle, const char *sym, const void *caller) {
-    void *p;
+    void *p = NULL;
     if (!sym) { set_err("dlsym failed: symbol name is null"); return NULL; }
+    afw_dlopen_lock();
     if (handle == (void *)(intptr_t)-1) {
         p = next_sym(sym, caller);
     } else if (handle == NULL || handle == &g_main_handle) {
         p = afw_global_sym(sym);      /* RTLD_DEFAULT: every library in load order */
     } else if (!afw_is_loaded(handle)) {
+        afw_dlopen_unlock();
         set_err("dlsym failed: invalid handle %p", handle);
         return NULL;
     } else {
         p = afw_sym((const afw_lib *)handle, sym);
     }
+    afw_dlopen_unlock();
     if (!p) set_err("dlsym failed: undefined symbol: %s", sym);
     return p;
 }
@@ -163,7 +169,11 @@ SYSV char *afw_l_dlerror(void) {
 }
 
 SYSV int afw_l_dlclose(void *handle) {
-    if (handle != &g_main_handle && !afw_is_loaded(handle)) {
+    int ok;
+    afw_dlopen_lock();
+    ok = (handle == &g_main_handle) || afw_is_loaded(handle);
+    afw_dlopen_unlock();
+    if (!ok) {
         set_err("dlclose failed: invalid handle %p", handle);
         return -1;
     }

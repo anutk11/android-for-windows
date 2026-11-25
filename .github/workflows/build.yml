@@ -114,11 +114,17 @@ jobs:
           "$TC/clang++" --target=x86_64-linux-android34 -std=c++17 -shared -fPIC -O2 -nostdlib++ \
             -Wl,--pack-dyn-relocs=none -Wl,-soname,libcxx_catcher.so \
             -Lout -lcxx_thrower -lc++_shared -o out/libcxx_catcher.so test/cxx_catcher.cpp
+          "$TC/clang++" --target=x86_64-linux-android34 -std=c++17 -shared -fPIC -O2 -nostdlib++ \
+            -Wl,--pack-dyn-relocs=none -Wl,-soname,libdlopen_cxx.so \
+            -Lout -lc++_shared -ldl -o out/libdlopen_cxx.so test/dlopen_cxx.cpp
+          if "$TC/llvm-readelf" -lW out/libdlopen_cxx.so | grep -q " TLS "; then
+            echo "libdlopen_cxx.so unexpectedly has PT_TLS (dlopen+PT_TLS is G2-5b)"; exit 1
+          fi
           "$TC/clang++" --target=x86_64-linux-android34 -std=c++17 -fPIE -pie -O2 -nostdlib++ \
-            -Wl,--pack-dyn-relocs=none \
+            -Wl,--pack-dyn-relocs=none -Wl,--export-dynamic \
             -Lout -lcxx_catcher -lcxx_thrower -lc++_shared -ldl -o out/cxx_gate_exe test/cxx_gate_exe.cpp
-          echo "--- G2a Gate DT_NEEDED (must dynamically link libc++_shared.so across both DSOs and PIE)"
-          for f in out/libcxx_thrower.so out/libcxx_catcher.so out/cxx_gate_exe; do
+          echo "--- G2a Gate DT_NEEDED (must dynamically link libc++_shared.so across all DSOs and PIE)"
+          for f in out/libcxx_thrower.so out/libcxx_catcher.so out/libdlopen_cxx.so out/cxx_gate_exe; do
             echo "$f:"
             "$TC/llvm-readelf" -dW "$f" | grep NEEDED
             "$TC/llvm-readelf" -dW "$f" | grep -q "libc++_shared.so" || { echo "$f missing DT_NEEDED libc++_shared.so"; exit 1; }

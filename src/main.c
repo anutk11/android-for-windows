@@ -282,8 +282,14 @@ static void run_loader_api_tests(const afw_lib *user) {
         }
         {
             reent_ctx rctx = { it, dlo, 0, 0, 0 };
+            char desc[256];
             check("reentrant dl_iterate_phdr + dlopen inside callback does not deadlock",
                   it(phdr_reent_cb, &rctx) == 0 && rctx.inner_seen == 4 && rctx.dlo_ok == 2);
+            check("afw_describe_address finds finished library via atomic crash table",
+                  afw_describe_address((uintptr_t)in_user, desc, sizeof desc) == 1 &&
+                  strstr(desc, "afw_deps_check") != NULL);
+            check("afw_describe_address returns 0 on non-library stack address",
+                  afw_describe_address((uintptr_t)&stack_var, desc, sizeof desc) == 0);
         }
     }
 }

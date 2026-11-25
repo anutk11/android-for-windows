@@ -25,9 +25,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <elf.h>
 #include <link.h>
 #include <pthread.h>
+#include <time.h>
 #include <unistd.h>
 
 extern "C" {
@@ -50,6 +52,11 @@ struct DtorLog {
 
 static DtorLog g_dtor_logs[kWorkers + 1];
 static int g_main_tls_armed = 0;
+
+void (*g_t6_barrier_hook)(void) = nullptr;
+extern "C" __attribute__((visibility("default"))) void g2a_ctor_barrier(void) {
+    if (g_t6_barrier_hook) g_t6_barrier_hook();
+}
 
 static void record_dtor(int slot, int tag, int seen_id) {
     if (slot < 0 || slot > kMainSlot) return;
@@ -259,6 +266,147 @@ int main() {
     }
     std::printf("  [ OK ] T4 cross-DSO thread_local dtors: exact-once LIFO [2,1] on all %d workers before join\n",
                 kWorkers);
+
+    /* T6: Concurrent dlopen("libdlopen_cxx.so") vs live C++ exceptions (dl_iterate_phdr)
+     * + deterministic constructor/dlsym barrier (Reviewer 2 Blocker 2 + Rule 4). */
+    {
+        static std::atomic<int> s_ctor_entered{0};
+        static std::atomic<int> s_dlsym_attempting{0};
+        static std::atomic<int> s_dlsym_early{0};
+        static std::atomic<int> s_t6_stop{0};
+        static std::atomic<int> s_t6_throws{0};
+        static std::atomic<int> s_t6_during_ctor{0};
+        static std::atomic<int> s_t6_err{0};
+
+        struct T6Hooks {
+            static void sleep_ms(int ms) {
+                pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+                pthread_condattr_t attr;
+                pthread_cond_t cv;
+                struct timespec ts;
+                pthread_condattr_init(&attr);
+                pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+                pthread_cond_init(&cv, &attr);
+                pthread_condattr_destroy(&attr);
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                ts.tv_nsec += (long)ms * 1000000L;
+                while (ts.tv_nsec >= 1000000000L) {
+                    ts.tv_sec++;
+                    ts.tv_nsec -= 1000000000L;
+                }
+                pthread_mutex_lock(&mu);
+                (void)pthread_cond_timedwait(&cv, &mu, &ts);
+                pthread_mutex_unlock(&mu);
+                pthread_cond_destroy(&cv);
+                pthread_mutex_destroy(&mu);
+            }
+
+            static void barrier_impl() {
+                s_ctor_entered.store(1, std::memory_order_release);
+                while (!s_dlsym_attempting.load(std::memory_order_acquire))
+                    sleep_ms(1);
+                int before = s_t6_throws.load(std::memory_order_acquire);
+                /* Hold constructor open while external dlsym() is blocked on afw_dlopen_lock
+                 * AND concurrent unwinder threads perform >= 40 live cross-DSO throws. */
+                while (s_t6_throws.load(std::memory_order_acquire) - before < 40)
+                    sleep_ms(2);
+                sleep_ms(50);
+                s_t6_during_ctor.store(s_t6_throws.load(std::memory_order_acquire) - before,
+                                       std::memory_order_release);
+            }
+
+            static void *unwind_worker(void *arg) {
+                int id = *static_cast<int *>(arg);
+                int iter = 0;
+                while (!s_t6_stop.load(std::memory_order_acquire)) {
+                    char payload[64], got[64];
+                    int raii = 0;
+                    std::snprintf(payload, sizeof payload, "afw-g2a-t6-%d-%d", id, iter++);
+                    got[0] = '\0';
+                    int rc = cxx_catch_cross_dso(payload, got, sizeof got, &raii);
+                    if (rc != 1 || raii != 1 || std::strcmp(got, payload) != 0) {
+                        s_t6_err.fetch_add(1, std::memory_order_acq_rel);
+                        return nullptr;
+                    }
+                    s_t6_throws.fetch_add(1, std::memory_order_acq_rel);
+                }
+                return nullptr;
+            }
+
+            static void *dlsym_waiter(void *arg) {
+                int *out_state = static_cast<int *>(arg);
+                while (!s_ctor_entered.load(std::memory_order_acquire))
+                    sleep_ms(1);
+                s_dlsym_attempting.store(1, std::memory_order_release);
+                using ready_fn = int (*)(void);
+                ready_fn fn = reinterpret_cast<ready_fn>(dlsym(RTLD_DEFAULT, "dlopen_cxx_ctor_ready"));
+                int st = fn ? fn() : -1;
+                if (st != 0x1337CAFE) s_dlsym_early.store(1, std::memory_order_release);
+                *out_state = st;
+                return nullptr;
+            }
+        };
+
+        /* Bind exported C barrier symbol to T6Hooks::barrier_impl */
+        extern void (*g_t6_barrier_hook)(void);
+        g_t6_barrier_hook = T6Hooks::barrier_impl;
+
+        pthread_t uth[kWorkers], dth;
+        int uids[kWorkers];
+        int dlsym_state = 0;
+        for (int w = 0; w < kWorkers; w++) {
+            uids[w] = w;
+            if (pthread_create(&uth[w], nullptr, T6Hooks::unwind_worker, &uids[w]) != 0) {
+                std::fprintf(stderr, "FAIL T6: pthread_create(unwind %d) failed\n", w);
+                return 1;
+            }
+        }
+        if (pthread_create(&dth, nullptr, T6Hooks::dlsym_waiter, &dlsym_state) != 0) {
+            std::fprintf(stderr, "FAIL T6: pthread_create(dlsym_waiter) failed\n");
+            return 1;
+        }
+        /* Wait until concurrent unwinders are actively hammering dl_iterate_phdr */
+        while (s_t6_throws.load(std::memory_order_acquire) < 8)
+            T6Hooks::sleep_ms(1);
+
+        /* Concurrent failed dlopen must return NULL cleanly while unwinders run */
+        if (dlopen("libnonexistent_g2a.so", RTLD_NOW) != nullptr) {
+            std::fprintf(stderr, "FAIL T6: nonexistent dlopen unexpectedly succeeded\n");
+            return 1;
+        }
+
+        /* Concurrent real dlopen of libdlopen_cxx.so (pauses in g2a_ctor_barrier) */
+        void *dh = dlopen("libdlopen_cxx.so", RTLD_NOW | RTLD_GLOBAL);
+        if (!dh) {
+            std::fprintf(stderr, "FAIL T6: dlopen(libdlopen_cxx.so) failed: %s\n", dlerror());
+            return 1;
+        }
+        using tc_fn = int (*)(const char *);
+        tc_fn dlopen_tc = reinterpret_cast<tc_fn>(dlsym(dh, "dlopen_cxx_throw_and_catch"));
+        if (!dlopen_tc || dlopen_tc("afw-g2a-dlopen-payload") != 1) {
+            std::fprintf(stderr, "FAIL T6: newly dlopen'd DSO throw/catch failed\n");
+            return 1;
+        }
+
+        s_t6_stop.store(1, std::memory_order_release);
+        (void)pthread_join(dth, nullptr);
+        for (int w = 0; w < kWorkers; w++) (void)pthread_join(uth[w], nullptr);
+
+        int during = s_t6_during_ctor.load(std::memory_order_acquire);
+        int total_t6 = s_t6_throws.load(std::memory_order_acquire);
+        if (s_t6_err.load(std::memory_order_acquire) != 0 ||
+            s_dlsym_early.load(std::memory_order_acquire) != 0 ||
+            dlsym_state != 0x1337CAFE || during < 40) {
+            std::fprintf(stderr,
+                         "FAIL T6: err=%d early=%d dlsym_state=0x%x during_ctor=%d total=%d\n",
+                         s_t6_err.load(), s_dlsym_early.load(), dlsym_state, during, total_t6);
+            return 1;
+        }
+        std::printf("  [ OK ] T6 concurrent dlopen vs unwind: %d throws during ctor (%d total), "
+                    "external dlsym saw post-ctor 0x%x, dlopen'd DSO unwind OK\n",
+                    during, total_t6, dlsym_state);
+    }
+
     std::printf("G2A CXX GATE PASSED\n");
     std::fflush(stdout);
     return 0;
