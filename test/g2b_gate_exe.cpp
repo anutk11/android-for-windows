@@ -50,6 +50,7 @@ static constexpr int kThrowsPerThrd  = 50;
 
 static std::atomic<int> g_worker_dtor_calls[kTotalWorkers + 1];
 static std::atomic<int> g_worker_dtor_intact[kTotalWorkers + 1];
+static std::atomic<int> g_expect_main_dtor{0};
 
 static void record_dyn_dtor(int worker_id, int intact) {
     if (worker_id >= 0 && worker_id <= kTotalWorkers) {
@@ -59,6 +60,7 @@ static void record_dyn_dtor(int worker_id, int intact) {
 }
 
 static void verify_main_dyn_tls_dtor(void) {
+    if (!g_expect_main_dtor.load(std::memory_order_acquire)) return;
     int calls  = g_worker_dtor_calls[0].load(std::memory_order_acquire);
     int intact = g_worker_dtor_intact[0].load(std::memory_order_acquire);
     if (calls != 1 || intact != 1) {
@@ -149,7 +151,7 @@ static void *tls_worker_fn(void *vp) {
     PhdrProbe before{}, after{};
 
     dl_iterate_phdr(phdr_probe_cb, &before);
-    if (!before.found_dyn || before.dyn_modid < 65 || before.dyn_tls_data != nullptr) {
+    if (!before.found_dyn || before.dyn_modid < 33 || before.dyn_tls_data != nullptr) {
         w->err = -10;
         w->ok = 0;
         barrier_wait(w->barrier);
@@ -242,7 +244,7 @@ int main(void) {
 
     PhdrProbe p_before{}, p_after{};
     dl_iterate_phdr(phdr_probe_cb, &p_before);
-    if (!p_before.found_dyn || p_before.dyn_modid < 65 || p_before.dyn_tls_data != nullptr) {
+    if (!p_before.found_dyn || p_before.dyn_modid < 33 || p_before.dyn_tls_data != nullptr) {
         std::fprintf(stderr, "FAIL B1 before touch: found=%d modid=%zu tls_data=%p\n",
                      p_before.found_dyn, p_before.dyn_modid, p_before.dyn_tls_data);
         return 1;
@@ -260,6 +262,7 @@ int main(void) {
                      rc, (unsigned long long)main_tls_addr);
         return 1;
     }
+    g_expect_main_dtor.store(1, std::memory_order_release);
     dl_iterate_phdr(phdr_probe_cb, &p_after);
     if (!p_after.found_dyn || p_after.dyn_tls_data == nullptr) {
         std::fprintf(stderr, "FAIL B1 after touch: found=%d tls_data=%p\n",

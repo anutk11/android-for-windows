@@ -16,8 +16,8 @@
 #define AFW_TLS_MAX_DYN  64
 
 /* Register a PT_TLS segment whose initial image (.tdata) is at `image`.
- * Before afw_tls_static_finish(): registers a static TLS module (1..64).
- * After  afw_tls_static_finish(): registers a dynamic TLS module (65..128)
+ * Before afw_tls_static_finish(): registers a static TLS module (1..32).
+ * After  afw_tls_static_finish(): registers a dynamic TLS module (33..96)
  * served lazily from the per-thread DTV in afw_tls_get_addr().
  * Returns the 1-based module id, or 0 on error. */
 int afw_tls_static_register(const void *image, const afw_tls_segment *seg, const char *name);
