@@ -57,3 +57,47 @@ __attribute__((naked)) long afw_flow_mov8(long i) {
             ".long 2b - 8b\n\t"
             ".text\n");
 }
+
+/* 8-bit AND does NOT zero-extend bits 8..63: rdi remains unbounded -> MUST stay UNPROVEN. */
+__attribute__((naked)) long afw_flow_and8(long i) {
+    __asm__("and $1, %dil\n\t"
+            "lea 8f(%rip), %rcx\n\t"
+            "movslq (%rcx,%rdi,4), %rax\n\t"
+            "add %rcx, %rax\n\t"
+            "jmp *%rax\n"
+            "1:\n\t"
+            "mov $39, %eax\n\t"
+            "syscall\n\t"
+            "ret\n"
+            "2:\n\t"
+            "xor %eax, %eax\n\t"
+            "ret\n"
+            ".section .rodata\n\t"
+            ".p2align 2\n"
+            "8:\n\t"
+            ".long 1b - 8b\n\t"
+            ".long 2b - 8b\n\t"
+            ".text\n");
+}
+
+/* 64-bit AND with negative sign-extended imm8 (-1 = 0xFFFFFFFFFFFFFFFF): unbounded -> MUST stay UNPROVEN. */
+__attribute__((naked)) long afw_flow_and64_neg(long i) {
+    __asm__("and $-1, %rdi\n\t"
+            "lea 8f(%rip), %rcx\n\t"
+            "movslq (%rcx,%rdi,4), %rax\n\t"
+            "add %rcx, %rax\n\t"
+            "jmp *%rax\n"
+            "1:\n\t"
+            "mov $39, %eax\n\t"
+            "syscall\n\t"
+            "ret\n"
+            "2:\n\t"
+            "xor %eax, %eax\n\t"
+            "ret\n"
+            ".section .rodata\n\t"
+            ".p2align 2\n"
+            "8:\n\t"
+            ".long 1b - 8b\n\t"
+            ".long 2b - 8b\n\t"
+            ".text\n");
+}

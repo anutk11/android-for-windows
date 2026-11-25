@@ -217,9 +217,18 @@ static int apply_rela(afw_lib *lib, const Elf64_Rela *rel, size_t count,
     for (i = 0; i < count; i++) {
         uint32_t type = ELF64_R_TYPE(rel[i].r_info);
         uint32_t sym = ELF64_R_SYM(rel[i].r_info);
-        uint64_t *where = (uint64_t *)(lib->bias + rel[i].r_offset);
+        uintptr_t waddr = (uintptr_t)lib->bias + (uintptr_t)rel[i].r_offset;
+        uint64_t *where = (uint64_t *)waddr;
         uint64_t S;
         int64_t A = rel[i].r_addend;
+        if (type != R_X86_64_NONE) {
+            uintptr_t lb = (uintptr_t)lib->base;
+            if (waddr < lb || lib->size < sizeof(uint64_t) || waddr - lb > lib->size - sizeof(uint64_t)) {
+                fprintf(stderr, "error: relocation offset 0x%llx outside mapped image\n",
+                        (unsigned long long)rel[i].r_offset);
+                return -1;
+            }
+        }
         if (sym >= lib->nsyms && sym != 0) {
             fprintf(stderr, "error: relocation symbol index %u out of range (nsyms %zu)\n", sym, lib->nsyms);
             return -1;

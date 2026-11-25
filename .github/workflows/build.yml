@@ -420,7 +420,7 @@ jobs:
           # a 32-bit compare / 8-bit copy does not bound a 64-bit index: both tables UNPROVEN, refused
           out/afw-asan out/libflow_test.so --patch-report > out/flow.txt 2>&1 || true
           grep -E "UNPROVEN:|^GATE" out/flow.txt
-          test "$(grep -c "\[audit\] UNPROVEN: syscall" out/flow.txt)" -eq 2
+          test "$(grep -c "\[audit\] UNPROVEN: syscall" out/flow.txt)" -eq 4
           grep -q "would REFUSE" out/flow.txt
           if out/afw-asan out/libfs_gate_test.so > out/fsgate.txt 2>&1; then cat out/fsgate.txt; echo "fs: gate did not refuse"; exit 1; fi
           grep -q "6 unsupported fs: accesses" out/fsgate.txt
