@@ -12,6 +12,7 @@
 #include <dlfcn.h>
 #include <jni.h>
 #include <pthread.h>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -118,11 +119,18 @@ int main(int argc, char **argv) {
         "-Xnorelocate",
         "-Xverify:none"
     };
-    std::vector<JavaVMOption> opts(opt_strs.size());
+    std::vector<JavaVMOption> opts(opt_strs.size() + 1);
     for (size_t i = 0; i < opt_strs.size(); i++) {
         opts[i].optionString = const_cast<char *>(opt_strs[i].c_str());
         opts[i].extraInfo = nullptr;
     }
+    opts[opt_strs.size()].optionString = const_cast<char *>("vfprintf");
+    opts[opt_strs.size()].extraInfo = reinterpret_cast<void *>(+[](FILE *fp, const char *fmt, va_list ap) -> int {
+        (void)fp;
+        int r = std::vfprintf(stderr, fmt, ap);
+        std::fflush(stderr);
+        return r;
+    });
 
     JavaVMInitArgs args;
     args.version = JNI_VERSION_1_6;

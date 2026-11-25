@@ -905,6 +905,9 @@ static long atomic_inc_long(long *p) {
 #endif
 }
 
+static void (*g_abort_cb)(uintptr_t sp);
+void afw_syscall_set_abort_cb(void (*on_abort)(uintptr_t sp)) { g_abort_cb = on_abort; }
+
 static void (*g_set_gs_cb)(uintptr_t);
 static uintptr_t (*g_get_gs_cb)(void);
 static _Thread_local uintptr_t t_fallback_gs;
@@ -998,6 +1001,7 @@ static int64_t dispatch_ex(int64_t nr, int64_t *a, const afw_clone_regs *regs, u
         fprintf(stderr, "[syscall] signal nr=%lld tgid=%lld tid=%lld sig=%lld\n",
                 (long long)nr, (long long)a[0], (long long)a[1], (long long)a[2]);
         if (a[2] == 6 && nr >= 0 && nr < AFW_MAX_SYSCALL && atomic_inc_long(&g_unimplemented[nr]) == 0) {
+            if (g_abort_cb) g_abort_cb(cur_sp);
             afw_syscall_report();
             fflush(stdout);
         }

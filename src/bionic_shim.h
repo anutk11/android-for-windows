@@ -29,5 +29,6 @@ void *afw_shared_globals(void);
 const unsigned char *afw_shared_globals_random(void);
 void afw_shared_globals_set_process(const uint64_t *auxv, char **envp, const char *progname);
 void afw_shared_globals_set_static_tls(const afw_bionic_static_tls *stl);
+const char *afw_shared_globals_abort_msg(void);
 
 #endif

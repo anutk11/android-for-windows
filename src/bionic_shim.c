@@ -237,6 +237,17 @@ void afw_shared_globals_set_static_tls(const afw_bionic_static_tls *stl) {
     memcpy(sg + SG_STL_OFFSET_BIONIC_TLS,     &stl->offset_bionic_tls,     8);
 }
 
+const char *afw_shared_globals_abort_msg(void) {
+    unsigned char *sg;
+    uint64_t ptr = 0;
+    if (!g_sg_ready) return NULL;
+    sg = (unsigned char *)g_sg_mem;
+    memcpy(&ptr, sg + 0x448, 8);
+    if (!ptr) return NULL;
+    /* struct abort_msg_t { size_t size; char msg[]; } */
+    return (const char *)(uintptr_t)(ptr + 8);
+}
+
 static const shim_entry g_shims[] = {
     S("strlen", s_strlen), S("strcmp", s_strcmp), S("strncmp", s_strncmp),
     S("strcpy", s_strcpy), S("strncpy", s_strncpy), S("strcat", s_strcat),

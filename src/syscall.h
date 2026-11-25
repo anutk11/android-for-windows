@@ -61,5 +61,6 @@ void afw_syscall_probe_summary(void);
 
 /* Register ART %gs base setter/getter for SYS_arch_prctl (ARCH_SET_GS / ARCH_GET_GS). */
 void afw_syscall_set_gs_ops(void (*set_gs)(uintptr_t), uintptr_t (*get_gs)(void));
+void afw_syscall_set_abort_cb(void (*on_abort)(uintptr_t sp));
 
 #endif

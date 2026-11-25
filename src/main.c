@@ -907,6 +907,10 @@ int main(int argc, char **argv) {
     if (afw_check_security() != 0) return 1;
     if (afw_tls_init() != 0) return 1;
     afw_syscall_set_gs_ops(afw_tls_set_art_gs, afw_tls_get_art_gs);
+    if (afw_load_enable_art_gs) {
+        extern void afw_main_abort_diag(uintptr_t sp);
+        afw_syscall_set_abort_cb(afw_main_abort_diag);
+    }
 
     /* test: a library that must FAIL to load leaves nothing behind - not in
      * the library list, and its TLS module does not block the next library */
@@ -1211,4 +1215,23 @@ int main(int argc, char **argv) {
 
     afw_unload(&lib);
     return rc;
+}
+
+void afw_main_abort_diag(uintptr_t sp) {
+    const char *msg = afw_shared_globals_abort_msg();
+    if (msg && msg[0])
+        fprintf(stderr, "[abort_msg] %s\n", msg);
+    if (sp && (sp & 7) == 0) {
+        const uint64_t *p = (const uint64_t *)sp;
+        char where[512];
+        int i, shown = 0;
+        fprintf(stderr, "[abort_stack] callers:\n");
+        for (i = 0; i < 256 && shown < 24; i++) {
+            if (afw_describe_address((uintptr_t)p[i], where, sizeof where)) {
+                fprintf(stderr, "    %s\n", where);
+                shown++;
+            }
+        }
+    }
+    fflush(stderr);
 }
