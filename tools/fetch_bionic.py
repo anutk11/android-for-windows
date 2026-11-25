@@ -170,6 +170,8 @@ def extract_art_full(system, out):
         ("com.android.art.apex", "com.android.art.capex"),
         ("com.android.i18n.apex", "com.android.i18n.capex"),
         ("com.android.conscrypt.apex", "com.android.conscrypt.capex"),
+        ("com.android.os.statsd.apex", "com.android.os.statsd.capex"),
+        ("com.android.runtime.apex", "com.android.runtime.capex"),
     ]
     for cand in apex_list:
         payload = open_apex(system, cand)
@@ -179,16 +181,21 @@ def extract_art_full(system, out):
         with open(pimg, "wb") as f:
             f.write(payload)
         with Ext4(pimg) as fs:
-            try:
-                for n, ino in fs.listdir(fs.lookup("/lib64")):
-                    if n.endswith(".so") and n not in have:
-                        d = fs.data(ino)
-                        if d[:4] == b"\x7fELF":
-                            save(lib_dir, n, d)
-                            have.add(n)
-                            queue.append((n, d))
-            except FileNotFoundError:
-                pass
+            for ldir in ("/lib64", "/lib64/bionic"):
+                try:
+                    for n, ino in fs.listdir(fs.lookup(ldir)):
+                        if n.endswith(".so") and n not in have:
+                            try:
+                                rino = fs.lookup(ldir + "/" + n)
+                                d = fs.data(rino)
+                            except (FileNotFoundError, IOError, ValueError):
+                                continue
+                            if d[:4] == b"\x7fELF":
+                                save(lib_dir, n, d)
+                                have.add(n)
+                                queue.append((n, d))
+                except FileNotFoundError:
+                    pass
             try:
                 for n, ino in fs.listdir(fs.lookup("/javalib")):
                     if n.endswith(".jar"):
@@ -209,7 +216,7 @@ def extract_art_full(system, out):
                 pass
         os.remove(pimg)
 
-    # Transitively resolve remaining DT_NEEDED from /system/lib64 (and runtime APEX /lib64)
+    # Transitively resolve remaining DT_NEEDED from /system/lib64
     missing = set()
     sys_dirs = ["/system/lib64", "/system/lib64/bootstrap"]
     while queue:
@@ -225,7 +232,7 @@ def extract_art_full(system, out):
                     if d[:4] == b"\x7fELF":
                         found_data = d
                         break
-                except FileNotFoundError:
+                except (FileNotFoundError, IOError, ValueError):
                     continue
             if found_data is not None:
                 save(lib_dir, dep, found_data)

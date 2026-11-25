@@ -155,8 +155,16 @@ jobs:
           "$TC/clang++" --target=x86_64-linux-android34 -std=c++17 -fPIE -pie -O2 -nostdlib++ \
             -Wl,--pack-dyn-relocs=none -Wl,--export-dynamic \
             -Lout -lcxx_catcher -lcxx_thrower -lc++_shared -ldl -o out/g2b_gate_exe test/g2b_gate_exe.cpp
-          echo "--- G2a/G2b Gate DT_NEEDED (must dynamically link libc++_shared.so across all DSOs and PIEs)"
-          for f in out/libcxx_thrower.so out/libcxx_catcher.so out/libdlopen_cxx.so out/cxx_gate_exe out/libg2b_dlopen_tls.so out/g2b_gate_exe; do
+          # G3 Gate: Real Android 14 libart.so boot + Java execution (JNI_CreateJavaVM)
+          "$TC/clang++" --target=x86_64-linux-android34 -std=c++17 -fPIE -pie -O2 -nostdlib++ \
+            -Wl,--pack-dyn-relocs=none -Wl,--export-dynamic \
+            -Lout -lc++_shared -ldl -o out/g3_art_gate_exe test/g3_art_gate_exe.cpp
+          mkdir -p out/g3_java/cls
+          javac --release 8 -Xlint:-options -d out/g3_java/cls test/G3ArtTest.java
+          D8=$(find "${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}/build-tools" -name d8 -type f | sort -V | tail -n 1)
+          "$D8" --min-api 24 --output out/g3_java_test.jar out/g3_java/cls/G3ArtTest.class
+          echo "--- G2a/G2b/G3 Gate DT_NEEDED (must dynamically link libc++_shared.so across all DSOs and PIEs)"
+          for f in out/libcxx_thrower.so out/libcxx_catcher.so out/libdlopen_cxx.so out/cxx_gate_exe out/libg2b_dlopen_tls.so out/g2b_gate_exe out/g3_art_gate_exe; do
             echo "$f:"
             "$TC/llvm-readelf" -dW "$f" | grep NEEDED
             "$TC/llvm-readelf" -dW "$f" | grep -q "libc++_shared.so" || { echo "$f missing DT_NEEDED libc++_shared.so"; exit 1; }
@@ -175,6 +183,8 @@ jobs:
             out/pthread_mt_test
             out/cxx_gate_exe
             out/g2b_gate_exe
+            out/g3_art_gate_exe
+            out/g3_java_test.jar
 
   # Gate G1 experiment: static scan of the real bionic libc.so.
   # The extracted Android files are NOT uploaded (licensing): only the report.
@@ -314,23 +324,19 @@ jobs:
       - name: "G3-0 Measure: libart.so + full transitive dependency closure with --art-gs (no binaries uploaded)"
         continue-on-error: true
         run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"; TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
           python3 -I tools/fetch_bionic.py out/artfull --art-full > out/art-deps-scan.txt 2>&1 || true
-          echo "=== Bootclasspath JARs & ICU data ===" >> out/art-deps-scan.txt
-          ls -la out/artfull/art/javalib out/artfull/art/icu >> out/art-deps-scan.txt 2>&1 || true
-          echo "=== libart.so with --patch-report --art-gs ===" >> out/art-deps-scan.txt
-          out/afw-loader out/artfull/art/lib64/libart.so --patch-report --art-gs 2>&1 | tee /tmp/libart-gs.txt | grep -E "^(Library|Needs|Code|Patched|GATE|ATTEST|PATCH REPORT|  \[patch\]|  \[audit\]|  fs:|  syscall)" | head -120 >> out/art-deps-scan.txt
-          echo "=== libart.so UNPROVEN summary ===" >> out/art-deps-scan.txt
-          grep -E "\[audit\] UNPROVEN:" /tmp/libart-gs.txt | head -40 >> out/art-deps-scan.txt || true
-          echo "=== Every transitive .so with --patch-report --art-gs ===" >> out/art-deps-scan.txt
-          for f in out/artfull/art/lib64/*.so; do
-            bn=$(basename "$f")
-            echo "--- $bn ---" >> out/art-deps-scan.txt
-            out/afw-loader "$f" --patch-report --art-gs 2>&1 | grep -E "^(Needs|GATE|PATCH REPORT|  \[patch\]|  \[audit\] WARNING|  imports)" | head -15 >> out/art-deps-scan.txt || true
+          echo "=== Disassemble 5 edge-case RVAs in libart.so ===" >> out/art-deps-scan.txt
+          for rva in 0x934890 0x934a01 0x366330 0x5fa467 0x5fa67c; do
+            lo=$(python3 -c "print(hex($rva - 0x20))")
+            hi=$(python3 -c "print(hex($rva + 0x20))")
+            echo "--- RVA $rva ---" >> out/art-deps-scan.txt
+            "$TC/llvm-objdump" -d --start-address=$lo --stop-address=$hi out/artfull/art/lib64/libart.so >> out/art-deps-scan.txt 2>&1 || true
           done
           echo "=== Transitive symbol resolution check (AFW_LIB_PATH=out/artfull:out/artfull/art/lib64) ===" >> out/art-deps-scan.txt
-          AFW_LIB_PATH="out/artfull:out/artfull/art/lib64" out/afw-loader out/artfull/art/lib64/libart.so --with-deps --patch-report --art-gs 2>&1 | grep -E "(missing|unresolved|error:|GATE|Loaded|== dependency|PATCH REPORT)" | head -120 >> out/art-deps-scan.txt || true
-          rm -rf out/artfull /tmp/libart-gs.txt
-          tail -n 60 out/art-deps-scan.txt
+          AFW_LIB_PATH="out/artfull:out/artfull/art/lib64" out/afw-loader out/artfull/art/lib64/libart.so --with-deps --patch-report --art-gs --allow-unproven 2>&1 | grep -E "(missing|unresolved|error:|GATE|Loaded|== dependency|PATCH REPORT|imports missing)" | head -200 >> out/art-deps-scan.txt || true
+          rm -rf out/artfull
+          tail -n 80 out/art-deps-scan.txt
       - name: "G2-1 / G2-4a Measure: bionic pthread/clone/StaticTlsLayout ABI oracle"
         continue-on-error: true
         run: |
@@ -568,9 +574,9 @@ jobs:
           clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Fe:out\fd_test.exe /Foout\fdobj\ tools\fd_test.c src\fd.c src\platform.c
           if errorlevel 1 exit /b 1
           out\fd_test.exe
-      - name: "G1: extract the real bionic on this Windows runner (never uploaded)"
+      - name: "G1/G3: extract the real bionic + ART on this Windows runner (never uploaded)"
         shell: bash
-        run: python -I tools/fetch_bionic.py out/bionic
+        run: python -I tools/fetch_bionic.py out/bionic --art-full
       - name: "An executable's initial stack (argc, argv, envp, auxv) on Windows"
         shell: cmd
         run: |
@@ -755,6 +761,19 @@ jobs:
           findstr /c:"G2B GATE PASSED" out\g2b-gate.txt >nul || (echo G2b g2b_gate_exe did not pass & exit /b 1)
           findstr /c:"G2B MAIN DYN TLS DTOR OK" out\g2b-gate.txt >nul || (echo G2b main dynamic thread_local dtor did not run cleanly & exit /b 1)
           exit /b 0
+      - name: "G3 ART Live Probe: boot real Android 14 libart.so (JNI_CreateJavaVM) on Windows"
+        continue-on-error: true
+        timeout-minutes: 3
+        shell: cmd
+        run: |
+          set AFW_LIB_PATH=out\bionic;out\bionic\art\lib64;out
+          out\afw-loader.exe out\g3_art_gate_exe --art-gs --allow-unproven --with-deps --watchdog=60 --exec out\bionic\art out\g3_java_test.jar > out\g3-art-gate.txt 2>&1
+          set rc=%errorlevel%
+          type out\g3-art-gate.txt
+          echo g3_art_gate_exe exit code %rc%
+          if not "%rc%"=="0" exit /b 1
+          findstr /c:"G3 ART GATE PASSED" out\g3-art-gate.txt >nul || exit /b 1
+          exit /b 0
       - name: "G2-1 Probe (Items 2-5): Windows stack / NT_TIB / VEH / ExitThread probe (informational)"
         continue-on-error: true
         timeout-minutes: 2
@@ -792,7 +811,7 @@ jobs:
   # 3. Publish a download link: Releases -> nightly
   release:
     needs: windows
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

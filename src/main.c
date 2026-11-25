@@ -844,7 +844,7 @@ int main(int argc, char **argv) {
     int nenv_overrides = 0;
     char **penvp = NULL;
     int call_bad_ip = 0;   /* test: execute address 0x28 - must be a crash report, never a hang */
-    static afw_lib deps[32];
+    static afw_lib deps[64];
     int ndeps = 0;
 
     setvbuf(stdout, NULL, _IONBF, 0); /* never lose output on a crash */
@@ -1060,7 +1060,7 @@ int main(int argc, char **argv) {
         afw_shared_globals_set_process(NULL, penvp, argv[1]);
     }
 
-    if ((with_deps ? afw_load_with_deps(argv[1], &lib, deps, 32, &ndeps, verbose)
+    if ((with_deps ? afw_load_with_deps(argv[1], &lib, deps, 64, &ndeps, verbose)
                    : afw_load(argv[1], &lib, verbose)) != 0) {
         printf("\nLoad failed.\n");
         free(penvp);

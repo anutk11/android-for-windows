@@ -50,7 +50,7 @@ static void set_err(const char *fmt, ...) {
  * only an interior deps[i] stayed loaded or quarantined). */
 typedef struct afw_deps_block_s {
     struct afw_deps_block_s *next;
-    afw_lib deps[32];
+    afw_lib deps[64];
 } afw_deps_block;
 static afw_deps_block *g_kept_deps_head;
 static void keep_deps_block(afw_deps_block *blk) {
@@ -87,7 +87,7 @@ SYSV void *afw_l_dlopen(const char *name, int flags, const void *caller) {
             return NULL;
         }
         strcpy(p, path);
-        if (afw_load_with_deps(p, lib, dblk->deps, 32, &ndeps, 0) != 0) {
+        if (afw_load_with_deps(p, lib, dblk->deps, 64, &ndeps, 0) != 0) {
             int i, keep_deps = 0;
             /* Only free allocations that are neither loaded in g_libs[] nor
              * quarantined on the intrusive quarantine list (past point of no return). */

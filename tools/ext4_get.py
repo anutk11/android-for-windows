@@ -93,11 +93,27 @@ class Ext4:
             walk(p, lvl)
         return out[:nblocks]
 
+    def inode_mode(self, ino):
+        return struct.unpack_from("<H", self.inode(ino), 0)[0]
+
+    def is_symlink(self, ino):
+        return (self.inode_mode(ino) & 0xF000) == 0xA000
+
+    def readlink(self, ino):
+        ind = self.inode(ino)
+        size = struct.unpack_from("<I", ind, 4)[0]
+        if size <= 60:
+            return ind[0x28:0x28 + size].decode("utf-8", "replace")
+        return self.data(ino).decode("utf-8", "replace")
+
     def data(self, ino):
         ind = self.inode(ino)
+        mode = struct.unpack_from("<H", ind, 0)[0]
         size = struct.unpack_from("<I", ind, 4)[0] | (struct.unpack_from("<I", ind, 0x6C)[0] << 32)
         flags = struct.unpack_from("<I", ind, 0x20)[0]
         iblock = ind[0x28:0x28 + 60]
+        if (mode & 0xF000) == 0xA000 and size <= 60:   # fast symlink
+            return iblock[:size]
         if flags & 0x10000000:                      # inline data
             return iblock[:size]
         buf = bytearray(size)
@@ -132,13 +148,34 @@ class Ext4:
             o += rec
         return out
 
-    def lookup(self, path):
+    def lookup(self, path, follow=True, depth=0):
+        if depth > 16:
+            raise FileNotFoundError(path)
         ino = 2
-        for part in [p for p in path.split("/") if p]:
+        parts = [p for p in path.split("/") if p]
+        cur_parts = []
+        for idx, part in enumerate(parts):
+            if part == ".":
+                continue
+            if part == "..":
+                if cur_parts:
+                    cur_parts.pop()
+                ino = self.lookup("/" + "/".join(cur_parts), follow=True, depth=depth + 1) if cur_parts else 2
+                continue
             hit = [c for n, c in self.listdir(ino) if n == part]
             if not hit:
                 raise FileNotFoundError(path)
             ino = hit[0]
+            if (follow or idx < len(parts) - 1) and self.is_symlink(ino):
+                target = self.readlink(ino)
+                rest = parts[idx + 1:]
+                if target.startswith("/"):
+                    new_path = target + ("/" + "/".join(rest) if rest else "")
+                else:
+                    base = "/" + "/".join(cur_parts) if cur_parts else ""
+                    new_path = base + "/" + target + ("/" + "/".join(rest) if rest else "")
+                return self.lookup(new_path, follow=follow, depth=depth + 1)
+            cur_parts.append(part)
         return ino
 
 

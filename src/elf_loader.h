@@ -11,7 +11,7 @@
 #include "patch.h"
 
 #define AFW_MAX_NEEDED 32
-#define AFW_MAX_LIBS   64
+#define AFW_MAX_LIBS   128
 
 #define AFW_BUILD_ID_HEX 65
 /* the only libc.so whose libc_shared_globals layout is measured (tools/fetch_bionic.py pins it) */
