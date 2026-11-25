@@ -6,24 +6,11 @@
 #include "jni_bridge.h"
 #include "platform.h"
 
-#include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#if defined(_WIN32)
-typedef __builtin_sysv_va_list afw_jni_va;
-#define JNI_VA_START(ap, last) __builtin_sysv_va_start(ap, last)
-#define JNI_VA_ARG(ap, type)   __builtin_sysv_va_arg(ap, type)
-#define JNI_VA_END(ap)         __builtin_sysv_va_end(ap)
-#else
-typedef va_list afw_jni_va;
-#define JNI_VA_START(ap, last) va_start(ap, last)
-#define JNI_VA_ARG(ap, type)   va_arg(ap, type)
-#define JNI_VA_END(ap)         va_end(ap)
-#endif
 
 struct afw_jni_state_s {
     const void **env_vtable_ptr; /* JNIEnv* points here */
@@ -143,34 +130,33 @@ static SYSV void *jni_GetStaticMethodID(void *env, void *cls, const char *name, 
     return jni_GetMethodID(env, cls, name, sig);
 }
 
-static int unpack_va_args(const char *shorty, afw_jni_va *ap, uint64_t *out, int max_args) {
-    int n = 0;
+/* Unpack SysV variadic args arriving in (rcx, r8, r9, stack...) + (xmm0..xmm2) */
+static int unpack_sysv_args(const char *shorty, const uint64_t *iargs, int niargs,
+                            const double *fargs, int nfargs, uint64_t *out, int max_args) {
+    int n = 0, ii = 0, fi = 0;
     const char *p;
     if (!shorty || !shorty[0]) return 0;
     for (p = shorty + 1; *p && n < max_args; p++) {
         switch (*p) {
-        case 'L': case '[':
-            out[n++] = (uint64_t)(uintptr_t)JNI_VA_ARG(*ap, void *);
-            break;
-        case 'J':
-            out[n++] = (uint64_t)JNI_VA_ARG(*ap, int64_t);
+        case 'L': case '[': case 'J':
+            out[n++] = (ii < niargs) ? iargs[ii++] : 0;
             break;
         case 'F': {
-            float f = (float)JNI_VA_ARG(*ap, double);
+            float f = (fi < nfargs) ? (float)fargs[fi++] : 0.0f;
             uint32_t bits = 0;
             memcpy(&bits, &f, 4);
             out[n++] = (uint64_t)bits;
             break;
         }
         case 'D': {
-            double d = JNI_VA_ARG(*ap, double);
+            double d = (fi < nfargs) ? fargs[fi++] : 0.0;
             uint64_t bits = 0;
             memcpy(&bits, &d, 8);
             out[n++] = bits;
             break;
         }
-        default: /* I, Z, B, C, S */
-            out[n++] = (uint64_t)(uint32_t)JNI_VA_ARG(*ap, int32_t);
+        default:
+            out[n++] = (ii < niargs) ? (uint64_t)(uint32_t)iargs[ii++] : 0;
             break;
         }
     }
@@ -193,18 +179,20 @@ static int unpack_jval_args(const char *shorty, const afw_jvalue *jv, uint64_t *
     return n;
 }
 
-static SYSV int32_t jni_CallIntMethod(void *env, void *obj, void *mid_p, ...) {
+static SYSV int32_t jni_CallIntMethod(void *env, void *obj, void *mid_p,
+                                      uint64_t a0, uint64_t a1, uint64_t a2,
+                                      double f0, double f1, double f2,
+                                      uint64_t a3, uint64_t a4) {
     afw_jni_state *st = from_env(env);
     int mid = (int)(uintptr_t)mid_p - 1;
     const char *shorty = afw_dex_method_shorty(st->vm, mid);
+    uint64_t iargs[5] = { a0, a1, a2, a3, a4 };
+    double   fargs[3] = { f0, f1, f2 };
     uint64_t args[16];
     int n = 0;
     uint64_t ret = 0;
-    afw_jni_va ap;
     args[n++] = (uint64_t)(uintptr_t)obj;
-    JNI_VA_START(ap, mid_p);
-    n += unpack_va_args(shorty, &ap, args + 1, 15);
-    JNI_VA_END(ap);
+    n += unpack_sysv_args(shorty, iargs, 5, fargs, 3, args + 1, 15);
     (void)afw_dex_invoke_method_id(st->vm, mid, args, n, &ret);
     return (int32_t)ret;
 }
@@ -222,18 +210,20 @@ static SYSV int32_t jni_CallIntMethodA(void *env, void *obj, void *mid_p, const 
     return (int32_t)ret;
 }
 
-static SYSV void *jni_CallObjectMethod(void *env, void *obj, void *mid_p, ...) {
+static SYSV void *jni_CallObjectMethod(void *env, void *obj, void *mid_p,
+                                       uint64_t a0, uint64_t a1, uint64_t a2,
+                                       double f0, double f1, double f2,
+                                       uint64_t a3, uint64_t a4) {
     afw_jni_state *st = from_env(env);
     int mid = (int)(uintptr_t)mid_p - 1;
     const char *shorty = afw_dex_method_shorty(st->vm, mid);
+    uint64_t iargs[5] = { a0, a1, a2, a3, a4 };
+    double   fargs[3] = { f0, f1, f2 };
     uint64_t args[16];
     int n = 0;
     uint64_t ret = 0;
-    afw_jni_va ap;
     args[n++] = (uint64_t)(uintptr_t)obj;
-    JNI_VA_START(ap, mid_p);
-    n += unpack_va_args(shorty, &ap, args + 1, 15);
-    JNI_VA_END(ap);
+    n += unpack_sysv_args(shorty, iargs, 5, fargs, 3, args + 1, 15);
     (void)afw_dex_invoke_method_id(st->vm, mid, args, n, &ret);
     return (void *)(uintptr_t)ret;
 }
@@ -251,17 +241,19 @@ static SYSV void *jni_CallObjectMethodA(void *env, void *obj, void *mid_p, const
     return (void *)(uintptr_t)ret;
 }
 
-static SYSV void jni_CallVoidMethod(void *env, void *obj, void *mid_p, ...) {
+static SYSV void jni_CallVoidMethod(void *env, void *obj, void *mid_p,
+                                    uint64_t a0, uint64_t a1, uint64_t a2,
+                                    double f0, double f1, double f2,
+                                    uint64_t a3, uint64_t a4) {
     afw_jni_state *st = from_env(env);
     int mid = (int)(uintptr_t)mid_p - 1;
     const char *shorty = afw_dex_method_shorty(st->vm, mid);
+    uint64_t iargs[5] = { a0, a1, a2, a3, a4 };
+    double   fargs[3] = { f0, f1, f2 };
     uint64_t args[16];
     int n = 0;
-    afw_jni_va ap;
     args[n++] = (uint64_t)(uintptr_t)obj;
-    JNI_VA_START(ap, mid_p);
-    n += unpack_va_args(shorty, &ap, args + 1, 15);
-    JNI_VA_END(ap);
+    n += unpack_sysv_args(shorty, iargs, 5, fargs, 3, args + 1, 15);
     (void)afw_dex_invoke_method_id(st->vm, mid, args, n, NULL);
 }
 
@@ -276,34 +268,38 @@ static SYSV void jni_CallVoidMethodA(void *env, void *obj, void *mid_p, const af
     (void)afw_dex_invoke_method_id(st->vm, mid, args, n, NULL);
 }
 
-static SYSV int32_t jni_CallStaticIntMethod(void *env, void *cls, void *mid_p, ...) {
+static SYSV int32_t jni_CallStaticIntMethod(void *env, void *cls, void *mid_p,
+                                            uint64_t a0, uint64_t a1, uint64_t a2,
+                                            double f0, double f1, double f2,
+                                            uint64_t a3, uint64_t a4) {
     afw_jni_state *st = from_env(env);
     int mid = (int)(uintptr_t)mid_p - 1;
     const char *shorty = afw_dex_method_shorty(st->vm, mid);
+    uint64_t iargs[5] = { a0, a1, a2, a3, a4 };
+    double   fargs[3] = { f0, f1, f2 };
     uint64_t args[16];
-    int n = 0;
+    int n;
     uint64_t ret = 0;
-    afw_jni_va ap;
     (void)cls;
-    JNI_VA_START(ap, mid_p);
-    n = unpack_va_args(shorty, &ap, args, 16);
-    JNI_VA_END(ap);
+    n = unpack_sysv_args(shorty, iargs, 5, fargs, 3, args, 16);
     (void)afw_dex_invoke_method_id(st->vm, mid, args, n, &ret);
     return (int32_t)ret;
 }
 
-static SYSV void *jni_CallStaticObjectMethod(void *env, void *cls, void *mid_p, ...) {
+static SYSV void *jni_CallStaticObjectMethod(void *env, void *cls, void *mid_p,
+                                             uint64_t a0, uint64_t a1, uint64_t a2,
+                                             double f0, double f1, double f2,
+                                             uint64_t a3, uint64_t a4) {
     afw_jni_state *st = from_env(env);
     int mid = (int)(uintptr_t)mid_p - 1;
     const char *shorty = afw_dex_method_shorty(st->vm, mid);
+    uint64_t iargs[5] = { a0, a1, a2, a3, a4 };
+    double   fargs[3] = { f0, f1, f2 };
     uint64_t args[16];
-    int n = 0;
+    int n;
     uint64_t ret = 0;
-    afw_jni_va ap;
     (void)cls;
-    JNI_VA_START(ap, mid_p);
-    n = unpack_va_args(shorty, &ap, args, 16);
-    JNI_VA_END(ap);
+    n = unpack_sysv_args(shorty, iargs, 5, fargs, 3, args, 16);
     (void)afw_dex_invoke_method_id(st->vm, mid, args, n, &ret);
     return (void *)(uintptr_t)ret;
 }

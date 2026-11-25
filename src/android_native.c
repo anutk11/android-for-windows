@@ -149,26 +149,21 @@ int afw_android_finish_requested(void) {
     return afw_os_atomic_load_i32(&g_finish_req) != 0;
 }
 
-/* ---- liblog: __android_log_print (safe SysV variadic formatter) ------- */
-#if defined(_WIN32)
-typedef __builtin_sysv_va_list afw_sysv_va;
-#define AFW_VA_START(ap, last) __builtin_sysv_va_start(ap, last)
-#define AFW_VA_ARG(ap, type)   __builtin_sysv_va_arg(ap, type)
-#define AFW_VA_END(ap)         __builtin_sysv_va_end(ap)
-#else
-typedef va_list afw_sysv_va;
-#define AFW_VA_START(ap, last) va_start(ap, last)
-#define AFW_VA_ARG(ap, type)   va_arg(ap, type)
-#define AFW_VA_END(ap)         va_end(ap)
-#endif
-
+/* ---- liblog: __android_log_print (portable SysV ABI formatter) --------
+ * In System V x86-64 ABI, variadic int/ptr args 4..6 arrive in rcx, r8, r9
+ * and args 7..9 on the caller's stack; float/double args arrive in xmm0..xmm3.
+ * Taking them as explicit SYSV parameters works identically on Windows clang-cl
+ * and Linux gcc/clang without non-portable sysv_va_list builtins. */
 static void append_str(char *dst, size_t cap, size_t *pos, const char *s) {
     if (!s) s = "(null)";
     while (*s && *pos + 1 < cap) dst[(*pos)++] = *s++;
 }
 
-static void format_sysv_log(char *out, size_t cap, const char *fmt, afw_sysv_va *ap) {
+static void format_sysv_log(char *out, size_t cap, const char *fmt,
+                            const uint64_t *iargs, int niargs,
+                            const double *fargs, int nfargs) {
     size_t pos = 0;
+    int ii = 0, fi = 0;
     char tmp[64];
     if (!cap) return;
     if (!fmt) { out[0] = '\0'; return; }
@@ -176,46 +171,61 @@ static void format_sysv_log(char *out, size_t cap, const char *fmt, afw_sysv_va 
         int is_long = 0, is_ll = 0, is_z = 0;
         if (*fmt != '%') { out[pos++] = *fmt++; continue; }
         fmt++;
-        /* Skip width/precision/flags for clean formatting */
         while (*fmt == '-' || *fmt == '+' || *fmt == ' ' || *fmt == '0' || *fmt == '#' ||
                (*fmt >= '0' && *fmt <= '9') || *fmt == '.') fmt++;
         if (*fmt == 'l') { is_long = 1; fmt++; if (*fmt == 'l') { is_ll = 1; fmt++; } }
         else if (*fmt == 'z') { is_z = 1; fmt++; }
         switch (*fmt) {
         case '%': out[pos++] = '%'; break;
-        case 's': append_str(out, cap, &pos, AFW_VA_ARG(*ap, const char *)); break;
-        case 'c': out[pos++] = (char)AFW_VA_ARG(*ap, int); break;
-        case 'd': case 'i':
+        case 's': {
+            const char *s = (ii < niargs) ? (const char *)(uintptr_t)iargs[ii++] : "(arg)";
+            append_str(out, cap, &pos, s);
+            break;
+        }
+        case 'c': {
+            uint64_t v = (ii < niargs) ? iargs[ii++] : '?';
+            out[pos++] = (char)v;
+            break;
+        }
+        case 'd': case 'i': {
+            uint64_t v = (ii < niargs) ? iargs[ii++] : 0;
             if (is_ll || is_long || is_z)
-                snprintf(tmp, sizeof tmp, "%lld", (long long)AFW_VA_ARG(*ap, long long));
+                snprintf(tmp, sizeof tmp, "%lld", (long long)v);
             else
-                snprintf(tmp, sizeof tmp, "%d", AFW_VA_ARG(*ap, int));
+                snprintf(tmp, sizeof tmp, "%d", (int)v);
             append_str(out, cap, &pos, tmp);
             break;
-        case 'u':
+        }
+        case 'u': {
+            uint64_t v = (ii < niargs) ? iargs[ii++] : 0;
             if (is_ll || is_long || is_z)
-                snprintf(tmp, sizeof tmp, "%llu", (unsigned long long)AFW_VA_ARG(*ap, unsigned long long));
+                snprintf(tmp, sizeof tmp, "%llu", (unsigned long long)v);
             else
-                snprintf(tmp, sizeof tmp, "%u", AFW_VA_ARG(*ap, unsigned int));
+                snprintf(tmp, sizeof tmp, "%u", (unsigned int)v);
             append_str(out, cap, &pos, tmp);
             break;
-        case 'x': case 'X':
+        }
+        case 'x': case 'X': {
+            uint64_t v = (ii < niargs) ? iargs[ii++] : 0;
             if (is_ll || is_long || is_z)
-                snprintf(tmp, sizeof tmp, (*fmt == 'X') ? "%llX" : "%llx",
-                         (unsigned long long)AFW_VA_ARG(*ap, unsigned long long));
+                snprintf(tmp, sizeof tmp, (*fmt == 'X') ? "%llX" : "%llx", (unsigned long long)v);
             else
-                snprintf(tmp, sizeof tmp, (*fmt == 'X') ? "%X" : "%x",
-                         AFW_VA_ARG(*ap, unsigned int));
+                snprintf(tmp, sizeof tmp, (*fmt == 'X') ? "%X" : "%x", (unsigned int)v);
             append_str(out, cap, &pos, tmp);
             break;
-        case 'p':
-            snprintf(tmp, sizeof tmp, "%p", AFW_VA_ARG(*ap, void *));
+        }
+        case 'p': {
+            uint64_t v = (ii < niargs) ? iargs[ii++] : 0;
+            snprintf(tmp, sizeof tmp, "%p", (void *)(uintptr_t)v);
             append_str(out, cap, &pos, tmp);
             break;
-        case 'f': case 'g':
-            snprintf(tmp, sizeof tmp, "%.3f", AFW_VA_ARG(*ap, double));
+        }
+        case 'f': case 'g': {
+            double d = (fi < nfargs) ? fargs[fi++] : 0.0;
+            snprintf(tmp, sizeof tmp, "%.3f", d);
             append_str(out, cap, &pos, tmp);
             break;
+        }
         default:
             if (*fmt) out[pos++] = *fmt;
             break;
@@ -232,12 +242,14 @@ static void emit_log_line(int prio, const char *tag, const char *text) {
     fflush(stdout);
 }
 
-static SYSV int s_android_log_print(int prio, const char *tag, const char *fmt, ...) {
+static SYSV int s_android_log_print(int prio, const char *tag, const char *fmt,
+                                    uint64_t a0, uint64_t a1, uint64_t a2,
+                                    double f0, double f1, double f2,
+                                    uint64_t a3, uint64_t a4, uint64_t a5) {
     char buf[1024];
-    afw_sysv_va ap;
-    AFW_VA_START(ap, fmt);
-    format_sysv_log(buf, sizeof buf, fmt, &ap);
-    AFW_VA_END(ap);
+    uint64_t iargs[6] = { a0, a1, a2, a3, a4, a5 };
+    double   fargs[3] = { f0, f1, f2 };
+    format_sysv_log(buf, sizeof buf, fmt, iargs, 6, fargs, 3);
     emit_log_line(prio, tag, buf);
     return 1;
 }
@@ -248,12 +260,14 @@ static SYSV int s_android_log_vprint(int prio, const char *tag, const char *fmt,
     return 1;
 }
 
-static SYSV void s_android_log_assert(const char *cond, const char *tag, const char *fmt, ...) {
+static SYSV void s_android_log_assert(const char *cond, const char *tag, const char *fmt,
+                                      uint64_t a0, uint64_t a1, uint64_t a2,
+                                      double f0, double f1) {
     char buf[1024];
-    afw_sysv_va ap;
-    AFW_VA_START(ap, fmt);
-    format_sysv_log(buf, sizeof buf, fmt ? fmt : (cond ? cond : "assertion failed"), &ap);
-    AFW_VA_END(ap);
+    uint64_t iargs[3] = { a0, a1, a2 };
+    double   fargs[2] = { f0, f1 };
+    format_sysv_log(buf, sizeof buf, fmt ? fmt : (cond ? cond : "assertion failed"),
+                    iargs, 3, fargs, 2);
     emit_log_line(7, tag ? tag : "assert", buf);
     abort();
 }
