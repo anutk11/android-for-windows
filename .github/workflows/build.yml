@@ -333,8 +333,6 @@ jobs:
             echo "--- RVA $rva ---" >> out/art-deps-scan.txt
             "$TC/llvm-objdump" -d --start-address=$lo --stop-address=$hi out/artfull/art/lib64/libart.so >> out/art-deps-scan.txt 2>&1 || true
           done
-          echo "=== Check BORINGSSL_bcm symbols in libcrypto.so ==="
-          "$TC/llvm-readelf" -Ws out/artfull/art/lib64/libcrypto.so 2>&1 | grep -E "BORINGSSL_bcm|power_on_self" | head -n 20 || true
           echo "=== libart.so --patch-report --art-gs summary ===" >> out/art-deps-scan.txt
           out/afw-loader out/artfull/art/lib64/libart.so --patch-report --art-gs 2>&1 | grep -E "^(GATE|PATCH REPORT|  fs:|  \[patch\]|  \[audit\] WARNING)" >> out/art-deps-scan.txt || true
           echo "=== Transitive symbol resolution check (AFW_LIB_PATH=out/artfull:out/artfull/art/lib64) ===" >> out/art-deps-scan.txt

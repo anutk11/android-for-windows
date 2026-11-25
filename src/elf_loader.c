@@ -990,77 +990,111 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
             free(cr); free(pageprot); return -1;
         }
         pc.readable = patch_readable;
-        /* If this library has BoringSSL FIPS integrity symbols (e.g. libcrypto.so),
-         * verify the unpatched HMAC-SHA256 matches BORINGSSL_bcm_text_hash before
-         * patching, then recompute it after our fs:/gs: in-place code rewrites. */
-        if (bcm_hash && bcm_t1 > bcm_t0) {
-            uint64_t t0 = (uint64_t)lib->bias + bcm_t0, t1 = (uint64_t)lib->bias + bcm_t1;
-            uint64_t r0 = (uint64_t)lib->bias + bcm_r0, r1 = (uint64_t)lib->bias + bcm_r1;
-            uint64_t hp = (uint64_t)lib->bias + bcm_hash;
-            uint64_t lo_a = (uint64_t)(uintptr_t)lib->base, hi_a = lo_a + lib->size;
-            if (t0 >= lo_a && t1 <= hi_a && hp >= lo_a && hp + 32 <= hi_a) {
-                const uint8_t *exp = (const uint8_t *)(uintptr_t)hp;
-                uint64_t tlen = t1 - t0, rlen = (bcm_r1 > bcm_r0 && r0 >= lo_a && r1 <= hi_a) ? (r1 - r0) : 0;
-                uint8_t got[32];
-                int m;
-                for (m = 1; m <= 4 && !bcm_mode; m++) {
-                    const void *ptrs[4]; size_t lens[4]; int ns = 0;
-                    if (m == 1) {
-                        ptrs[0] = (const void *)(uintptr_t)t0; lens[0] = (size_t)tlen; ns = 1;
-                    } else if (m == 2 && rlen) {
-                        ptrs[0] = &tlen; lens[0] = 8;
-                        ptrs[1] = (const void *)(uintptr_t)t0; lens[1] = (size_t)tlen;
-                        ptrs[2] = &rlen; lens[2] = 8;
-                        ptrs[3] = (const void *)(uintptr_t)r0; lens[3] = (size_t)rlen;
-                        ns = 4;
-                    } else if (m == 3 && rlen) {
-                        ptrs[0] = (const void *)(uintptr_t)t0; lens[0] = (size_t)tlen;
-                        ptrs[1] = (const void *)(uintptr_t)r0; lens[1] = (size_t)rlen;
-                        ns = 2;
-                    } else if (m == 4) {
-                        ptrs[0] = &tlen; lens[0] = 8;
-                        ptrs[1] = (const void *)(uintptr_t)t0; lens[1] = (size_t)tlen;
-                        ns = 2;
-                    } else continue;
-                    afw_hmac_sha256_zero_key_slices(ptrs, lens, ns, got);
-                    if (memcmp(got, exp, 32) == 0) bcm_mode = m;
+        /* If this library exports BoringSSL FIPS module bounds (e.g. libcrypto.so),
+         * compute the unpatched HMAC-SHA256, locate the exact 32-byte stored digest
+         * outside the hashed ranges, and update it after our fs:/gs: rewrites. */
+        {
+            uint8_t *bcm_hash_ptr = NULL;
+            if ((!bcm_t0 || !bcm_t1) && lib->symtab && lib->strtab) {
+                for (i = 1; i < lib->nsyms; i++) {
+                    const Elf64_Sym *s = &lib->symtab[i];
+                    const char *nm;
+                    if (s->st_shndx == SHN_UNDEF || !s->st_name) continue;
+                    nm = lib->strtab + s->st_name;
+                    if (strncmp(nm, "BORINGSSL_bcm_", 14) != 0) continue;
+                    if (strcmp(nm, "BORINGSSL_bcm_text_start") == 0)        bcm_t0 = s->st_value;
+                    else if (strcmp(nm, "BORINGSSL_bcm_text_end") == 0)     bcm_t1 = s->st_value;
+                    else if (strcmp(nm, "BORINGSSL_bcm_rodata_start") == 0) bcm_r0 = s->st_value;
+                    else if (strcmp(nm, "BORINGSSL_bcm_rodata_end") == 0)   bcm_r1 = s->st_value;
+                    else if (strcmp(nm, "BORINGSSL_bcm_text_hash") == 0)    bcm_hash = s->st_value;
                 }
             }
-        }
-        {
-            int prc = afw_patch_code(cr, ncr, lib->stub_area, AFW_STUB_RESERVE, &pc, &lib->patch, verbose);
-            lib->load_prot = NULL; lib->load_npages = 0;   /* pageprot is freed below */
-            if (prc < 0) {
-                fprintf(stderr, "error: could not patch %s safely; refusing to run it\n", path);
-                free(cr); free(pageprot); return -1;
+            if (bcm_t1 > bcm_t0) {
+                uint64_t t0 = (uint64_t)lib->bias + bcm_t0, t1 = (uint64_t)lib->bias + bcm_t1;
+                uint64_t r0 = (uint64_t)lib->bias + bcm_r0, r1 = (uint64_t)lib->bias + bcm_r1;
+                uint64_t lo_a = (uint64_t)(uintptr_t)lib->base, hi_a = lo_a + lib->size;
+                if (t0 >= lo_a && t1 <= hi_a) {
+                    uint64_t tlen = t1 - t0;
+                    uint64_t rlen = (bcm_r1 > bcm_r0 && r0 >= lo_a && r1 <= hi_a) ? (r1 - r0) : 0;
+                    uint8_t got[32];
+                    int m;
+                    for (m = 1; m <= 4 && !bcm_mode; m++) {
+                        const void *ptrs[4]; size_t lens[4]; int ns = 0;
+                        if (m == 1 && rlen) {
+                            ptrs[0] = &tlen; lens[0] = 8;
+                            ptrs[1] = (const void *)(uintptr_t)t0; lens[1] = (size_t)tlen;
+                            ptrs[2] = &rlen; lens[2] = 8;
+                            ptrs[3] = (const void *)(uintptr_t)r0; lens[3] = (size_t)rlen;
+                            ns = 4;
+                        } else if (m == 2) {
+                            ptrs[0] = (const void *)(uintptr_t)t0; lens[0] = (size_t)tlen; ns = 1;
+                        } else if (m == 3 && rlen) {
+                            ptrs[0] = (const void *)(uintptr_t)t0; lens[0] = (size_t)tlen;
+                            ptrs[1] = (const void *)(uintptr_t)r0; lens[1] = (size_t)rlen;
+                            ns = 2;
+                        } else if (m == 4) {
+                            ptrs[0] = &tlen; lens[0] = 8;
+                            ptrs[1] = (const void *)(uintptr_t)t0; lens[1] = (size_t)tlen;
+                            ns = 2;
+                        } else continue;
+                        afw_hmac_sha256_zero_key_slices(ptrs, lens, ns, got);
+                        if (bcm_hash) {
+                            uint64_t hp = (uint64_t)lib->bias + bcm_hash;
+                            if (hp >= lo_a && hp + 32 <= hi_a &&
+                                memcmp((const void *)(uintptr_t)hp, got, 32) == 0) {
+                                bcm_mode = m;
+                                bcm_hash_ptr = (uint8_t *)(uintptr_t)hp;
+                            }
+                        } else {
+                            size_t off;
+                            for (off = 0; off + 32 <= lib->size; off += 4) {
+                                uint64_t p = lo_a + off;
+                                if ((p + 32 > t0 && p < t1) || (rlen && p + 32 > r0 && p < r1))
+                                    continue;
+                                if (lib->base[off] == got[0] && memcmp(lib->base + off, got, 32) == 0) {
+                                    bcm_mode = m;
+                                    bcm_hash_ptr = lib->base + off;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
             }
-        }
-        if (bcm_mode) {
-            uint64_t t0 = (uint64_t)lib->bias + bcm_t0, t1 = (uint64_t)lib->bias + bcm_t1;
-            uint64_t r0 = (uint64_t)lib->bias + bcm_r0, r1 = (uint64_t)lib->bias + bcm_r1;
-            uint64_t hp = (uint64_t)lib->bias + bcm_hash;
-            uint64_t tlen = t1 - t0, rlen = (bcm_r1 > bcm_r0) ? (r1 - r0) : 0;
-            const void *ptrs[4]; size_t lens[4]; int ns = 0;
-            uint8_t updated[32];
-            if (bcm_mode == 1) {
-                ptrs[0] = (const void *)(uintptr_t)t0; lens[0] = (size_t)tlen; ns = 1;
-            } else if (bcm_mode == 2) {
-                ptrs[0] = &tlen; lens[0] = 8;
-                ptrs[1] = (const void *)(uintptr_t)t0; lens[1] = (size_t)tlen;
-                ptrs[2] = &rlen; lens[2] = 8;
-                ptrs[3] = (const void *)(uintptr_t)r0; lens[3] = (size_t)rlen;
-                ns = 4;
-            } else if (bcm_mode == 3) {
-                ptrs[0] = (const void *)(uintptr_t)t0; lens[0] = (size_t)tlen;
-                ptrs[1] = (const void *)(uintptr_t)r0; lens[1] = (size_t)rlen;
-                ns = 2;
-            } else {
-                ptrs[0] = &tlen; lens[0] = 8;
-                ptrs[1] = (const void *)(uintptr_t)t0; lens[1] = (size_t)tlen;
-                ns = 2;
+            {
+                int prc = afw_patch_code(cr, ncr, lib->stub_area, AFW_STUB_RESERVE, &pc, &lib->patch, verbose);
+                lib->load_prot = NULL; lib->load_npages = 0;   /* pageprot is freed below */
+                if (prc < 0) {
+                    fprintf(stderr, "error: could not patch %s safely; refusing to run it\n", path);
+                    free(cr); free(pageprot); return -1;
+                }
             }
-            afw_hmac_sha256_zero_key_slices(ptrs, lens, ns, updated);
-            memcpy((void *)(uintptr_t)hp, updated, 32);
+            if (bcm_mode && bcm_hash_ptr) {
+                uint64_t t0 = (uint64_t)lib->bias + bcm_t0, t1 = (uint64_t)lib->bias + bcm_t1;
+                uint64_t r0 = (uint64_t)lib->bias + bcm_r0, r1 = (uint64_t)lib->bias + bcm_r1;
+                uint64_t tlen = t1 - t0, rlen = (bcm_r1 > bcm_r0) ? (r1 - r0) : 0;
+                const void *ptrs[4]; size_t lens[4]; int ns = 0;
+                uint8_t updated[32];
+                if (bcm_mode == 1) {
+                    ptrs[0] = &tlen; lens[0] = 8;
+                    ptrs[1] = (const void *)(uintptr_t)t0; lens[1] = (size_t)tlen;
+                    ptrs[2] = &rlen; lens[2] = 8;
+                    ptrs[3] = (const void *)(uintptr_t)r0; lens[3] = (size_t)rlen;
+                    ns = 4;
+                } else if (bcm_mode == 2) {
+                    ptrs[0] = (const void *)(uintptr_t)t0; lens[0] = (size_t)tlen; ns = 1;
+                } else if (bcm_mode == 3) {
+                    ptrs[0] = (const void *)(uintptr_t)t0; lens[0] = (size_t)tlen;
+                    ptrs[1] = (const void *)(uintptr_t)r0; lens[1] = (size_t)rlen;
+                    ns = 2;
+                } else {
+                    ptrs[0] = &tlen; lens[0] = 8;
+                    ptrs[1] = (const void *)(uintptr_t)t0; lens[1] = (size_t)tlen;
+                    ns = 2;
+                }
+                afw_hmac_sha256_zero_key_slices(ptrs, lens, ns, updated);
+                memcpy(bcm_hash_ptr, updated, 32);
+            }
         }
         free(cr);
         if (!afw_load_patch_only && !afw_load_allow_unproven && !afw_gate_ok(lib)) {
