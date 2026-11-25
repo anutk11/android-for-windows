@@ -231,6 +231,26 @@ def extract_art_full(system, out):
                 pass
         os.remove(pimg)
 
+    # Extract /system/etc/public.libraries*.txt and llndk.libraries.txt for libnativeloader.so
+    etc_dir = os.path.join(out, "art", "etc")
+    os.makedirs(etc_dir, exist_ok=True)
+    try:
+        for n, ino in system.listdir(system.lookup("/system/etc")):
+            if n.startswith("public.libraries") or n.startswith("llndk.libraries") or n == "ld.config.txt":
+                try:
+                    d = system.data(system.lookup("/system/etc/" + n))
+                    with open(os.path.join(etc_dir, n), "wb") as ef:
+                        ef.write(d)
+                    print("== etc %-24s %9d bytes" % (n, len(d)))
+                except (FileNotFoundError, IOError, ValueError):
+                    pass
+    except FileNotFoundError:
+        pass
+    pub_txt = os.path.join(etc_dir, "public.libraries.txt")
+    if not os.path.exists(pub_txt):
+        with open(pub_txt, "wb") as ef:
+            ef.write(b"libc.so\nlibm.so\nlibdl.so\nliblog.so\nlibz.so\n")
+
     # Seed libraries loaded dynamically via dlopen() by ART (not in DT_NEEDED)
     sys_dirs = ["/system/lib64", "/system/lib64/bootstrap"]
     dlopen_seeds = [

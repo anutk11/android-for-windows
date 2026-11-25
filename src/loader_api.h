@@ -22,4 +22,15 @@ SYSV int afw_l_dladdr(const void *addr, void *info);
 SYSV int afw_l_dl_iterate_phdr(SYSV int (*cb)(void *info, size_t size, void *data), void *data);
 SYSV void afw_l_add_thread_local_dtor(void *dso_handle);
 SYSV void afw_l_remove_thread_local_dtor(void *dso_handle);
+SYSV void *afw_l_android_create_namespace(const char *name, const char *ld_library_path,
+                                          const char *default_library_path, uint64_t type,
+                                          const char *permitted_when_isolated_path,
+                                          void *parent, const void *caller);
+SYSV void *afw_l_android_get_exported_namespace(const char *name);
+SYSV int afw_l_android_link_namespaces(void *from, void *to, const char *shared_libs);
+SYSV int afw_l_android_link_namespaces_all_libs(void *from, void *to);
+SYSV int afw_l_android_init_anonymous_namespace(const char *shared_libs, const char *search_path);
+SYSV void afw_l_android_update_LD_LIBRARY_PATH(const char *ld_library_path);
+SYSV void afw_l_android_set_application_target_sdk_version(int target);
+SYSV void afw_l_android_dlwarning(void *obj, void (*f)(void *, const char *));
 #endif

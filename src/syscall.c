@@ -996,8 +996,11 @@ static int64_t dispatch_ex(int64_t nr, int64_t *a, const afw_clone_regs *regs, u
     case 297: /* rt_tgsigqueueinfo */
         fprintf(stderr, "[syscall] signal nr=%lld tgid=%lld tid=%lld sig=%lld\n",
                 (long long)nr, (long long)a[0], (long long)a[1], (long long)a[2]);
+        if (a[2] == 6 && nr >= 0 && nr < AFW_MAX_SYSCALL && atomic_inc_long(&g_unimplemented[nr]) == 0) {
+            afw_syscall_report();
+            fflush(stdout);
+        }
         fflush(stderr);
-        if (nr >= 0 && nr < AFW_MAX_SYSCALL) (void)atomic_inc_long(&g_unimplemented[nr]);
         return -LNX_ENOSYS;
     case 257: return afw_fd_openat(a[0], (const char *)(uintptr_t)a[1], a[2], (uint64_t)a[3]);
     case 258: /* mkdirat */

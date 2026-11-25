@@ -61,16 +61,21 @@ int main(int argc, char **argv) {
                     grc, static_cast<void *>(&attr), sb, ss, gs);
     }
 
+    setenv("ANDROID_LOG_TAGS", "*:i", 1);
+
     /* Redirect Android liblog output to stderr so all ART LOG()/CHECK() messages are visible. */
     void *h_log = dlopen("liblog.so", RTLD_NOW);
     if (h_log) {
         typedef void (*logger_fn)(const void *);
         typedef void (*set_logger_fn)(logger_fn);
+        typedef int (*set_min_prio_fn)(int);
         set_logger_fn set_logger = reinterpret_cast<set_logger_fn>(dlsym(h_log, "__android_log_set_logger"));
         logger_fn stderr_logger = reinterpret_cast<logger_fn>(dlsym(h_log, "__android_log_stderr_logger"));
+        set_min_prio_fn set_min = reinterpret_cast<set_min_prio_fn>(dlsym(h_log, "__android_log_set_minimum_priority"));
         if (set_logger && stderr_logger) {
             set_logger(stderr_logger);
-            std::printf("[G3] step 0 OK: liblog redirected to stderr\n");
+            if (set_min) set_min(4 /* ANDROID_LOG_INFO */);
+            std::printf("[G3] step 0 OK: liblog redirected to stderr (min=INFO)\n");
         }
     }
 

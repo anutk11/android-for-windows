@@ -280,7 +280,42 @@ SYSV void afw_l_android_get_LD_LIBRARY_PATH(char *buf, size_t sz) {
 }
 
 /* The image's API level until an app's own target SDK is known (G3). */
-SYSV int afw_l_android_get_application_target_sdk_version(void) { return 34; }
+static int g_target_sdk = 34;
+static int g_default_namespace;
+
+SYSV int afw_l_android_get_application_target_sdk_version(void) { return g_target_sdk; }
+SYSV void afw_l_android_set_application_target_sdk_version(int target) { g_target_sdk = target; }
+
+SYSV void *afw_l_android_create_namespace(const char *name, const char *ld_library_path,
+                                          const char *default_library_path, uint64_t type,
+                                          const char *permitted_when_isolated_path,
+                                          void *parent, const void *caller) {
+    (void)name; (void)ld_library_path; (void)default_library_path;
+    (void)type; (void)permitted_when_isolated_path; (void)parent; (void)caller;
+    return &g_default_namespace;
+}
+SYSV void *afw_l_android_get_exported_namespace(const char *name) {
+    (void)name;
+    return &g_default_namespace;
+}
+SYSV int afw_l_android_link_namespaces(void *from, void *to, const char *shared_libs) {
+    (void)from; (void)to; (void)shared_libs;
+    return 1;
+}
+SYSV int afw_l_android_link_namespaces_all_libs(void *from, void *to) {
+    (void)from; (void)to;
+    return 1;
+}
+SYSV int afw_l_android_init_anonymous_namespace(const char *shared_libs, const char *search_path) {
+    (void)shared_libs; (void)search_path;
+    return 1;
+}
+SYSV void afw_l_android_update_LD_LIBRARY_PATH(const char *ld_library_path) {
+    (void)ld_library_path;
+}
+SYSV void afw_l_android_dlwarning(void *obj, void (*f)(void *, const char *)) {
+    (void)obj; (void)f;
+}
 
 /* The linker's signal hook (CFI and the like): not handled here. */
 SYSV int afw_l_android_handle_signal(int sig, void *info, void *ctx) {
