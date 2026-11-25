@@ -69,7 +69,16 @@ static fd_entry g_fds[AFW_MAX_FDS];
 static int g_fds_init;
 
 static const char g_proc_cmdline[] = "g3_art_gate_exe\0";
-static const char g_proc_maps[] = "";
+static const char g_proc_status[] =
+    "Name:\tg3_art_gate_exe\n"
+    "State:\tR (running)\n"
+    "Pid:\t1000\n"
+    "PPid:\t1\n"
+    "Uid:\t10000\t10000\t10000\t10000\n"
+    "Gid:\t10000\t10000\t10000\t10000\n"
+    "Threads:\t1\n";
+static const char g_proc_stat[] =
+    "1000 (g3_art_gate_exe) R 1 1000 1000 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0\n";
 static const char g_proc_cpuinfo[] =
     "processor\t: 0\n"
     "vendor_id\t: GenuineIntel\n"
@@ -82,6 +91,16 @@ static const char g_proc_meminfo[] =
     "MemAvailable:    4194304 kB\n";
 static const char g_sys_cpu_online[] = "0-3\n";
 
+static int is_proc_maps_path(const char *path) {
+    const char *p;
+    if (strcmp(path, "/proc/self/maps") == 0) return 1;
+    if (strncmp(path, "/proc/", 6) != 0) return 0;
+    p = path + 6;
+    if (*p < '0' || *p > '9') return 0;
+    while (*p >= '0' && *p <= '9') p++;
+    return strcmp(p, "/maps") == 0;
+}
+
 /* Match synthetic virtual files needed by Android runtime on Windows.
  * Returns FD_DEVNULL, FD_MEMBUF (setting *buf_out and *len_out), or 0 for real OS path. */
 static int match_virtual_path(const char *path, const char **buf_out, size_t *len_out) {
@@ -91,9 +110,14 @@ static int match_virtual_path(const char *path, const char **buf_out, size_t *le
         if (len_out) *len_out = sizeof(g_proc_cmdline) - 1;
         return FD_MEMBUF;
     }
-    if (strcmp(path, "/proc/self/maps") == 0) {
-        if (buf_out) *buf_out = g_proc_maps;
-        if (len_out) *len_out = 0;
+    if (strcmp(path, "/proc/self/status") == 0) {
+        if (buf_out) *buf_out = g_proc_status;
+        if (len_out) *len_out = sizeof(g_proc_status) - 1;
+        return FD_MEMBUF;
+    }
+    if (strcmp(path, "/proc/self/stat") == 0) {
+        if (buf_out) *buf_out = g_proc_stat;
+        if (len_out) *len_out = sizeof(g_proc_stat) - 1;
         return FD_MEMBUF;
     }
     if (strcmp(path, "/proc/cpuinfo") == 0) {
@@ -170,7 +194,7 @@ static void fill_lnx_stat(const afw_os_stat_info *src, afw_lnx_stat *dst) {
 
 int64_t afw_fd_openat(int64_t dirfd, const char *path, int64_t flags, uint64_t mode) {
     int acc = (int)(flags & AFW_O_ACCMODE);
-    int os_flags, rc, slot = -1, i, vkind;
+    int os_flags, rc, slot = -1, i, vkind, vowned = 0;
     const char *vbuf = NULL;
     size_t vlen = 0;
     afw_os_file f = AFW_OS_FILE_INVALID;
@@ -183,9 +207,19 @@ int64_t afw_fd_openat(int64_t dirfd, const char *path, int64_t flags, uint64_t m
     if (rc != 0) return rc;
 
     vkind = match_virtual_path(path, &vbuf, &vlen);
+    if (vkind == 0 && is_proc_maps_path(path)) {
+        char *mb = NULL;
+        size_t ml = 0;
+        if (afw_os_build_proc_maps(&mb, &ml) == 0) {
+            vkind = FD_MEMBUF;
+            vbuf = mb;
+            vlen = ml;
+            vowned = 1;
+        }
+    }
     if (vkind != 0) {
-        if (flags & AFW_O_DIRECTORY) return -20; /* ENOTDIR */
-        if (vkind == FD_MEMBUF && acc != AFW_O_RDONLY) return -13; /* EACCES */
+        if (flags & AFW_O_DIRECTORY) { if (vowned) free((void *)vbuf); return -20; } /* ENOTDIR */
+        if (vkind == FD_MEMBUF && acc != AFW_O_RDONLY) { if (vowned) free((void *)vbuf); return -13; } /* EACCES */
         afw_fd_lock();
         fds_ensure_init();
         for (i = 0; i < AFW_MAX_FDS; i++) {
@@ -193,6 +227,7 @@ int64_t afw_fd_openat(int64_t dirfd, const char *path, int64_t flags, uint64_t m
         }
         if (slot < 0) {
             afw_fd_unlock();
+            if (vowned) free((void *)vbuf);
             return -LNX_EMFILE;
         }
         memset(&g_fds[slot], 0, sizeof g_fds[slot]);
@@ -204,7 +239,7 @@ int64_t afw_fd_openat(int64_t dirfd, const char *path, int64_t flags, uint64_t m
         g_fds[slot].mem_buf = vbuf;
         g_fds[slot].mem_len = vlen;
         g_fds[slot].mem_pos = 0;
-        g_fds[slot].mem_owned = 0;
+        g_fds[slot].mem_owned = vowned;
         afw_fd_unlock();
         return slot;
     }

@@ -195,4 +195,8 @@ int   afw_os_dtv_fls_set(void (*release_cb)(void *), void *dtv);
 void  afw_os_test_fail_dtv_fls_clear(int count);
 #endif
 
+/* ---- G3 ART /proc/self/maps synthesis & main-stack query (Rule 8) ---- */
+int afw_os_build_proc_maps(char **buf_out, size_t *len_out);
+int afw_os_is_current_stack(uint64_t addr, uint64_t len);
+
 #endif

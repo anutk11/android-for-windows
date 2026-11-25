@@ -996,6 +996,8 @@ int64_t afw_mprotect(uint64_t addr, uint64_t len, int prot) {
     if (!len) return 0;
     LOCK();
     r = each(addr, n, do_protect, prot, 1);
+    if (r == -LNX_ENOMEM && afw_os_is_current_stack(addr, n))
+        r = 0;
     UNLOCK();
     return r;
 }
