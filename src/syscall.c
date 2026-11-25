@@ -617,6 +617,48 @@ static int64_t sys_gettimeofday(int64_t *tv, void *tz) {
     return 0;
 }
 
+struct lnx_sysinfo {
+    int64_t  uptime;
+    uint64_t loads[3];
+    uint64_t totalram;
+    uint64_t freeram;
+    uint64_t sharedram;
+    uint64_t bufferram;
+    uint64_t totalswap;
+    uint64_t freeswap;
+    uint16_t procs;
+    uint16_t pad;
+    uint32_t pad2;
+    uint64_t totalhigh;
+    uint64_t freehigh;
+    uint32_t mem_unit;
+    char     _f[4];
+};
+_Static_assert(sizeof(struct lnx_sysinfo) == 112, "struct sysinfo must be 112 bytes");
+
+static int64_t sys_sysinfo(void *buf) {
+    struct lnx_sysinfo si;
+    if (!buf) return -LNX_EFAULT;
+    memset(&si, 0, sizeof si);
+    si.uptime   = 3600;
+    si.totalram = 8ULL * 1024ULL * 1024ULL * 1024ULL;
+    si.freeram  = 4ULL * 1024ULL * 1024ULL * 1024ULL;
+    si.procs    = 16;
+    si.mem_unit = 1;
+#if defined(_WIN32)
+    {
+        MEMORYSTATUSEX ms;
+        ms.dwLength = sizeof ms;
+        if (GlobalMemoryStatusEx(&ms)) {
+            si.totalram = ms.ullTotalPhys;
+            si.freeram  = ms.ullAvailPhys;
+        }
+    }
+#endif
+    memcpy(buf, &si, sizeof si);
+    return 0;
+}
+
 static int32_t g_umask = 0022;
 
 static int64_t dispatch_ex(int64_t nr, int64_t *a, const afw_clone_regs *regs, uintptr_t cur_sp);
@@ -868,6 +910,7 @@ static int64_t dispatch_ex(int64_t nr, int64_t *a, const afw_clone_regs *regs, u
     case 20:  return afw_fd_writev(a[0], (const uint64_t *)(uintptr_t)a[1], a[2]);
     case 21:  return afw_fd_faccessat(-100, (const char *)(uintptr_t)a[0], a[1], 0);
     case 24:  return sys_sched_yield();
+    case 26:  return 0; /* msync */
     case 35:  return sys_clock_nanosleep(LNX_CLOCK_MONOTONIC, 0,
                                          (const struct lnx_timespec *)(uintptr_t)a[0],
                                          (struct lnx_timespec *)(uintptr_t)a[1]);
@@ -876,13 +919,16 @@ static int64_t dispatch_ex(int64_t nr, int64_t *a, const afw_clone_regs *regs, u
                                    (uint64_t)a[3], (uint64_t)a[4], regs);
     case 63:  return sys_uname((void *)(uintptr_t)a[0]);
     case 72:  return afw_fd_fcntl(a[0], a[1], a[2]);
+    case 74:  case 75: return 0; /* fsync, fdatasync */
     case 79:  return sys_getcwd((char *)(uintptr_t)a[0], (uint64_t)a[1]);
+    case 83:  return a[0] ? afw_os_mkdir((const char *)(uintptr_t)a[0], (uint32_t)a[1]) : -LNX_EFAULT;
     case 87:  return afw_fd_unlinkat(-100, (const char *)(uintptr_t)a[0], 0);
     case 89:  return sys_readlinkat(-100, (const char *)(uintptr_t)a[0],
                                     (char *)(uintptr_t)a[1], a[2]);
     case 95:  return (int64_t)afw_os_atomic_xchg_i32(&g_umask, (int32_t)(a[0] & 0777));
     case 96:  return sys_gettimeofday((int64_t *)(uintptr_t)a[0], (void *)(uintptr_t)a[1]);
     case 97:  return sys_prlimit64(0, a[0], NULL, (void *)(uintptr_t)a[1]);
+    case 99:  return sys_sysinfo((void *)(uintptr_t)a[0]);
     case 110: return 1;            /* getppid */
     case 111: return sys_getpid(); /* getpgrp */
     case 121: return sys_getpid(); /* getpgid */
@@ -890,8 +936,17 @@ static int64_t dispatch_ex(int64_t nr, int64_t *a, const afw_clone_regs *regs, u
     case 131: return sys_sigaltstack((const void *)(uintptr_t)a[0], (void *)(uintptr_t)a[1]);
     case 140: return 20;           /* getpriority (Linux returns 20 - nice; default nice=0 -> 20) */
     case 141: return 0;            /* setpriority */
+    case 143: /* sched_getparam */
+        if (!a[1]) return -LNX_EFAULT;
+        *(int32_t *)(uintptr_t)a[1] = 0;
+        return 0;
+    case 144: return 0;            /* sched_setscheduler */
+    case 145: return 0;            /* sched_getscheduler (SCHED_OTHER) */
+    case 146: return 0;            /* sched_get_priority_max */
+    case 147: return 0;            /* sched_get_priority_min */
     case 160: return sys_prlimit64(0, a[0], (const void *)(uintptr_t)a[1], NULL);
     case 202: return sys_futex(a[0], a[1], a[2], a[3], a[4], a[5]);
+    case 203: return 0;            /* sched_setaffinity */
     case 204: return sys_sched_getaffinity(a[0], (uint64_t)a[1], (void *)(uintptr_t)a[2]);
     case 218: return afw_sys_set_tid_address((uint64_t)a[0]);
     case 228: return sys_clock_gettime(a[0], (struct lnx_timespec *)(uintptr_t)a[1]);
@@ -907,6 +962,9 @@ static int64_t dispatch_ex(int64_t nr, int64_t *a, const afw_clone_regs *regs, u
         if (nr >= 0 && nr < AFW_MAX_SYSCALL) (void)atomic_inc_long(&g_unimplemented[nr]);
         return -LNX_ENOSYS;
     case 257: return afw_fd_openat(a[0], (const char *)(uintptr_t)a[1], a[2], (uint64_t)a[3]);
+    case 258: /* mkdirat */
+        if (!a[1]) return -LNX_EFAULT;
+        return afw_os_mkdir((const char *)(uintptr_t)a[1], (uint32_t)a[2]);
     case 262: return afw_fd_newfstatat(a[0], (const char *)(uintptr_t)a[1], (void *)(uintptr_t)a[2], a[3]);
     case 263: return afw_fd_unlinkat(a[0], (const char *)(uintptr_t)a[1], a[2]);
     case 267: return sys_readlinkat(a[0], (const char *)(uintptr_t)a[1],

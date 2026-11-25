@@ -231,9 +231,34 @@ def extract_art_full(system, out):
                 pass
         os.remove(pimg)
 
+    # Seed libraries loaded dynamically via dlopen() by ART (not in DT_NEEDED)
+    sys_dirs = ["/system/lib64", "/system/lib64/bootstrap"]
+    dlopen_seeds = [
+        "libartpalette-system.so",
+        "libnativeloader.so",
+        "libnativebridge.so",
+        "libvndksupport.so",
+        "libtombstoned_client.so",
+        "libdebuggerd_client.so",
+        "libstatslog.so",
+    ]
+    for dep in dlopen_seeds:
+        if dep in have:
+            continue
+        for sdir in sys_dirs:
+            try:
+                ino = system.lookup(sdir + "/" + dep)
+                d = system.data(ino)
+                if d[:4] == b"\x7fELF":
+                    save(lib_dir, dep, d)
+                    have.add(dep)
+                    queue.append((dep, d))
+                    break
+            except (FileNotFoundError, IOError, ValueError):
+                continue
+
     # Transitively resolve remaining DT_NEEDED from /system/lib64
     missing = set()
-    sys_dirs = ["/system/lib64", "/system/lib64/bootstrap"]
     while queue:
         _, data = queue.pop(0)
         for dep in elf_needed(data):

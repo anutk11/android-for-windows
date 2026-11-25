@@ -249,6 +249,11 @@ int afw_func_bounds(const afw_lib *lib, uint64_t addr, uint64_t *start, uint64_t
         if (!sz) continue;
         if (addr >= a && addr < a + sz) { *start = a; *end = a + sz; return 1; }
     }
+    for (i = 0; i < (size_t)lib->nextra_fn; i++) {
+        uint64_t a = (uint64_t)lib->bias + lib->extra_fn_vaddr[i];
+        uint64_t sz = lib->extra_fn_size[i];
+        if (sz && addr >= a && addr < a + sz) { *start = a; *end = a + sz; return 1; }
+    }
     return 0;
 }
 
@@ -267,7 +272,7 @@ int afw_func_list(const afw_lib *lib, unsigned char ***starts, size_t **sizes) {
     size_t cap, n = 0, k;
     *starts = NULL; *sizes = NULL;
     if (!hdr_table(lib, &tab, &count) || !count) return 0;
-    cap = (size_t)count + (lib->symtab ? lib->nsyms : 0);
+    cap = (size_t)count + (lib->symtab ? lib->nsyms : 0) + (size_t)lib->nextra_fn;
     tmp = (func_range_tmp *)malloc(cap * sizeof *tmp);
     if (!tmp) return 0;
     for (i = 0; i < count; i++) {
@@ -279,23 +284,44 @@ int afw_func_list(const afw_lib *lib, unsigned char ***starts, size_t **sizes) {
         tmp[n].size  = (size_t)(e0 - s0);
         n++;
     }
-    /* Also include exported STT_FUNC symbols without .eh_frame FDEs (e.g.
-     * hand-written assembly entrypoints like ART's ExecuteNterpWithClinitImpl),
-     * skipping any that overlap an existing FDE. */
-    if (lib->symtab && lib->nsyms > 1 && n > 0) {
+    /* Also include exported STT_FUNC symbols and SHT_SYMTAB ExecuteNterp*
+     * entrypoints without .eh_frame FDEs, skipping any overlapping an FDE. */
+    if (n > 0 && ((lib->symtab && lib->nsyms > 1) || lib->nextra_fn > 0)) {
         size_t nfde = n;
         qsort(tmp, nfde, sizeof *tmp, cmp_func_range);
-        for (i = 1; i < lib->nsyms; i++) {
-            const Elf64_Sym *s = &lib->symtab[i];
-            uint64_t s0, e0, sz;
+        if (lib->symtab && lib->nsyms > 1) {
+            for (i = 1; i < lib->nsyms; i++) {
+                const Elf64_Sym *s = &lib->symtab[i];
+                uint64_t s0, e0, sz;
+                size_t lo = 0, hi = nfde;
+                int overlap = 0;
+                if (s->st_shndx == SHN_UNDEF) continue;
+                sz = sym_inferred_size(lib, s);
+                if (!sz) continue;
+                s0 = (uint64_t)lib->bias + s->st_value;
+                e0 = s0 + sz;
+                if (e0 <= s0 || s0 < (uint64_t)(uintptr_t)lib->base || e0 > (uint64_t)(uintptr_t)lib->base + lib->size)
+                    continue;
+                while (lo < hi) {
+                    size_t mid = lo + (hi - lo) / 2;
+                    if ((uint64_t)(uintptr_t)tmp[mid].start <= s0) lo = mid + 1; else hi = mid;
+                }
+                if (lo > 0 && (uint64_t)(uintptr_t)tmp[lo - 1].start + tmp[lo - 1].size > s0) overlap = 1;
+                if (lo < nfde && (uint64_t)(uintptr_t)tmp[lo].start < e0) overlap = 1;
+                if (!overlap && n < cap) {
+                    tmp[n].start = (unsigned char *)(uintptr_t)s0;
+                    tmp[n].size  = (size_t)(e0 - s0);
+                    n++;
+                }
+            }
+        }
+        for (i = 0; i < (uint64_t)lib->nextra_fn; i++) {
+            uint64_t s0 = (uint64_t)lib->bias + lib->extra_fn_vaddr[i];
+            uint64_t sz = lib->extra_fn_size[i];
+            uint64_t e0 = s0 + sz;
             size_t lo = 0, hi = nfde;
             int overlap = 0;
-            if (s->st_shndx == SHN_UNDEF) continue;
-            sz = sym_inferred_size(lib, s);
-            if (!sz) continue;
-            s0 = (uint64_t)lib->bias + s->st_value;
-            e0 = s0 + sz;
-            if (e0 <= s0 || s0 < (uint64_t)(uintptr_t)lib->base || e0 > (uint64_t)(uintptr_t)lib->base + lib->size)
+            if (!sz || e0 <= s0 || s0 < (uint64_t)(uintptr_t)lib->base || e0 > (uint64_t)(uintptr_t)lib->base + lib->size)
                 continue;
             while (lo < hi) {
                 size_t mid = lo + (hi - lo) / 2;
@@ -310,7 +336,7 @@ int afw_func_list(const afw_lib *lib, unsigned char ***starts, size_t **sizes) {
             }
         }
         if (n > nfde) {
-            /* Sort and deduplicate any overlapping .dynsym aliases */
+            /* Sort and deduplicate any overlapping aliases */
             size_t w = 0;
             qsort(tmp, n, sizeof *tmp, cmp_func_range);
             for (k = 0; k < n; k++) {

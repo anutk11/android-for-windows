@@ -33,6 +33,8 @@ int main(int argc, char **argv) {
     }
     std::string art_dir = argv[1];
     std::string test_jar = argv[2];
+    for (char &c : art_dir) if (c == '\\') c = '/';
+    for (char &c : test_jar) if (c == '\\') c = '/';
     std::string javalib = art_dir + "/javalib";
     std::string lib64   = art_dir + "/lib64";
 

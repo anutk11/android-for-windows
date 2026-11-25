@@ -43,6 +43,8 @@ typedef struct afw_lib_s {
     uint64_t xsec_vaddr[16], xsec_size[16]; /* SHF_EXECINSTR sections */
     int nxsec;
     int xsec_truncated;                     /* >16 SHF_ALLOC|SHF_EXECINSTR sections */
+    uint64_t extra_fn_vaddr[16], extra_fn_size[16]; /* SHT_SYMTAB assembly entrypoints without FDE */
+    int nextra_fn;
     afw_patch_report patch;
 
     char sha256[65];            /* of the file as read, before mapping or patching */

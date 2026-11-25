@@ -598,7 +598,7 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
      * only these, not whole PT_LOAD segments that also hold .dynstr/.rodata */
     if (eh->e_shoff && eh->e_shnum && eh->e_shoff + (uint64_t)eh->e_shnum * sizeof(Elf64_Shdr) <= fsize) {
         const Elf64_Shdr *sh = (const Elf64_Shdr *)(file + eh->e_shoff);
-        for (i = 0; i < eh->e_shnum; i++)
+        for (i = 0; i < eh->e_shnum; i++) {
             if ((sh[i].sh_flags & (SHF_ALLOC | SHF_EXECINSTR)) == (SHF_ALLOC | SHF_EXECINSTR) && sh[i].sh_size) {
                 if (lib->nxsec < 16) {
                     lib->xsec_vaddr[lib->nxsec] = sh[i].sh_addr;
@@ -608,6 +608,45 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
                     lib->xsec_truncated = 1;
                 }
             }
+            if (sh[i].sh_type == 2 /* SHT_SYMTAB */ && sh[i].sh_entsize == sizeof(Elf64_Sym) &&
+                sh[i].sh_offset <= fsize && sh[i].sh_size <= fsize - sh[i].sh_offset &&
+                sh[i].sh_link < eh->e_shnum) {
+                const Elf64_Shdr *strsh = &sh[sh[i].sh_link];
+                if (strsh->sh_offset <= fsize && strsh->sh_size <= fsize - strsh->sh_offset) {
+                    const Elf64_Sym *syms = (const Elf64_Sym *)(file + sh[i].sh_offset);
+                    size_t nsym = (size_t)(sh[i].sh_size / sizeof(Elf64_Sym));
+                    const char *strs = (const char *)(file + strsh->sh_offset);
+                    size_t strsz = (size_t)strsh->sh_size, j, k;
+                    for (j = 1; j < nsym && lib->nextra_fn < 16; j++) {
+                        const char *nm;
+                        char end_nm[160];
+                        size_t nlen;
+                        if (syms[j].st_shndx == SHN_UNDEF || syms[j].st_name >= strsz) continue;
+                        nm = strs + syms[j].st_name;
+                        if (strncmp(nm, "ExecuteNterp", 12) != 0) continue;
+                        {
+                            size_t rem = strsz - syms[j].st_name;
+                            const char *nul = (const char *)memchr(nm, '\0', rem);
+                            if (!nul) continue;
+                            nlen = (size_t)(nul - nm);
+                            if (nlen + 4 > sizeof end_nm) continue;
+                        }
+                        memcpy(end_nm, "End", 3);
+                        memcpy(end_nm + 3, nm, nlen + 1);
+                        for (k = 1; k < nsym; k++) {
+                            if (syms[k].st_shndx == SHN_UNDEF || syms[k].st_name >= strsz) continue;
+                            if (syms[k].st_value > syms[j].st_value &&
+                                strncmp(strs + syms[k].st_name, end_nm, strsz - syms[k].st_name) == 0) {
+                                lib->extra_fn_vaddr[lib->nextra_fn] = syms[j].st_value;
+                                lib->extra_fn_size[lib->nextra_fn]  = syms[k].st_value - syms[j].st_value;
+                                lib->nextra_fn++;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /* 2. Map segments ------------------------------------------------ */
