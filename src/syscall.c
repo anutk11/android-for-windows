@@ -270,9 +270,16 @@ static int64_t sys_futex(int64_t uaddr, int64_t op_full, int64_t val, int64_t ts
         else WakeByAddressAll((PVOID)p);
         return 0;
     }
+    if (op == 3 /* FUTEX_REQUEUE */ || op == 4 /* FUTEX_CMP_REQUEUE */) {
+        if ((int32_t)val < 0 || (int32_t)ts < 0) return -LNX_EINVAL;
+        if (op == 4 && *p != (int32_t)val3) return -LNX_EAGAIN;
+        if ((int32_t)val > 0 || (int32_t)ts > 0) WakeByAddressAll((PVOID)p);
+        return 0;
+    }
     return -LNX_ENOSYS;
 #else
-    if (op != FUTEX_WAIT && op != FUTEX_WAKE && op != FUTEX_WAIT_BITSET && op != FUTEX_WAKE_BITSET)
+    if (op != FUTEX_WAIT && op != FUTEX_WAKE && op != FUTEX_WAIT_BITSET && op != FUTEX_WAKE_BITSET &&
+        op != 3 /* FUTEX_REQUEUE */ && op != 4 /* FUTEX_CMP_REQUEUE */)
         return -LNX_ENOSYS;
     {   /* host build: the real futex, same semantics */
         long r = syscall(SYS_futex, p, (int)op_full, (int)val, (void *)(uintptr_t)ts, (void *)(uintptr_t)uaddr2, (int)val3);
@@ -382,6 +389,79 @@ static int64_t sys_sigaltstack(const void *ss, void *old_ss) {
         }
     }
     return 0;
+}
+
+/* ---- rt_sigtimedwait(128) & tgkill(234) wakeup (ART SignalCatcher) ------ */
+typedef struct {
+    int32_t tid;
+    int32_t pending_sig;
+} afw_sigwait_slot;
+
+static afw_sigwait_slot g_sigwait[64];
+static int32_t g_sigwait_spin;
+
+static afw_sigwait_slot *sigwait_slot_for(int32_t tid) {
+    int i, free_idx = -1;
+    while (afw_os_atomic_cmpxchg_i32(&g_sigwait_spin, 0, 1) != 0) {}
+    for (i = 0; i < 64; i++) {
+        if (g_sigwait[i].tid == tid) {
+            afw_os_atomic_store_i32(&g_sigwait_spin, 0);
+            return &g_sigwait[i];
+        }
+        if (free_idx < 0 && g_sigwait[i].tid == 0) free_idx = i;
+    }
+    if (free_idx >= 0) {
+        g_sigwait[free_idx].tid = tid;
+        g_sigwait[free_idx].pending_sig = 0;
+        afw_os_atomic_store_i32(&g_sigwait_spin, 0);
+        return &g_sigwait[free_idx];
+    }
+    afw_os_atomic_store_i32(&g_sigwait_spin, 0);
+    return NULL;
+}
+
+static int64_t sys_tgkill_deliver(int64_t tid, int64_t sig) {
+    afw_sigwait_slot *s;
+    if (sig == 0) return 0;
+    if (sig < 0 || sig > 64) return -LNX_EINVAL;
+    s = sigwait_slot_for((int32_t)tid);
+    if (s) {
+        afw_os_atomic_store_i32(&s->pending_sig, (int32_t)sig);
+        afw_os_wake_address_all(&s->pending_sig);
+    }
+    return 0;
+}
+
+static int64_t sys_rt_sigtimedwait(const void *uthese, void *uinfo,
+                                   const struct lnx_timespec *uts, uint64_t sigsetsize) {
+    uint64_t mask = 0;
+    afw_sigwait_slot *s;
+    if (sigsetsize != 8) return -LNX_EINVAL;
+    if (!uthese) return -LNX_EFAULT;
+    memcpy(&mask, uthese, 8);
+    s = sigwait_slot_for((int32_t)sys_gettid());
+    if (!s) return -LNX_EAGAIN;
+    for (;;) {
+        int32_t cur = afw_os_atomic_load_i32(&s->pending_sig);
+        if (cur >= 1 && cur <= 64) {
+            if (afw_os_atomic_cmpxchg_i32(&s->pending_sig, cur, 0) == cur) {
+                if (mask & (1ULL << (cur - 1))) {
+                    if (uinfo) {
+                        memset(uinfo, 0, 128);
+                        memcpy(uinfo, &cur, 4); /* si_signo */
+                    }
+                    return (int64_t)cur;
+                }
+            }
+            continue;
+        }
+        {
+            int64_t wr = sys_futex((int64_t)(uintptr_t)&s->pending_sig, FUTEX_WAIT, 0,
+                                   (int64_t)(uintptr_t)uts, 0, 0);
+            if (wr == -LNX_ETIMEDOUT) return -LNX_EAGAIN;
+            if (wr < 0 && wr != -LNX_EAGAIN) return wr;
+        }
+    }
 }
 
 /* ---- uname(63) ---------------------------------------------------------- */
@@ -970,6 +1050,8 @@ static int64_t dispatch_ex(int64_t nr, int64_t *a, const afw_clone_regs *regs, u
     case 111: return sys_getpid(); /* getpgrp */
     case 121: return sys_getpid(); /* getpgid */
     case 124: return sys_getpid(); /* getsid */
+    case 128: return sys_rt_sigtimedwait((const void *)(uintptr_t)a[0], (void *)(uintptr_t)a[1],
+                                         (const struct lnx_timespec *)(uintptr_t)a[2], (uint64_t)a[3]);
     case 131: return sys_sigaltstack((const void *)(uintptr_t)a[0], (void *)(uintptr_t)a[1]);
     case 137: /* statfs */
         if (!a[0]) return -LNX_EFAULT;
@@ -997,6 +1079,8 @@ static int64_t dispatch_ex(int64_t nr, int64_t *a, const afw_clone_regs *regs, u
                                          (const struct lnx_timespec *)(uintptr_t)a[2],
                                          (struct lnx_timespec *)(uintptr_t)a[3]);
     case 234: /* tgkill */
+        if (a[2] != 6) return sys_tgkill_deliver(a[1], a[2]);
+        /* fall through on SIGABRT */
     case 297: /* rt_tgsigqueueinfo */
         fprintf(stderr, "[syscall] signal nr=%lld tgid=%lld tid=%lld sig=%lld\n",
                 (long long)nr, (long long)a[0], (long long)a[1], (long long)a[2]);
