@@ -89,7 +89,9 @@ int64_t afw_os_lseek(afw_os_file f, int64_t off, int whence);
 int     afw_os_fstat(afw_os_file f, afw_os_stat_info *out);
 int     afw_os_stat(const char *path, int nofollow, afw_os_stat_info *out);
 int     afw_os_unlink(const char *path, int rmdir_flag);
+int     afw_os_rename(const char *oldpath, const char *newpath);
 int     afw_os_mkdir(const char *path, uint32_t mode);
+int     afw_os_setenv(const char *name, const char *val);
 int     afw_os_symlink(const char *target, const char *linkpath);
 int     afw_os_junction(const char *target, const char *linkpath);
 int     afw_os_set_append(afw_os_file f, int append);
@@ -194,5 +196,11 @@ int   afw_os_dtv_fls_set(void (*release_cb)(void *), void *dtv);
 #ifdef AFW_TEST
 void  afw_os_test_fail_dtv_fls_clear(int count);
 #endif
+
+/* ---- G3 ART /proc/self/maps synthesis & main-stack query (Rule 8) ---- */
+int      afw_os_build_proc_maps(char **buf_out, size_t *len_out);
+int      afw_os_is_current_stack(uint64_t addr, uint64_t len);
+int      afw_os_current_stack_limits(uint64_t *lo_out, uint64_t *hi_out);
+uint32_t afw_os_current_pid(void);
 
 #endif

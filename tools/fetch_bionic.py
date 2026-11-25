@@ -76,6 +76,56 @@ def save(out, name, data):
     print("== %-28s %9d bytes  build id %s" % (name, len(data), build_id(data)))
 
 
+def elf_needed(data):
+    """Return list of DT_NEEDED library names from an ELF64 binary."""
+    if len(data) < 64 or data[:4] != b"\x7fELF" or data[4] != 2:
+        return []
+    phoff, = struct.unpack_from("<Q", data, 0x20)
+    phent, phnum = struct.unpack_from("<HH", data, 0x36)
+    loads = []
+    dyn_off = dyn_sz = 0
+    for i in range(phnum):
+        p = phoff + i * phent
+        if p + 56 > len(data):
+            break
+        pt, _, off, vaddr, _, filesz, memsz, _ = struct.unpack_from("<IIQQQQQQ", data, p)
+        if pt == 1:
+            loads.append((vaddr, vaddr + filesz, off))
+        elif pt == 2:
+            dyn_off, dyn_sz = off, filesz
+    if not dyn_off:
+        return []
+
+    def v2o(va):
+        for lo, hi, off in loads:
+            if lo <= va < hi:
+                return off + (va - lo)
+        return None
+
+    strtab_va = None
+    needed_offs = []
+    for o in range(dyn_off, min(dyn_off + dyn_sz, len(data) - 15), 16):
+        tag, val = struct.unpack_from("<qQ", data, o)
+        if tag == 0:
+            break
+        elif tag == 5:
+            strtab_va = val
+        elif tag == 1:
+            needed_offs.append(val)
+    if strtab_va is None:
+        return []
+    st_off = v2o(strtab_va)
+    if st_off is None:
+        return []
+    out = []
+    for noff in needed_offs:
+        pos = st_off + noff
+        end = data.find(b"\0", pos)
+        if end > pos:
+            out.append(data[pos:end].decode("utf-8", "replace"))
+    return out
+
+
 def extract_art(system, out):
     """libart.so and the boot image .oat files, for the %gs: scan."""
     art_dir = os.path.join(out, "art")
@@ -103,9 +153,150 @@ def extract_art(system, out):
         print("== no /system/framework/x86_64 in the system partition")
 
 
+def extract_art_full(system, out):
+    """Extract libart.so, all APEX/system transitive .so deps, bootclasspath jars, and ICU data."""
+    lib_dir = os.path.join(out, "art", "lib64")
+    jar_dir = os.path.join(out, "art", "javalib")
+    icu_dir = os.path.join(out, "art", "etc", "icu")
+    tz_dir  = os.path.join(out, "art", "etc", "tz")
+    os.makedirs(lib_dir, exist_ok=True)
+    os.makedirs(jar_dir, exist_ok=True)
+    os.makedirs(icu_dir, exist_ok=True)
+    os.makedirs(tz_dir, exist_ok=True)
+
+    bionic_skip = {"libc.so", "libm.so", "libdl.so", "ld-android.so"}
+    have = set(bionic_skip)
+    queue = []
+
+    apex_list = [
+        ("com.android.art.apex", "com.android.art.capex"),
+        ("com.android.i18n.apex", "com.android.i18n.capex"),
+        ("com.android.conscrypt.apex", "com.android.conscrypt.capex"),
+        ("com.android.os.statsd.apex", "com.android.os.statsd.capex"),
+        ("com.android.runtime.apex", "com.android.runtime.capex"),
+        ("com.android.tzdata.apex", "com.android.tzdata.capex"),
+    ]
+    for cand in apex_list:
+        payload = open_apex(system, cand)
+        if payload is None:
+            continue
+        pimg = os.path.join(out, "tmp_apex.img")
+        with open(pimg, "wb") as f:
+            f.write(payload)
+        with Ext4(pimg) as fs:
+            for ldir in ("/lib64", "/lib64/bionic"):
+                try:
+                    for n, ino in fs.listdir(fs.lookup(ldir)):
+                        if n.endswith(".so") and n not in have:
+                            try:
+                                rino = fs.lookup(ldir + "/" + n)
+                                d = fs.data(rino)
+                            except (FileNotFoundError, IOError, ValueError):
+                                continue
+                            if d[:4] == b"\x7fELF":
+                                save(lib_dir, n, d)
+                                have.add(n)
+                                queue.append((n, d))
+                except FileNotFoundError:
+                    pass
+            try:
+                for n, ino in fs.listdir(fs.lookup("/javalib")):
+                    if n.endswith(".jar"):
+                        d = fs.data(ino)
+                        with open(os.path.join(jar_dir, n), "wb") as jf:
+                            jf.write(d)
+                        print("== jar %-24s %9d bytes" % (n, len(d)))
+            except FileNotFoundError:
+                pass
+            try:
+                for n, ino in fs.listdir(fs.lookup("/etc/icu")):
+                    if n.endswith(".dat"):
+                        d = fs.data(ino)
+                        with open(os.path.join(icu_dir, n), "wb") as df:
+                            df.write(d)
+                        print("== icu %-24s %9d bytes" % (n, len(d)))
+            except FileNotFoundError:
+                pass
+            try:
+                for n, ino in fs.listdir(fs.lookup("/etc/tz")):
+                    if not n.startswith("."):
+                        try:
+                            d = fs.data(ino)
+                        except (FileNotFoundError, IOError, ValueError):
+                            continue
+                        with open(os.path.join(tz_dir, n), "wb") as tf:
+                            tf.write(d)
+                        print("== tz  %-24s %9d bytes" % (n, len(d)))
+            except FileNotFoundError:
+                pass
+        os.remove(pimg)
+
+    # Write minimal headless public.libraries.txt for libnativeloader.so
+    # (Android's full /system/etc/public.libraries.txt requires GUI/framework libs like libandroid.so/libvulkan.so)
+    etc_dir = os.path.join(out, "art", "etc")
+    os.makedirs(etc_dir, exist_ok=True)
+    pub_txt = os.path.join(etc_dir, "public.libraries.txt")
+    with open(pub_txt, "wb") as ef:
+        ef.write(b"libc.so\nlibm.so\nlibdl.so\nliblog.so\nlibz.so\n")
+    print("== etc %-24s (minimal headless ART list)" % "public.libraries.txt")
+
+    # Seed libraries loaded dynamically via dlopen() by ART (not in DT_NEEDED)
+    sys_dirs = ["/system/lib64", "/system/lib64/bootstrap"]
+    dlopen_seeds = [
+        "libartpalette-system.so",
+        "libnativeloader.so",
+        "libnativebridge.so",
+        "libvndksupport.so",
+        "libtombstoned_client.so",
+        "libdebuggerd_client.so",
+        "libstatslog.so",
+    ]
+    for dep in dlopen_seeds:
+        if dep in have:
+            continue
+        for sdir in sys_dirs:
+            try:
+                ino = system.lookup(sdir + "/" + dep)
+                d = system.data(ino)
+                if d[:4] == b"\x7fELF":
+                    save(lib_dir, dep, d)
+                    have.add(dep)
+                    queue.append((dep, d))
+                    break
+            except (FileNotFoundError, IOError, ValueError):
+                continue
+
+    # Transitively resolve remaining DT_NEEDED from /system/lib64
+    missing = set()
+    while queue:
+        _, data = queue.pop(0)
+        for dep in elf_needed(data):
+            if dep in have or dep in missing:
+                continue
+            found_data = None
+            for sdir in sys_dirs:
+                try:
+                    ino = system.lookup(sdir + "/" + dep)
+                    d = system.data(ino)
+                    if d[:4] == b"\x7fELF":
+                        found_data = d
+                        break
+                except (FileNotFoundError, IOError, ValueError):
+                    continue
+            if found_data is not None:
+                save(lib_dir, dep, found_data)
+                have.add(dep)
+                queue.append((dep, found_data))
+            else:
+                missing.add(dep)
+    if missing:
+        print("== unresolved DT_NEEDED (not in APEX or /system/lib64):", sorted(missing))
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     want_art = "--art" in sys.argv[1:]
+    want_art_full = "--art-full" in sys.argv[1:]
     out = args[0] if args else os.path.join("out", "bionic")
     os.makedirs(out, exist_ok=True)
     sdk = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
@@ -124,6 +315,8 @@ def main():
     data = open_apex(system, ("com.android.runtime.apex", "com.android.runtime.capex"))
     if want_art:
         extract_art(system, out)
+    if want_art_full:
+        extract_art_full(system, out)
     system.close()                                      # Windows cannot delete an open file
     if data is None:
         sys.exit("no runtime APEX in the image")
@@ -132,10 +325,20 @@ def main():
         f.write(data)
     with Ext4(payload) as fs:
         for src, dst in WANT.items():
-            data = fs.data(fs.lookup(src))
+            d = fs.data(fs.lookup(src))
             with open(os.path.join(out, dst), "wb") as f:
-                f.write(data)
-            print("== %-10s %8d bytes  build id %s" % (dst, len(data), build_id(data)))
+                f.write(d)
+            print("== %-10s %8d bytes  build id %s" % (dst, len(d), build_id(d)))
+        if want_art_full:
+            # Also grab libdl_android.so / libandroidicu.so etc. if present in runtime APEX
+            try:
+                for n, ino in fs.listdir(fs.lookup("/lib64/bionic")):
+                    if n.endswith(".so") and n not in ("libc.so", "libm.so", "libdl.so"):
+                        d = fs.data(ino)
+                        if d[:4] == b"\x7fELF":
+                            save(os.path.join(out, "art", "lib64"), n, d)
+            except FileNotFoundError:
+                pass
     os.remove(payload)
     shutil.rmtree(parts, ignore_errors=True)            # the partitions are large and not needed
     with open(os.path.join(out, "libc.so"), "rb") as f:

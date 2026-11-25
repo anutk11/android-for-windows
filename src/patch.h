@@ -44,7 +44,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define AFW_STUB_RESERVE (64 * 1024)
+#define AFW_STUB_RESERVE (512 * 1024)
 
 typedef struct {
     int fs_patched;            /* fs:[disp32] rewritten to gs: */
@@ -74,6 +74,8 @@ typedef struct {
     int fs_reg_trampolined;    /* fs:[reg] rewritten through a jmp trampoline (Windows) */
     int fs_reg_feasible;       /* fs:[reg] a trampoline can handle (counted on every platform) */
     int fs_unsupported;        /* reachable fs: access other than a read of fs:[0] / fs:[0x28]: blocks loading */
+    int gs_feasible;           /* reachable gs: accesses a trampoline can handle (when enable_art_gs) */
+    int gs_trampolined;        /* reachable gs: accesses rewritten through a trampoline (Windows) */
     int gs_unsupported;        /* reachable gs: access (ART's Thread*; on Windows gs is the TEB): blocks loading */
     int gs_outside_functions;  /* gs: look-alikes outside .eh_frame: blocks loading, like fs: */
     int redzone_direct;        /* refusals by reason: [rsp-N] */
@@ -112,6 +114,7 @@ typedef struct {
     /* mapped read-only in the file (PF_R without PF_W): attested tables must be */
     int (*readonly)(const void *ctx, uint64_t addr, uint64_t len);
     int attest_dump;        /* print the evidence behind every attestation (ATTEST-DETAIL lines) */
+    int enable_art_gs;      /* rewrite ART %gs: accesses via Windows TEB slots (Gate G3) */
     /* extra entry points of a function (C++ landing pads) */
     int (*entries)(const void *ctx, uint64_t func, uint64_t *out, int max);
     const afw_code_range *segs; int nsegs; /* executable segments, for the audit */

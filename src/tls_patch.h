@@ -56,4 +56,14 @@ long afw_tls_patch_count(void);
 /* Current thread's bionic TLS slots (what fs:0 points to on Android). */
 uintptr_t *afw_tls_block(void);
 
+/* ART %gs: emulation (Gate G3): on Windows, 3 low TEB TLS slots (< 64) hold
+ * the current thread's emulated gs base (set via SYS_arch_prctl ARCH_SET_GS)
+ * plus 2 per-thread scratch slots used by zero-stack/zero-EFLAGS trampolines.
+ * Returns -1 on non-Windows or if uninitialized. */
+int afw_tls_art_gs_base_off(void);
+int afw_tls_art_gs_scratch1_off(void);
+int afw_tls_art_gs_scratch2_off(void);
+void afw_tls_set_art_gs(uintptr_t addr);
+uintptr_t afw_tls_get_art_gs(void);
+
 #endif

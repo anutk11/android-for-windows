@@ -11,7 +11,7 @@
 #include "patch.h"
 
 #define AFW_MAX_NEEDED 32
-#define AFW_MAX_LIBS   64
+#define AFW_MAX_LIBS   128
 
 #define AFW_BUILD_ID_HEX 65
 /* the only libc.so whose libc_shared_globals layout is measured (tools/fetch_bionic.py pins it) */
@@ -43,6 +43,8 @@ typedef struct afw_lib_s {
     uint64_t xsec_vaddr[16], xsec_size[16]; /* SHF_EXECINSTR sections */
     int nxsec;
     int xsec_truncated;                     /* >16 SHF_ALLOC|SHF_EXECINSTR sections */
+    uint64_t extra_fn_vaddr[16], extra_fn_size[16]; /* SHT_SYMTAB assembly entrypoints without FDE */
+    int nextra_fn;
     afw_patch_report patch;
 
     char sha256[65];            /* of the file as read, before mapping or patching */
@@ -92,6 +94,7 @@ extern int afw_load_patch_only;
  * flag overrides that, for diagnosis only. */
 extern int afw_load_allow_unproven;
 extern int afw_attest_dump;   /* print ATTEST-DETAIL evidence while loading */
+extern int afw_load_enable_art_gs; /* rewrite ART %gs: accesses via Windows TEB slots (Gate G3) */
 /* How many libraries are registered (tests: a failed load must not count). */
 int afw_loaded_count(void);
 /* How many failed libraries are quarantined (past point of no return: TLS

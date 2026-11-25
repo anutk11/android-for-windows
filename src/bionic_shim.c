@@ -9,6 +9,7 @@
 #include "tls_static.h"
 #include "loader_api.h"
 #include "callback_bridge.h"
+#include "win_host.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -237,6 +238,17 @@ void afw_shared_globals_set_static_tls(const afw_bionic_static_tls *stl) {
     memcpy(sg + SG_STL_OFFSET_BIONIC_TLS,     &stl->offset_bionic_tls,     8);
 }
 
+const char *afw_shared_globals_abort_msg(void) {
+    unsigned char *sg;
+    uint64_t ptr = 0;
+    if (!g_sg_ready) return NULL;
+    sg = (unsigned char *)g_sg_mem;
+    memcpy(&ptr, sg + 0x448, 8);
+    if (!ptr) return NULL;
+    /* struct abort_msg_t { size_t size; char msg[]; } */
+    return (const char *)(uintptr_t)(ptr + 8);
+}
+
 static const shim_entry g_shims[] = {
     S("strlen", s_strlen), S("strcmp", s_strcmp), S("strncmp", s_strncmp),
     S("strcpy", s_strcpy), S("strncpy", s_strncpy), S("strcat", s_strcat),
@@ -273,8 +285,32 @@ static const shim_entry g_shims[] = {
     S("__loader_remove_thread_local_dtor", afw_l_remove_thread_local_dtor),
     S("__loader_android_get_LD_LIBRARY_PATH", afw_l_android_get_LD_LIBRARY_PATH),
     S("__loader_android_get_application_target_sdk_version", afw_l_android_get_application_target_sdk_version),
+    S("__loader_android_set_application_target_sdk_version", afw_l_android_set_application_target_sdk_version),
+    S("__loader_android_create_namespace", afw_l_android_create_namespace),
+    S("__loader_android_get_exported_namespace", afw_l_android_get_exported_namespace),
+    S("__loader_android_link_namespaces", afw_l_android_link_namespaces),
+    S("__loader_android_link_namespaces_all_libs", afw_l_android_link_namespaces_all_libs),
+    S("__loader_android_init_anonymous_namespace", afw_l_android_init_anonymous_namespace),
+    S("__loader_android_update_LD_LIBRARY_PATH", afw_l_android_update_LD_LIBRARY_PATH),
+    S("__loader_android_dlwarning", afw_l_android_dlwarning),
     S("__loader_android_handle_signal", afw_l_android_handle_signal),
     S("__loader_cfi_fail", afw_l_cfi_fail),
+    /* Win32 GUI, framebuffer, input, and audio host bridge (Gates G4/G5) */
+    S("__afw_host_window_create", afw_host_window_create),
+    S("__afw_host_present", afw_host_present),
+    S("__afw_host_poll_event", afw_host_poll_event),
+    S("__afw_host_get_size", afw_host_get_size),
+    S("__afw_host_audio_open", afw_host_audio_open),
+    S("__afw_host_audio_write", afw_host_audio_write),
+    S("__afw_host_audio_close", afw_host_audio_close),
+    S("__afw_host_sleep_ms", afw_host_sleep_ms),
+    S("__afw_host_get_stats", afw_host_get_stats),
+    S("__afw_host_decode_image_alloc", afw_host_decode_image_alloc),
+    S("__afw_host_media_decode_alloc", afw_host_media_decode_alloc),
+    S("__afw_host_free_buf", afw_host_free_buf),
+    S("__afw_host_draw_text_ttf", afw_host_draw_text_ttf),
+    S("__afw_host_measure_text_ttf", afw_host_measure_text_ttf),
+    S("__afw_host_get_user_dir", afw_host_get_user_dir),
 };
 #undef S
 

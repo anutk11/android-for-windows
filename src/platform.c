@@ -137,19 +137,39 @@ static const wchar_t *utf8_to_wide(const char *path, wchar_t *sbuf, size_t scap,
     wchar_t *w, *p;
     *heap = NULL;
     if (!path) return NULL;
+    char drv_stack[1024];
+    char *drv_heap = NULL;
     if (strcmp(path, "/dev/null") == 0) return L"NUL";
+    if (strncmp(path, "/__afw_drv__/", 13) == 0 &&
+        ((path[13] >= 'A' && path[13] <= 'Z') || (path[13] >= 'a' && path[13] <= 'z')) &&
+        (path[14] == '/' || path[14] == '\0')) {
+        size_t rest_len = strlen(path + 14);
+        size_t need_utf8 = 2 + (rest_len ? rest_len : 1) + 1;
+        char *dst = drv_stack;
+        if (need_utf8 > sizeof drv_stack) {
+            drv_heap = (char *)malloc(need_utf8);
+            if (!drv_heap) return NULL;
+            dst = drv_heap;
+        }
+        dst[0] = path[13];
+        dst[1] = ':';
+        if (rest_len) memcpy(dst + 2, path + 14, rest_len + 1);
+        else { dst[2] = '/'; dst[3] = '\0'; }
+        path = dst;
+    }
     need = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
-    if (need <= 0) return NULL;
+    if (need <= 0) { free(drv_heap); return NULL; }
     if ((size_t)need <= scap) {
         w = sbuf;
     } else {
         w = (wchar_t *)malloc((size_t)need * sizeof(wchar_t));
-        if (!w) return NULL;
+        if (!w) { free(drv_heap); return NULL; }
         *heap = w;
     }
     if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, w, need) <= 0) {
-        free(*heap); *heap = NULL; return NULL;
+        free(drv_heap); free(*heap); *heap = NULL; return NULL;
     }
+    free(drv_heap);
     for (p = w; *p; p++) if (*p == L'/') *p = L'\\';
     return w;
 }
@@ -458,6 +478,26 @@ int afw_os_mkdir(const char *path, uint32_t mode) {
     err = ok ? 0 : GetLastError();
     free(wheap);
     return ok ? 0 : win_err_to_lnx(err);
+}
+
+int afw_os_rename(const char *oldpath, const char *newpath) {
+    wchar_t obuf[512], nbuf[512], *oheap = NULL, *nheap = NULL;
+    const wchar_t *wo, *wn;
+    BOOL ok;
+    DWORD err;
+    if (!oldpath || !newpath) return -14;
+    wo = utf8_to_wide(oldpath, obuf, sizeof obuf / sizeof obuf[0], &oheap);
+    wn = utf8_to_wide(newpath, nbuf, sizeof nbuf / sizeof nbuf[0], &nheap);
+    if (!wo || !wn) { free(oheap); free(nheap); return -22; }
+    ok = MoveFileExW(wo, wn, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    err = ok ? 0 : GetLastError();
+    free(oheap); free(nheap);
+    return ok ? 0 : win_err_to_lnx(err);
+}
+
+int afw_os_setenv(const char *name, const char *val) {
+    if (!name || !val) return -22;
+    return _putenv_s(name, val) == 0 ? 0 : -12;
 }
 
 #ifndef SYMBOLIC_LINK_FLAG_DIRECTORY
@@ -963,6 +1003,132 @@ int afw_os_clone_supported(void) {
     return 1;
 }
 
+int afw_os_is_current_stack(uint64_t addr, uint64_t len) {
+    ULONG_PTR lo = 0, hi = 0;
+    if (len == 0 || addr + len < addr) return 0;
+    GetCurrentThreadStackLimits(&lo, &hi);
+    return (addr >= (uint64_t)lo && addr + len <= (uint64_t)hi) ? 1 : 0;
+}
+
+int afw_os_current_stack_limits(uint64_t *lo_out, uint64_t *hi_out) {
+    ULONG_PTR lo = 0, hi = 0;
+    GetCurrentThreadStackLimits(&lo, &hi);
+    if (hi <= lo) return -1;
+    if (lo_out) *lo_out = (uint64_t)lo;
+    if (hi_out) *hi_out = (uint64_t)hi;
+    return 0;
+}
+
+uint32_t afw_os_current_pid(void) {
+    return (uint32_t)GetCurrentProcessId();
+}
+
+static int proc_maps_append(char **buf, size_t *len, size_t *cap, const char *line, size_t n) {
+    if (*len + n + 1 > *cap) {
+        size_t ncap = (*cap ? *cap * 2 : 16384);
+        char *nb;
+        while (ncap < *len + n + 1) ncap *= 2;
+        nb = (char *)realloc(*buf, ncap);
+        if (!nb) return -1;
+        *buf = nb;
+        *cap = ncap;
+    }
+    memcpy(*buf + *len, line, n);
+    *len += n;
+    (*buf)[*len] = '\0';
+    return 0;
+}
+
+static void win_prot_to_rwx(DWORD prot, char out[4]) {
+    DWORD p = prot & 0xffu;
+    out[0] = '-'; out[1] = '-'; out[2] = '-'; out[3] = '\0';
+    if (p == PAGE_NOACCESS || (prot & PAGE_GUARD)) return;
+    if (p == PAGE_READONLY || p == PAGE_READWRITE || p == PAGE_WRITECOPY ||
+        p == PAGE_EXECUTE_READ || p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY)
+        out[0] = 'r';
+    if (p == PAGE_READWRITE || p == PAGE_WRITECOPY ||
+        p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY)
+        out[1] = 'w';
+    if (p == PAGE_EXECUTE || p == PAGE_EXECUTE_READ ||
+        p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY)
+        out[2] = 'x';
+}
+
+int afw_os_build_proc_maps(char **buf_out, size_t *len_out) {
+    ULONG_PTR stk_lo = 0, stk_hi = 0;
+    uint64_t addr = 0;
+    int stk_emitted = 0;
+    char *buf = NULL;
+    size_t len = 0, cap = 0;
+    uint64_t run_lo = 0, run_hi = 0;
+    char run_perm[4] = {0};
+    int have_run = 0;
+    char line[160];
+
+    GetCurrentThreadStackLimits(&stk_lo, &stk_hi);
+    for (;;) {
+        MEMORY_BASIC_INFORMATION mbi;
+        uint64_t rlo, rhi;
+        if (VirtualQuery((LPCVOID)(uintptr_t)addr, &mbi, sizeof mbi) == 0) break;
+        rlo = (uint64_t)(uintptr_t)mbi.BaseAddress;
+        rhi = rlo + (uint64_t)mbi.RegionSize;
+        if (rhi <= addr) break;
+        addr = rhi;
+
+        if (!stk_emitted && stk_hi > stk_lo && rlo >= (uint64_t)stk_lo) {
+            int n;
+            if (have_run) {
+                n = snprintf(line, sizeof line, "%llx-%llx %sp 00000000 00:00 0\n",
+                             (unsigned long long)run_lo, (unsigned long long)run_hi, run_perm);
+                if (n > 0 && proc_maps_append(&buf, &len, &cap, line, (size_t)n) != 0) { free(buf); return -1; }
+                have_run = 0;
+            }
+            n = snprintf(line, sizeof line, "%llx-%llx rw-p 00000000 00:00 0          [stack]\n",
+                         (unsigned long long)stk_lo, (unsigned long long)stk_hi);
+            if (n > 0 && proc_maps_append(&buf, &len, &cap, line, (size_t)n) != 0) { free(buf); return -1; }
+            stk_emitted = 1;
+        }
+        if (stk_hi > stk_lo && rlo < (uint64_t)stk_hi && rhi > (uint64_t)stk_lo)
+            continue;
+        if (mbi.State == MEM_COMMIT) {
+            char perm[4];
+            win_prot_to_rwx(mbi.Protect, perm);
+            if (have_run && run_hi == rlo && memcmp(run_perm, perm, 3) == 0) {
+                run_hi = rhi;
+            } else {
+                if (have_run) {
+                    int n = snprintf(line, sizeof line, "%llx-%llx %sp 00000000 00:00 0\n",
+                                     (unsigned long long)run_lo, (unsigned long long)run_hi, run_perm);
+                    if (n > 0 && proc_maps_append(&buf, &len, &cap, line, (size_t)n) != 0) { free(buf); return -1; }
+                }
+                run_lo = rlo;
+                run_hi = rhi;
+                memcpy(run_perm, perm, 4);
+                have_run = 1;
+            }
+        }
+    }
+    if (have_run) {
+        int n = snprintf(line, sizeof line, "%llx-%llx %sp 00000000 00:00 0\n",
+                         (unsigned long long)run_lo, (unsigned long long)run_hi, run_perm);
+        if (n > 0 && proc_maps_append(&buf, &len, &cap, line, (size_t)n) != 0) { free(buf); return -1; }
+    }
+    if (!stk_emitted && stk_hi > stk_lo) {
+        int n = snprintf(line, sizeof line, "%llx-%llx rw-p 00000000 00:00 0          [stack]\n",
+                     (unsigned long long)stk_lo, (unsigned long long)stk_hi);
+        if (n > 0 && proc_maps_append(&buf, &len, &cap, line, (size_t)n) != 0) { free(buf); return -1; }
+    }
+    if (!buf) {
+        buf = (char *)malloc(1);
+        if (!buf) return -1;
+        buf[0] = '\0';
+        len = 0;
+    }
+    *buf_out = buf;
+    *len_out = len;
+    return 0;
+}
+
 /* Windows x64 assembly trampolines for entering Bionic's child_stack on clone(56)
  * and returning to the original Windows host_rsp + NT_TIB on SYS_exit(60).
  * Validated in Stage-0 (tools/g2_stack_probe.c, Items 2a, 4a, 4b, 4c-win, 5). */
@@ -1191,6 +1357,16 @@ int afw_os_unlink(const char *path, int rmdir_flag) {
 int afw_os_mkdir(const char *path, uint32_t mode) {
     if (!path) return -EFAULT;
     return mkdir(path, (mode_t)(mode & 0777u)) == 0 ? 0 : -errno;
+}
+
+int afw_os_rename(const char *oldpath, const char *newpath) {
+    if (!oldpath || !newpath) return -EFAULT;
+    return rename(oldpath, newpath) == 0 ? 0 : -errno;
+}
+
+int afw_os_setenv(const char *name, const char *val) {
+    if (!name || !val) return -EINVAL;
+    return setenv(name, val, 1) == 0 ? 0 : -errno;
 }
 
 int afw_os_symlink(const char *target, const char *linkpath) {
@@ -1528,5 +1704,24 @@ void afw_os_clone_exit_on_host(afw_os_clone_trampoline *t, void *ctx,
                                int exit_code, void (*fn)(void *, int)) {
     (void)t; (void)ctx; (void)exit_code; (void)fn;
     abort();
+}
+
+int afw_os_is_current_stack(uint64_t addr, uint64_t len) {
+    (void)addr; (void)len;
+    return 0;
+}
+
+int afw_os_current_stack_limits(uint64_t *lo_out, uint64_t *hi_out) {
+    (void)lo_out; (void)hi_out;
+    return -1;
+}
+
+uint32_t afw_os_current_pid(void) {
+    return (uint32_t)getpid();
+}
+
+int afw_os_build_proc_maps(char **buf_out, size_t *len_out) {
+    (void)buf_out; (void)len_out;
+    return -1; /* Linux uses real /proc/self/maps via afw_os_open */
 }
 #endif

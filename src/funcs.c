@@ -211,40 +211,150 @@ static const unsigned char *find_fde(const afw_lib *lib, uint64_t addr) {
     return (const unsigned char *)(uintptr_t)(hdr + (int64_t)tab[2 * lo + 1]);
 }
 
+static uint64_t sym_inferred_size(const afw_lib *lib, const Elf64_Sym *s) {
+    const char *nm;
+    char end_nm[160];
+    size_t i, nlen;
+    unsigned stt = ELF64_ST_TYPE(s->st_info);
+    if (stt == STT_FUNC && s->st_size) return s->st_size;
+    if (stt != STT_FUNC && stt != 0 /* STT_NOTYPE */) return 0;
+    if (s->st_size || !lib->strtab || !s->st_name) return 0;
+    nm = lib->strtab + s->st_name;
+    if (strncmp(nm, "ExecuteNterp", 12) != 0) return 0;
+    nlen = strlen(nm);
+    if (nlen + 4 > sizeof end_nm) return 0;
+    memcpy(end_nm, "End", 3);
+    memcpy(end_nm + 3, nm, nlen + 1);
+    for (i = 1; i < lib->nsyms; i++) {
+        const Elf64_Sym *e = &lib->symtab[i];
+        if (e->st_shndx != SHN_UNDEF && e->st_name &&
+            strcmp(lib->strtab + e->st_name, end_nm) == 0 && e->st_value > s->st_value)
+            return e->st_value - s->st_value;
+    }
+    return 0;
+}
+
 int afw_func_bounds(const afw_lib *lib, uint64_t addr, uint64_t *start, uint64_t *end) {
     const unsigned char *fde = find_fde(lib, addr);
     uint64_t lsda;
     size_t i;
     if (fde && fde_parse(lib, fde, start, end, &lsda) != FDE_BAD && addr >= *start && addr < *end)
         return 1;
-    /* fallback: exported function symbols with a size */
+    /* fallback: exported function symbols with a size (or End<name> pair) */
     for (i = 1; i < lib->nsyms; i++) {
         const Elf64_Sym *s = &lib->symtab[i];
-        uint64_t a = (uint64_t)lib->bias + s->st_value;
-        if (s->st_shndx == SHN_UNDEF || ELF64_ST_TYPE(s->st_info) != STT_FUNC || !s->st_size) continue;
-        if (addr >= a && addr < a + s->st_size) { *start = a; *end = a + s->st_size; return 1; }
+        uint64_t a = (uint64_t)lib->bias + s->st_value, sz;
+        if (s->st_shndx == SHN_UNDEF) continue;
+        sz = sym_inferred_size(lib, s);
+        if (!sz) continue;
+        if (addr >= a && addr < a + sz) { *start = a; *end = a + sz; return 1; }
+    }
+    for (i = 0; i < (size_t)lib->nextra_fn; i++) {
+        uint64_t a = (uint64_t)lib->bias + lib->extra_fn_vaddr[i];
+        uint64_t sz = lib->extra_fn_size[i];
+        if (sz && addr >= a && addr < a + sz) { *start = a; *end = a + sz; return 1; }
     }
     return 0;
+}
+
+typedef struct { unsigned char *start; size_t size; } func_range_tmp;
+static int cmp_func_range(const void *a, const void *b) {
+    const func_range_tmp *x = (const func_range_tmp *)a, *y = (const func_range_tmp *)b;
+    if (x->start < y->start) return -1;
+    if (x->start > y->start) return 1;
+    return (x->size > y->size) - (x->size < y->size);
 }
 
 int afw_func_list(const afw_lib *lib, unsigned char ***starts, size_t **sizes) {
     const int32_t *tab;
     uint64_t count, i, hdr = (uint64_t)(uintptr_t)lib->eh_frame_hdr;
-    int n = 0;
+    func_range_tmp *tmp;
+    size_t cap, n = 0, k;
     *starts = NULL; *sizes = NULL;
     if (!hdr_table(lib, &tab, &count) || !count) return 0;
-    *starts = (unsigned char **)malloc((size_t)count * sizeof **starts);
-    *sizes = (size_t *)malloc((size_t)count * sizeof **sizes);
+    cap = (size_t)count + (lib->symtab ? lib->nsyms : 0) + (size_t)lib->nextra_fn;
+    tmp = (func_range_tmp *)malloc(cap * sizeof *tmp);
+    if (!tmp) return 0;
     for (i = 0; i < count; i++) {
         uint64_t s0, e0, lsda;
         const unsigned char *fde = (const unsigned char *)(uintptr_t)(hdr + (int64_t)tab[2 * i + 1]);
         if (fde_parse(lib, fde, &s0, &e0, &lsda) == FDE_BAD || e0 <= s0) continue;
         if (s0 < (uint64_t)(uintptr_t)lib->base || e0 > (uint64_t)(uintptr_t)lib->base + lib->size) continue;
-        (*starts)[n] = (unsigned char *)(uintptr_t)s0;
-        (*sizes)[n] = (size_t)(e0 - s0);
+        tmp[n].start = (unsigned char *)(uintptr_t)s0;
+        tmp[n].size  = (size_t)(e0 - s0);
         n++;
     }
-    return n;
+    /* Also include exported STT_FUNC symbols and SHT_SYMTAB ExecuteNterp*
+     * entrypoints without .eh_frame FDEs, skipping any overlapping an FDE. */
+    if (n > 0 && ((lib->symtab && lib->nsyms > 1) || lib->nextra_fn > 0)) {
+        size_t nfde = n;
+        qsort(tmp, nfde, sizeof *tmp, cmp_func_range);
+        if (lib->symtab && lib->nsyms > 1) {
+            for (i = 1; i < lib->nsyms; i++) {
+                const Elf64_Sym *s = &lib->symtab[i];
+                uint64_t s0, e0, sz;
+                size_t lo = 0, hi = nfde;
+                int overlap = 0;
+                if (s->st_shndx == SHN_UNDEF) continue;
+                sz = sym_inferred_size(lib, s);
+                if (!sz) continue;
+                s0 = (uint64_t)lib->bias + s->st_value;
+                e0 = s0 + sz;
+                if (e0 <= s0 || s0 < (uint64_t)(uintptr_t)lib->base || e0 > (uint64_t)(uintptr_t)lib->base + lib->size)
+                    continue;
+                while (lo < hi) {
+                    size_t mid = lo + (hi - lo) / 2;
+                    if ((uint64_t)(uintptr_t)tmp[mid].start <= s0) lo = mid + 1; else hi = mid;
+                }
+                if (lo > 0 && (uint64_t)(uintptr_t)tmp[lo - 1].start + tmp[lo - 1].size > s0) overlap = 1;
+                if (lo < nfde && (uint64_t)(uintptr_t)tmp[lo].start < e0) overlap = 1;
+                if (!overlap && n < cap) {
+                    tmp[n].start = (unsigned char *)(uintptr_t)s0;
+                    tmp[n].size  = (size_t)(e0 - s0);
+                    n++;
+                }
+            }
+        }
+        for (i = 0; i < (uint64_t)lib->nextra_fn; i++) {
+            uint64_t s0 = (uint64_t)lib->bias + lib->extra_fn_vaddr[i];
+            uint64_t sz = lib->extra_fn_size[i];
+            uint64_t e0 = s0 + sz;
+            size_t lo = 0, hi = nfde;
+            int overlap = 0;
+            if (!sz || e0 <= s0 || s0 < (uint64_t)(uintptr_t)lib->base || e0 > (uint64_t)(uintptr_t)lib->base + lib->size)
+                continue;
+            while (lo < hi) {
+                size_t mid = lo + (hi - lo) / 2;
+                if ((uint64_t)(uintptr_t)tmp[mid].start <= s0) lo = mid + 1; else hi = mid;
+            }
+            if (lo > 0 && (uint64_t)(uintptr_t)tmp[lo - 1].start + tmp[lo - 1].size > s0) overlap = 1;
+            if (lo < nfde && (uint64_t)(uintptr_t)tmp[lo].start < e0) overlap = 1;
+            if (!overlap && n < cap) {
+                tmp[n].start = (unsigned char *)(uintptr_t)s0;
+                tmp[n].size  = (size_t)(e0 - s0);
+                n++;
+            }
+        }
+        if (n > nfde) {
+            /* Sort and deduplicate any overlapping aliases */
+            size_t w = 0;
+            qsort(tmp, n, sizeof *tmp, cmp_func_range);
+            for (k = 0; k < n; k++) {
+                if (w > 0 && tmp[k].start < tmp[w - 1].start + tmp[w - 1].size) continue;
+                tmp[w++] = tmp[k];
+            }
+            n = w;
+        }
+    }
+    *starts = (unsigned char **)malloc((n ? n : 1) * sizeof **starts);
+    *sizes = (size_t *)malloc((n ? n : 1) * sizeof **sizes);
+    if (!*starts || !*sizes) { free(*starts); free(*sizes); *starts = NULL; *sizes = NULL; free(tmp); return 0; }
+    for (k = 0; k < n; k++) {
+        (*starts)[k] = tmp[k].start;
+        (*sizes)[k]  = tmp[k].size;
+    }
+    free(tmp);
+    return (int)n;
 }
 
 /*
@@ -263,9 +373,11 @@ int afw_func_landing_pads(const afw_lib *lib, uint64_t func, uint64_t *out, int 
     cur c;
     const unsigned char *cs_end;
     int n = 0, st;
-    if (!fde) return -1;                                   /* func came from this table: must exist */
+    if (!fde) return 0;                                    /* .dynsym function without an FDE: no LSDA */
     st = fde_parse(lib, fde, &s0, &e0, &lsda);
-    if (st == FDE_BAD || s0 != func) return -1;
+    if (st == FDE_BAD) return -1;
+    if (func < s0 || func >= e0) return 0;                 /* nearest FDE does not cover func: no LSDA */
+    if (s0 != func) return -1;
     if (st == FDE_OK) return 0;                            /* decoded: no exception table */
     c = image_cur(lib, (const unsigned char *)(uintptr_t)lsda);
     lp_enc = rd_u8(&c);

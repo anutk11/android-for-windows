@@ -49,7 +49,9 @@ _Static_assert(offsetof(afw_lnx_stat, st_ctime_s) == 104, "st_ctim offset");
 
 #define LNX_MAX_RW_COUNT 0x7ffff000u
 
-enum { FD_NONE = 0, FD_STDIO = 1, FD_FILE = 2 };
+#include <stdlib.h>
+
+enum { FD_NONE = 0, FD_STDIO = 1, FD_FILE = 2, FD_DEVNULL = 3, FD_MEMBUF = 4 };
 
 typedef struct {
     int         kind;
@@ -57,10 +59,98 @@ typedef struct {
     afw_os_file os;         /* OS handle for FD_FILE */
     int         flags;      /* LNX_F_STATUS_STORED_MASK (with LNX_O_LARGEFILE forced) */
     int         cloexec;
+    const char *mem_buf;    /* backing buffer for FD_MEMBUF */
+    size_t      mem_len;
+    size_t      mem_pos;
+    int         mem_owned;
 } fd_entry;
 
 static fd_entry g_fds[AFW_MAX_FDS];
 static int g_fds_init;
+
+static const char g_proc_cmdline[] = "g3_art_gate_exe\0";
+static const char g_proc_status[] =
+    "Name:\tg3_art_gate_exe\n"
+    "State:\tR (running)\n"
+    "Pid:\t1000\n"
+    "PPid:\t1\n"
+    "Uid:\t10000\t10000\t10000\t10000\n"
+    "Gid:\t10000\t10000\t10000\t10000\n"
+    "Threads:\t1\n";
+static const char g_proc_stat[] =
+    "1000 (g3_art_gate_exe) R 1 1000 1000 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0\n";
+static const char g_proc_cpuinfo[] =
+    "processor\t: 0\n"
+    "vendor_id\t: GenuineIntel\n"
+    "cpu family\t: 6\n"
+    "model name\t: Android-for-Windows x86_64\n"
+    "flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx lm constant_tsc ssse3 sse4_1 sse4_2 popcnt aes avx\n\n";
+static const char g_proc_meminfo[] =
+    "MemTotal:        8388608 kB\n"
+    "MemFree:         4194304 kB\n"
+    "MemAvailable:    4194304 kB\n";
+static const char g_sys_cpu_online[] = "0-3\n";
+static const char g_etc_hosts[] = "127.0.0.1 localhost\n::1 ip6-localhost\n";
+static const char g_etc_resolv[] = "nameserver 8.8.8.8\nnameserver 1.1.1.1\n";
+
+static int is_proc_maps_path(const char *path) {
+    const char *p;
+    if (strcmp(path, "/proc/self/maps") == 0) return 1;
+    if (strncmp(path, "/proc/", 6) != 0) return 0;
+    p = path + 6;
+    if (*p < '0' || *p > '9') return 0;
+    while (*p >= '0' && *p <= '9') p++;
+    return strcmp(p, "/maps") == 0;
+}
+
+/* Match synthetic virtual files needed by Android runtime on Windows.
+ * Returns FD_DEVNULL, FD_MEMBUF (setting *buf_out and *len_out), or 0 for real OS path. */
+static int match_virtual_path(const char *path, const char **buf_out, size_t *len_out) {
+    if (strcmp(path, "/dev/null") == 0) return FD_DEVNULL;
+    if (strcmp(path, "/proc/self/cmdline") == 0) {
+        if (buf_out) *buf_out = g_proc_cmdline;
+        if (len_out) *len_out = sizeof(g_proc_cmdline) - 1;
+        return FD_MEMBUF;
+    }
+    if (strcmp(path, "/proc/self/status") == 0) {
+        if (buf_out) *buf_out = g_proc_status;
+        if (len_out) *len_out = sizeof(g_proc_status) - 1;
+        return FD_MEMBUF;
+    }
+    if (strcmp(path, "/proc/self/stat") == 0) {
+        if (buf_out) *buf_out = g_proc_stat;
+        if (len_out) *len_out = sizeof(g_proc_stat) - 1;
+        return FD_MEMBUF;
+    }
+    if (strcmp(path, "/proc/cpuinfo") == 0) {
+        if (buf_out) *buf_out = g_proc_cpuinfo;
+        if (len_out) *len_out = sizeof(g_proc_cpuinfo) - 1;
+        return FD_MEMBUF;
+    }
+    if (strcmp(path, "/proc/meminfo") == 0) {
+        if (buf_out) *buf_out = g_proc_meminfo;
+        if (len_out) *len_out = sizeof(g_proc_meminfo) - 1;
+        return FD_MEMBUF;
+    }
+    if (strcmp(path, "/sys/devices/system/cpu/online") == 0 ||
+        strcmp(path, "/sys/devices/system/cpu/possible") == 0 ||
+        strcmp(path, "/sys/devices/system/cpu/present") == 0) {
+        if (buf_out) *buf_out = g_sys_cpu_online;
+        if (len_out) *len_out = sizeof(g_sys_cpu_online) - 1;
+        return FD_MEMBUF;
+    }
+    if (strcmp(path, "/etc/hosts") == 0 || strcmp(path, "/system/etc/hosts") == 0) {
+        if (buf_out) *buf_out = g_etc_hosts;
+        if (len_out) *len_out = sizeof(g_etc_hosts) - 1;
+        return FD_MEMBUF;
+    }
+    if (strcmp(path, "/etc/resolv.conf") == 0 || strcmp(path, "/system/etc/resolv.conf") == 0) {
+        if (buf_out) *buf_out = g_etc_resolv;
+        if (len_out) *len_out = sizeof(g_etc_resolv) - 1;
+        return FD_MEMBUF;
+    }
+    return 0;
+}
 
 /* Must be called with afw_fd_lock() held. */
 static void fds_ensure_init(void) {
@@ -116,7 +206,9 @@ static void fill_lnx_stat(const afw_os_stat_info *src, afw_lnx_stat *dst) {
 
 int64_t afw_fd_openat(int64_t dirfd, const char *path, int64_t flags, uint64_t mode) {
     int acc = (int)(flags & AFW_O_ACCMODE);
-    int os_flags, rc, slot = -1, i;
+    int os_flags, rc, slot = -1, i, vkind, vowned = 0;
+    const char *vbuf = NULL;
+    size_t vlen = 0;
     afw_os_file f = AFW_OS_FILE_INVALID;
 
     if (!path) return -LNX_EFAULT;
@@ -125,6 +217,44 @@ int64_t afw_fd_openat(int64_t dirfd, const char *path, int64_t flags, uint64_t m
         return -LNX_EINVAL;
     rc = check_dirfd(dirfd, path);
     if (rc != 0) return rc;
+
+    vkind = match_virtual_path(path, &vbuf, &vlen);
+    if (vkind == 0 && is_proc_maps_path(path)) {
+        char *mb = NULL;
+        size_t ml = 0;
+        if (afw_os_build_proc_maps(&mb, &ml) == 0) {
+            vkind = FD_MEMBUF;
+            vbuf = mb;
+            vlen = ml;
+            vowned = 1;
+        }
+    }
+    if (vkind != 0) {
+        if (flags & AFW_O_DIRECTORY) { if (vowned) free((void *)vbuf); return -20; } /* ENOTDIR */
+        if (vkind == FD_MEMBUF && acc != AFW_O_RDONLY) { if (vowned) free((void *)vbuf); return -13; } /* EACCES */
+        afw_fd_lock();
+        fds_ensure_init();
+        for (i = 0; i < AFW_MAX_FDS; i++) {
+            if (g_fds[i].kind == FD_NONE) { slot = i; break; }
+        }
+        if (slot < 0) {
+            afw_fd_unlock();
+            if (vowned) free((void *)vbuf);
+            return -LNX_EMFILE;
+        }
+        memset(&g_fds[slot], 0, sizeof g_fds[slot]);
+        g_fds[slot].kind    = vkind;
+        g_fds[slot].std_fd  = -1;
+        g_fds[slot].os      = AFW_OS_FILE_INVALID;
+        g_fds[slot].flags   = (int)(flags & LNX_F_STATUS_STORED_MASK) | LNX_O_LARGEFILE;
+        g_fds[slot].cloexec = (flags & LNX_O_CLOEXEC) ? 1 : 0;
+        g_fds[slot].mem_buf = vbuf;
+        g_fds[slot].mem_len = vlen;
+        g_fds[slot].mem_pos = 0;
+        g_fds[slot].mem_owned = vowned;
+        afw_fd_unlock();
+        return slot;
+    }
 
     os_flags = (int)(flags & (AFW_O_ACCMODE | AFW_O_CREAT | AFW_O_EXCL |
                               AFW_O_TRUNC | AFW_O_APPEND | AFW_O_DIRECTORY |
@@ -142,6 +272,7 @@ int64_t afw_fd_openat(int64_t dirfd, const char *path, int64_t flags, uint64_t m
         (void)afw_os_close(f);
         return -LNX_EMFILE;
     }
+    memset(&g_fds[slot], 0, sizeof g_fds[slot]);
     g_fds[slot].kind    = FD_FILE;
     g_fds[slot].std_fd  = -1;
     g_fds[slot].os      = f;
@@ -162,13 +293,14 @@ int64_t afw_fd_close(int64_t fd) {
     if (g_fds[fd].kind == FD_FILE) {
         afw_os_file f = g_fds[fd].os;
         rc = afw_os_close(f);
+    } else if (g_fds[fd].kind == FD_MEMBUF && g_fds[fd].mem_owned) {
+        free((void *)g_fds[fd].mem_buf);
     }
     /* Clear descriptor slot (for FD_STDIO we leave host handles intact for the loader). */
+    memset(&g_fds[fd], 0, sizeof g_fds[fd]);
     g_fds[fd].kind = FD_NONE;
     g_fds[fd].std_fd = -1;
     g_fds[fd].os = AFW_OS_FILE_INVALID;
-    g_fds[fd].flags = 0;
-    g_fds[fd].cloexec = 0;
     afw_fd_unlock();
     return rc;
 }
@@ -192,6 +324,21 @@ int64_t afw_fd_read(int64_t fd, void *buf, uint64_t len) {
         r = chunk ? afw_os_read(g_fds[fd].os, buf, chunk) : 0;
         afw_fd_unlock();
         return r;
+    }
+    if (kind == FD_DEVNULL) {
+        afw_fd_unlock();
+        return 0;
+    }
+    if (kind == FD_MEMBUF) {
+        size_t avail = g_fds[fd].mem_pos < g_fds[fd].mem_len
+                       ? g_fds[fd].mem_len - g_fds[fd].mem_pos : 0;
+        size_t n = chunk < avail ? chunk : avail;
+        if (n > 0) {
+            memcpy(buf, g_fds[fd].mem_buf + g_fds[fd].mem_pos, n);
+            g_fds[fd].mem_pos += n;
+        }
+        afw_fd_unlock();
+        return (int64_t)n;
     }
     afw_fd_unlock();
     if (std_fd != 0) return -LNX_EBADF;
@@ -218,6 +365,14 @@ int64_t afw_fd_write(int64_t fd, const void *buf, uint64_t len) {
         r = chunk ? afw_os_write(g_fds[fd].os, buf, chunk, append) : 0;
         afw_fd_unlock();
         return r;
+    }
+    if (kind == FD_DEVNULL) {
+        afw_fd_unlock();
+        return (int64_t)chunk;
+    }
+    if (kind == FD_MEMBUF) {
+        afw_fd_unlock();
+        return -LNX_EBADF;
     }
     if (std_fd != 1 && std_fd != 2) { afw_fd_unlock(); return -LNX_EBADF; }
     r = chunk ? afw_os_stdio_write(std_fd, buf, chunk, append) : 0;
@@ -271,6 +426,17 @@ int64_t afw_fd_lseek(int64_t fd, int64_t off, int64_t whence) {
     fds_ensure_init();
     if (!valid_fd_locked(fd)) { afw_fd_unlock(); return -LNX_EBADF; }
     if (g_fds[fd].kind == FD_STDIO) { afw_fd_unlock(); return -LNX_ESPIPE; }
+    if (g_fds[fd].kind == FD_DEVNULL) { afw_fd_unlock(); return 0; }
+    if (g_fds[fd].kind == FD_MEMBUF) {
+        int64_t base = (whence == AFW_SEEK_SET) ? 0
+                     : (whence == AFW_SEEK_CUR) ? (int64_t)g_fds[fd].mem_pos
+                                                : (int64_t)g_fds[fd].mem_len;
+        int64_t np = base + off;
+        if (np < 0) { afw_fd_unlock(); return -LNX_EINVAL; }
+        g_fds[fd].mem_pos = (size_t)np;
+        afw_fd_unlock();
+        return np;
+    }
     r = afw_os_lseek(g_fds[fd].os, off, (int)whence);
     afw_fd_unlock();
     return r;
@@ -284,10 +450,22 @@ int64_t afw_fd_fstat(int64_t fd, void *statbuf) {
     afw_fd_lock();
     fds_ensure_init();
     if (!valid_fd_locked(fd)) { afw_fd_unlock(); return -LNX_EBADF; }
-    if (g_fds[fd].kind == FD_STDIO)
+    if (g_fds[fd].kind == FD_STDIO) {
         rc = afw_os_stdio_stat(g_fds[fd].std_fd, &info);
-    else
+    } else if (g_fds[fd].kind == FD_DEVNULL) {
+        memset(&info, 0, sizeof info);
+        info.mode = 0020666u; /* S_IFCHR | 0666 */
+        info.nlink = 1;
+        rc = 0;
+    } else if (g_fds[fd].kind == FD_MEMBUF) {
+        memset(&info, 0, sizeof info);
+        info.mode = 0100444u; /* S_IFREG | 0444 */
+        info.nlink = 1;
+        info.size = (int64_t)g_fds[fd].mem_len;
+        rc = 0;
+    } else {
         rc = afw_os_fstat(g_fds[fd].os, &info);
+    }
     afw_fd_unlock();
     if (rc != 0) return rc;
     fill_lnx_stat(&info, &st);
@@ -298,7 +476,9 @@ int64_t afw_fd_fstat(int64_t fd, void *statbuf) {
 int64_t afw_fd_newfstatat(int64_t dirfd, const char *path, void *statbuf, int64_t flags) {
     afw_os_stat_info info;
     afw_lnx_stat st;
-    int rc;
+    int rc, vkind;
+    const char *vbuf = NULL;
+    size_t vlen = 0;
     if (!path || !statbuf) return -LNX_EFAULT;
     if (flags & ~(int64_t)(LNX_AT_SYMLINK_NOFOLLOW | LNX_AT_EMPTY_PATH))
         return -LNX_EINVAL;
@@ -307,6 +487,16 @@ int64_t afw_fd_newfstatat(int64_t dirfd, const char *path, void *statbuf, int64_
     if (path[0] == '\0') return -LNX_ENOENT;
     rc = check_dirfd(dirfd, path);
     if (rc != 0) return rc;
+    vkind = match_virtual_path(path, &vbuf, &vlen);
+    if (vkind != 0) {
+        memset(&info, 0, sizeof info);
+        info.mode = (vkind == FD_DEVNULL) ? 0020666u : 0100444u;
+        info.nlink = 1;
+        info.size = (vkind == FD_MEMBUF) ? (int64_t)vlen : 0;
+        fill_lnx_stat(&info, &st);
+        memcpy(statbuf, &st, sizeof st);
+        return 0;
+    }
     rc = afw_os_stat(path, (flags & LNX_AT_SYMLINK_NOFOLLOW) != 0, &info);
     if (rc != 0) return rc;
     fill_lnx_stat(&info, &st);
@@ -347,9 +537,12 @@ int64_t afw_fd_fcntl(int64_t fd, int64_t cmd, int64_t arg) {
             break;
         }
         want_append = (arg & AFW_O_APPEND) != 0;
-        rc = (g_fds[fd].kind == FD_FILE)
-             ? afw_os_set_append(g_fds[fd].os, want_append)
-             : afw_os_stdio_set_append(g_fds[fd].std_fd, want_append);
+        if (g_fds[fd].kind == FD_FILE)
+            rc = afw_os_set_append(g_fds[fd].os, want_append);
+        else if (g_fds[fd].kind == FD_STDIO)
+            rc = afw_os_stdio_set_append(g_fds[fd].std_fd, want_append);
+        else
+            rc = 0;
         if (rc != 0) {
             r = rc;
             break;
@@ -364,6 +557,83 @@ int64_t afw_fd_fcntl(int64_t fd, int64_t cmd, int64_t arg) {
     }
     afw_fd_unlock();
     return r;
+}
+
+int64_t afw_fd_pread(int64_t fd, void *buf, uint64_t len, int64_t off) {
+    int acc, kind;
+    int64_t saved, r;
+    size_t chunk;
+
+    if (off < 0) return -LNX_EINVAL;
+    if (len > 0 && !buf) return -LNX_EFAULT;
+    chunk = len > LNX_MAX_RW_COUNT ? LNX_MAX_RW_COUNT : (size_t)len;
+
+    afw_fd_lock();
+    fds_ensure_init();
+    if (!valid_fd_locked(fd)) { afw_fd_unlock(); return -LNX_EBADF; }
+    acc = g_fds[fd].flags & AFW_O_ACCMODE;
+    if (acc == AFW_O_WRONLY) { afw_fd_unlock(); return -LNX_EBADF; }
+    kind = g_fds[fd].kind;
+    if (kind == FD_STDIO) { afw_fd_unlock(); return -LNX_ESPIPE; }
+    if (kind == FD_DEVNULL) { afw_fd_unlock(); return 0; }
+    if (kind == FD_MEMBUF) {
+        size_t pos = (uint64_t)off < g_fds[fd].mem_len ? (size_t)off : g_fds[fd].mem_len;
+        size_t avail = g_fds[fd].mem_len - pos;
+        size_t n = chunk < avail ? chunk : avail;
+        if (n > 0) memcpy(buf, g_fds[fd].mem_buf + pos, n);
+        afw_fd_unlock();
+        return (int64_t)n;
+    }
+    saved = afw_os_lseek(g_fds[fd].os, 0, AFW_SEEK_CUR);
+    if (saved < 0) { afw_fd_unlock(); return saved; }
+    r = afw_os_lseek(g_fds[fd].os, off, AFW_SEEK_SET);
+    if (r < 0) { afw_fd_unlock(); return r; }
+    r = chunk ? afw_os_read(g_fds[fd].os, buf, chunk) : 0;
+    (void)afw_os_lseek(g_fds[fd].os, saved, AFW_SEEK_SET);
+    afw_fd_unlock();
+    return r;
+}
+
+int64_t afw_fd_pwrite(int64_t fd, const void *buf, uint64_t len, int64_t off) {
+    int acc, kind;
+    int64_t saved, r;
+    size_t chunk;
+
+    if (off < 0) return -LNX_EINVAL;
+    if (len > 0 && !buf) return -LNX_EFAULT;
+    chunk = len > LNX_MAX_RW_COUNT ? LNX_MAX_RW_COUNT : (size_t)len;
+
+    afw_fd_lock();
+    fds_ensure_init();
+    if (!valid_fd_locked(fd)) { afw_fd_unlock(); return -LNX_EBADF; }
+    acc = g_fds[fd].flags & AFW_O_ACCMODE;
+    if (acc == AFW_O_RDONLY) { afw_fd_unlock(); return -LNX_EBADF; }
+    kind = g_fds[fd].kind;
+    if (kind == FD_STDIO) { afw_fd_unlock(); return -LNX_ESPIPE; }
+    if (kind == FD_DEVNULL) { afw_fd_unlock(); return (int64_t)chunk; }
+    if (kind == FD_MEMBUF) { afw_fd_unlock(); return -LNX_EBADF; }
+    saved = afw_os_lseek(g_fds[fd].os, 0, AFW_SEEK_CUR);
+    if (saved < 0) { afw_fd_unlock(); return saved; }
+    r = afw_os_lseek(g_fds[fd].os, off, AFW_SEEK_SET);
+    if (r < 0) { afw_fd_unlock(); return r; }
+    r = chunk ? afw_os_write(g_fds[fd].os, buf, chunk, 0) : 0;
+    (void)afw_os_lseek(g_fds[fd].os, saved, AFW_SEEK_SET);
+    afw_fd_unlock();
+    return r;
+}
+
+int64_t afw_fd_faccessat(int64_t dirfd, const char *path, int64_t mode, int64_t flags) {
+    afw_os_stat_info info;
+    int rc;
+    if (!path) return -LNX_EFAULT;
+    if (path[0] == '\0') return -LNX_ENOENT;
+    if (mode & ~(int64_t)7) return -LNX_EINVAL;
+    if (flags & ~(int64_t)(LNX_AT_SYMLINK_NOFOLLOW | 0x200)) return -LNX_EINVAL;
+    rc = check_dirfd(dirfd, path);
+    if (rc != 0) return rc;
+    if (match_virtual_path(path, NULL, NULL) != 0) return 0;
+    rc = afw_os_stat(path, (flags & LNX_AT_SYMLINK_NOFOLLOW) != 0, &info);
+    return rc == 0 ? 0 : rc;
 }
 
 int afw_fd_inspect_for_mmap_locked(int fd, intptr_t *os_out, int64_t *size_out) {

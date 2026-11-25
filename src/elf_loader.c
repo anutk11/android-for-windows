@@ -32,6 +32,7 @@ typedef SYSV void (*init_fn)(void);
 int afw_load_patch_only;
 int afw_load_allow_unproven;
 int afw_attest_dump;
+int afw_load_enable_art_gs;
 
 int afw_gate_ok(const afw_lib *lib) {
     const afw_patch_report *r = &lib->patch;
@@ -39,9 +40,10 @@ int afw_gate_ok(const afw_lib *lib) {
            !r->fs_unsupported &&
            !r->gs_unsupported && !r->gs_outside_functions &&   /* gs: is the TEB on Windows (issue #15) */
            !r->fs_outside_functions &&   /* fs: look-alikes outside .eh_frame (reviewer 4); measured 0 in bionic */
-           /* every fs:[reg] must really be rewritten (Windows); measurement mode
+           /* every fs:[reg] and ART gs: must really be rewritten (Windows); measurement mode
             * reports what Windows would do */
-           (afw_load_patch_only || r->fs_reg_trampolined == r->fs_reg_feasible);
+           (afw_load_patch_only || r->fs_reg_trampolined == r->fs_reg_feasible) &&
+           (afw_load_patch_only || r->gs_trampolined == r->gs_feasible);
 }
 
 #define MAX_LIBS AFW_MAX_LIBS
@@ -107,8 +109,19 @@ int afw_describe_address(uintptr_t addr, char *out, size_t outsz) {
     return 0;
 }
 
+static const char *translate_drv_path(const char *path, char *buf, size_t bufsz) {
+    if (path && strncmp(path, "/__afw_drv__/", 13) == 0 &&
+        ((path[13] >= 'A' && path[13] <= 'Z') || (path[13] >= 'a' && path[13] <= 'z')) &&
+        (path[14] == '/' || path[14] == '\0')) {
+        snprintf(buf, bufsz, "%c:%s", path[13], path[14] ? path + 14 : "/");
+        return buf;
+    }
+    return path;
+}
+
 static unsigned char *read_file(const char *path, size_t *out_size) {
-    FILE *f = fopen(path, "rb");
+    char pbuf[1200];
+    FILE *f = fopen(translate_drv_path(path, pbuf, sizeof pbuf), "rb");
     unsigned char *buf;
     long n;
     if (!f) return NULL;
@@ -548,6 +561,8 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
     unsigned char *imp_ifunc;
     unsigned char *pageprot;
     size_t npages;
+    uint64_t bcm_t0 = 0, bcm_t1 = 0, bcm_r0 = 0, bcm_r1 = 0, bcm_hash = 0;
+    int bcm_mode = 0;
 
     memset(lib, 0, sizeof(*lib));
     lib->path = path;
@@ -596,7 +611,7 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
      * only these, not whole PT_LOAD segments that also hold .dynstr/.rodata */
     if (eh->e_shoff && eh->e_shnum && eh->e_shoff + (uint64_t)eh->e_shnum * sizeof(Elf64_Shdr) <= fsize) {
         const Elf64_Shdr *sh = (const Elf64_Shdr *)(file + eh->e_shoff);
-        for (i = 0; i < eh->e_shnum; i++)
+        for (i = 0; i < eh->e_shnum; i++) {
             if ((sh[i].sh_flags & (SHF_ALLOC | SHF_EXECINSTR)) == (SHF_ALLOC | SHF_EXECINSTR) && sh[i].sh_size) {
                 if (lib->nxsec < 16) {
                     lib->xsec_vaddr[lib->nxsec] = sh[i].sh_addr;
@@ -606,6 +621,45 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
                     lib->xsec_truncated = 1;
                 }
             }
+            if (sh[i].sh_type == 2 /* SHT_SYMTAB */ && sh[i].sh_entsize == sizeof(Elf64_Sym) &&
+                sh[i].sh_offset <= fsize && sh[i].sh_size <= fsize - sh[i].sh_offset &&
+                sh[i].sh_link < eh->e_shnum) {
+                const Elf64_Shdr *strsh = &sh[sh[i].sh_link];
+                if (strsh->sh_offset <= fsize && strsh->sh_size <= fsize - strsh->sh_offset) {
+                    const Elf64_Sym *syms = (const Elf64_Sym *)(file + sh[i].sh_offset);
+                    size_t nsym = (size_t)(sh[i].sh_size / sizeof(Elf64_Sym));
+                    const char *strs = (const char *)(file + strsh->sh_offset);
+                    size_t strsz = (size_t)strsh->sh_size, j, k;
+                    for (j = 1; j < nsym && lib->nextra_fn < 16; j++) {
+                        const char *nm;
+                        char end_nm[160];
+                        size_t nlen;
+                        if (syms[j].st_shndx == SHN_UNDEF || syms[j].st_name >= strsz) continue;
+                        nm = strs + syms[j].st_name;
+                        if (strncmp(nm, "ExecuteNterp", 12) != 0) continue;
+                        {
+                            size_t rem = strsz - syms[j].st_name;
+                            const char *nul = (const char *)memchr(nm, '\0', rem);
+                            if (!nul) continue;
+                            nlen = (size_t)(nul - nm);
+                            if (nlen + 4 > sizeof end_nm) continue;
+                        }
+                        memcpy(end_nm, "End", 3);
+                        memcpy(end_nm + 3, nm, nlen + 1);
+                        for (k = 1; k < nsym; k++) {
+                            if (syms[k].st_shndx == SHN_UNDEF || syms[k].st_name >= strsz) continue;
+                            if (syms[k].st_value > syms[j].st_value &&
+                                strncmp(strs + syms[k].st_name, end_nm, strsz - syms[k].st_name) == 0) {
+                                lib->extra_fn_vaddr[lib->nextra_fn] = syms[j].st_value;
+                                lib->extra_fn_size[lib->nextra_fn]  = syms[k].st_value - syms[j].st_value;
+                                lib->nextra_fn++;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /* 2. Map segments ------------------------------------------------ */
@@ -939,6 +993,7 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
         pc.attest = afw_attest_for(lib->sha256, lib->attest_buf, (int)(sizeof lib->attest_buf / sizeof lib->attest_buf[0]), &pc.nattest);
         pc.readonly = patch_readonly;
         pc.attest_dump = afw_attest_dump;
+        pc.enable_art_gs = afw_load_enable_art_gs;
         lib->load_prot = pageprot; lib->load_npages = npages;
         if (pc.nattest < 0) {
             fprintf(stderr, "error: attestation table for %s cannot be read; refusing to run it\n", path);
@@ -946,12 +1001,110 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
             free(cr); free(pageprot); return -1;
         }
         pc.readable = patch_readable;
+        /* If this library exports BoringSSL FIPS module bounds (e.g. libcrypto.so),
+         * compute the unpatched HMAC-SHA256, locate the exact 32-byte stored digest
+         * outside the hashed ranges, and update it after our fs:/gs: rewrites. */
         {
-            int prc = afw_patch_code(cr, ncr, lib->stub_area, AFW_STUB_RESERVE, &pc, &lib->patch, verbose);
-            lib->load_prot = NULL; lib->load_npages = 0;   /* pageprot is freed below */
-            if (prc < 0) {
-                fprintf(stderr, "error: could not patch %s safely; refusing to run it\n", path);
-                free(cr); free(pageprot); return -1;
+            uint8_t *bcm_hash_ptr = NULL;
+            if ((!bcm_t0 || !bcm_t1) && lib->symtab && lib->strtab) {
+                for (i = 1; i < lib->nsyms; i++) {
+                    const Elf64_Sym *s = &lib->symtab[i];
+                    const char *nm;
+                    if (s->st_shndx == SHN_UNDEF || !s->st_name) continue;
+                    nm = lib->strtab + s->st_name;
+                    if (strncmp(nm, "BORINGSSL_bcm_", 14) != 0) continue;
+                    if (strcmp(nm, "BORINGSSL_bcm_text_start") == 0)        bcm_t0 = s->st_value;
+                    else if (strcmp(nm, "BORINGSSL_bcm_text_end") == 0)     bcm_t1 = s->st_value;
+                    else if (strcmp(nm, "BORINGSSL_bcm_rodata_start") == 0) bcm_r0 = s->st_value;
+                    else if (strcmp(nm, "BORINGSSL_bcm_rodata_end") == 0)   bcm_r1 = s->st_value;
+                    else if (strcmp(nm, "BORINGSSL_bcm_text_hash") == 0)    bcm_hash = s->st_value;
+                }
+            }
+            if (bcm_t1 > bcm_t0) {
+                uint64_t t0 = (uint64_t)lib->bias + bcm_t0, t1 = (uint64_t)lib->bias + bcm_t1;
+                uint64_t r0 = (uint64_t)lib->bias + bcm_r0, r1 = (uint64_t)lib->bias + bcm_r1;
+                uint64_t lo_a = (uint64_t)(uintptr_t)lib->base, hi_a = lo_a + lib->size;
+                if (t0 >= lo_a && t1 <= hi_a) {
+                    uint64_t tlen = t1 - t0;
+                    uint64_t rlen = (bcm_r1 > bcm_r0 && r0 >= lo_a && r1 <= hi_a) ? (r1 - r0) : 0;
+                    uint8_t got[32];
+                    int m;
+                    for (m = 1; m <= 4 && !bcm_mode; m++) {
+                        const void *ptrs[4]; size_t lens[4]; int ns = 0;
+                        if (m == 1 && rlen) {
+                            ptrs[0] = &tlen; lens[0] = 8;
+                            ptrs[1] = (const void *)(uintptr_t)t0; lens[1] = (size_t)tlen;
+                            ptrs[2] = &rlen; lens[2] = 8;
+                            ptrs[3] = (const void *)(uintptr_t)r0; lens[3] = (size_t)rlen;
+                            ns = 4;
+                        } else if (m == 2) {
+                            ptrs[0] = (const void *)(uintptr_t)t0; lens[0] = (size_t)tlen; ns = 1;
+                        } else if (m == 3 && rlen) {
+                            ptrs[0] = (const void *)(uintptr_t)t0; lens[0] = (size_t)tlen;
+                            ptrs[1] = (const void *)(uintptr_t)r0; lens[1] = (size_t)rlen;
+                            ns = 2;
+                        } else if (m == 4) {
+                            ptrs[0] = &tlen; lens[0] = 8;
+                            ptrs[1] = (const void *)(uintptr_t)t0; lens[1] = (size_t)tlen;
+                            ns = 2;
+                        } else continue;
+                        afw_hmac_sha256_zero_key_slices(ptrs, lens, ns, got);
+                        if (bcm_hash) {
+                            uint64_t hp = (uint64_t)lib->bias + bcm_hash;
+                            if (hp >= lo_a && hp + 32 <= hi_a &&
+                                memcmp((const void *)(uintptr_t)hp, got, 32) == 0) {
+                                bcm_mode = m;
+                                bcm_hash_ptr = (uint8_t *)(uintptr_t)hp;
+                            }
+                        } else {
+                            size_t off;
+                            for (off = 0; off + 32 <= lib->size; off += 4) {
+                                uint64_t p = lo_a + off;
+                                if ((p + 32 > t0 && p < t1) || (rlen && p + 32 > r0 && p < r1))
+                                    continue;
+                                if (lib->base[off] == got[0] && memcmp(lib->base + off, got, 32) == 0) {
+                                    bcm_mode = m;
+                                    bcm_hash_ptr = lib->base + off;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            {
+                int prc = afw_patch_code(cr, ncr, lib->stub_area, AFW_STUB_RESERVE, &pc, &lib->patch, verbose);
+                lib->load_prot = NULL; lib->load_npages = 0;   /* pageprot is freed below */
+                if (prc < 0) {
+                    fprintf(stderr, "error: could not patch %s safely; refusing to run it\n", path);
+                    free(cr); free(pageprot); return -1;
+                }
+            }
+            if (bcm_mode && bcm_hash_ptr) {
+                uint64_t t0 = (uint64_t)lib->bias + bcm_t0, t1 = (uint64_t)lib->bias + bcm_t1;
+                uint64_t r0 = (uint64_t)lib->bias + bcm_r0, r1 = (uint64_t)lib->bias + bcm_r1;
+                uint64_t tlen = t1 - t0, rlen = (bcm_r1 > bcm_r0) ? (r1 - r0) : 0;
+                const void *ptrs[4]; size_t lens[4]; int ns = 0;
+                uint8_t updated[32];
+                if (bcm_mode == 1) {
+                    ptrs[0] = &tlen; lens[0] = 8;
+                    ptrs[1] = (const void *)(uintptr_t)t0; lens[1] = (size_t)tlen;
+                    ptrs[2] = &rlen; lens[2] = 8;
+                    ptrs[3] = (const void *)(uintptr_t)r0; lens[3] = (size_t)rlen;
+                    ns = 4;
+                } else if (bcm_mode == 2) {
+                    ptrs[0] = (const void *)(uintptr_t)t0; lens[0] = (size_t)tlen; ns = 1;
+                } else if (bcm_mode == 3) {
+                    ptrs[0] = (const void *)(uintptr_t)t0; lens[0] = (size_t)tlen;
+                    ptrs[1] = (const void *)(uintptr_t)r0; lens[1] = (size_t)rlen;
+                    ns = 2;
+                } else {
+                    ptrs[0] = &tlen; lens[0] = 8;
+                    ptrs[1] = (const void *)(uintptr_t)t0; lens[1] = (size_t)tlen;
+                    ns = 2;
+                }
+                afw_hmac_sha256_zero_key_slices(ptrs, lens, ns, updated);
+                memcpy(bcm_hash_ptr, updated, 32);
             }
         }
         free(cr);
@@ -1276,10 +1429,12 @@ void *afw_global_sym(const char *name) {
 int afw_find_lib(const char *name, char *out, size_t outsz) {
     char dir[1024];
     if (strchr(name, '/') || strchr(name, '\\')) {
-        FILE *t = fopen(name, "rb");
+        char pbuf[1200];
+        const char *real = translate_drv_path(name, pbuf, sizeof pbuf);
+        FILE *t = fopen(real, "rb");
         if (!t) return 0;
         fclose(t);
-        snprintf(out, outsz, "%s", name);
+        snprintf(out, outsz, "%s", real);
         return 1;
     }
     /* AFW_LIB_PATH, then the directory of the first library loaded */
@@ -1310,13 +1465,19 @@ static int already_loaded(const char *name) {
 }
 
 /* Find name in the search path: the directories in AFW_LIB_PATH (';' or ':'
- * separated), then dir. */
+ * separated, preserving Windows drive letters like C:\), then dir. */
 static int find_lib(const char *name, const char *dir, char *out, size_t outsz) {
     const char *env = getenv("AFW_LIB_PATH");
     char d[1024];
     FILE *t;
     while (env && *env) {
-        size_t l = strcspn(env, ";:");
+        size_t l = 0;
+        while (env[l]) {
+            if (env[l] == ';') break;
+            if (env[l] == ':' && !(l == 1 && ((env[0] >= 'A' && env[0] <= 'Z') || (env[0] >= 'a' && env[0] <= 'z'))))
+                break;
+            l++;
+        }
         if (l && l < sizeof d) {
             memcpy(d, env, l); d[l] = 0;
             snprintf(out, outsz, "%s/%s", d, name);

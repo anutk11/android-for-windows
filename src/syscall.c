@@ -20,16 +20,20 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
+#include <sched.h>
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <time.h>
 #endif
 
-#define LNX_ENOSYS 38
+#define LNX_ENOENT 2
+#define LNX_ESRCH 3
 #define LNX_EBADF 9
 #define LNX_EAGAIN 11
-#define LNX_EINVAL 22
 #define LNX_EFAULT 14
+#define LNX_EINVAL 22
+#define LNX_ERANGE 34
+#define LNX_ENOSYS 38
 #define LNX_ETIMEDOUT 110
 
 #if defined(_WIN32)
@@ -266,9 +270,16 @@ static int64_t sys_futex(int64_t uaddr, int64_t op_full, int64_t val, int64_t ts
         else WakeByAddressAll((PVOID)p);
         return 0;
     }
+    if (op == 3 /* FUTEX_REQUEUE */ || op == 4 /* FUTEX_CMP_REQUEUE */) {
+        if ((int32_t)val < 0 || (int32_t)ts < 0) return -LNX_EINVAL;
+        if (op == 4 && *p != (int32_t)val3) return -LNX_EAGAIN;
+        if ((int32_t)val > 0 || (int32_t)ts > 0) WakeByAddressAll((PVOID)p);
+        return 0;
+    }
     return -LNX_ENOSYS;
 #else
-    if (op != FUTEX_WAIT && op != FUTEX_WAKE && op != FUTEX_WAIT_BITSET && op != FUTEX_WAKE_BITSET)
+    if (op != FUTEX_WAIT && op != FUTEX_WAKE && op != FUTEX_WAIT_BITSET && op != FUTEX_WAKE_BITSET &&
+        op != 3 /* FUTEX_REQUEUE */ && op != 4 /* FUTEX_CMP_REQUEUE */)
         return -LNX_ENOSYS;
     {   /* host build: the real futex, same semantics */
         long r = syscall(SYS_futex, p, (int)op_full, (int)val, (void *)(uintptr_t)ts, (void *)(uintptr_t)uaddr2, (int)val3);
@@ -321,6 +332,447 @@ static int64_t sys_rt_sigprocmask(int how, const void *set, void *oldset, uint64
     if (oldset) memcpy(oldset, &prev, 8);
     return 0;
 }
+
+/* ---- signals: rt_sigaction(13) & sigaltstack(131) ----------------------- */
+struct lnx_kernel_sigaction {
+    uint64_t sa_handler;
+    uint64_t sa_flags;
+    uint64_t sa_restorer;
+    uint64_t sa_mask;
+};
+_Static_assert(sizeof(struct lnx_kernel_sigaction) == 32, "kernel_sigaction must be 32 bytes");
+
+struct lnx_stack_t {
+    uint64_t ss_sp;
+    int32_t  ss_flags;
+    int32_t  __pad;
+    uint64_t ss_size;
+};
+_Static_assert(sizeof(struct lnx_stack_t) == 24, "stack_t must be 24 bytes");
+
+static struct lnx_kernel_sigaction g_sigactions[65];
+static int32_t g_sigaction_spin;
+static _Thread_local struct lnx_stack_t t_altstack = { 0, 2 /* SS_DISABLE */, 0, 0 };
+static _Thread_local char t_thread_comm[16] = "android-app";
+
+static void sigaction_lock(void) {
+    while (afw_os_atomic_cmpxchg_i32(&g_sigaction_spin, 0, 1) != 0) {}
+}
+static void sigaction_unlock(void) {
+    afw_os_atomic_store_i32(&g_sigaction_spin, 0);
+}
+
+static int64_t sys_rt_sigaction(int64_t signum, const void *act, void *oldact, uint64_t sigsetsize) {
+    if (sigsetsize != 8 || signum < 1 || signum > 64) return -LNX_EINVAL;
+    if (act && (signum == 9 || signum == 19)) return -LNX_EINVAL;
+    sigaction_lock();
+    if (oldact) memcpy(oldact, &g_sigactions[signum], sizeof g_sigactions[signum]);
+    if (act)    memcpy(&g_sigactions[signum], act, sizeof g_sigactions[signum]);
+    sigaction_unlock();
+    return 0;
+}
+
+static int64_t sys_sigaltstack(const void *ss, void *old_ss) {
+    if (old_ss) memcpy(old_ss, &t_altstack, sizeof t_altstack);
+    if (ss) {
+        struct lnx_stack_t ns;
+        memcpy(&ns, ss, sizeof ns);
+        if (ns.ss_flags & 2 /* SS_DISABLE */) {
+            t_altstack.ss_sp = 0;
+            t_altstack.ss_flags = 2;
+            t_altstack.ss_size = 0;
+        } else {
+            if (ns.ss_size < 2048) return -12; /* ENOMEM */
+            t_altstack.ss_sp = ns.ss_sp;
+            t_altstack.ss_flags = ns.ss_flags & ~1;
+            t_altstack.ss_size = ns.ss_size;
+        }
+    }
+    return 0;
+}
+
+/* ---- rt_sigtimedwait(128) & tgkill(234) wakeup (ART SignalCatcher) ------ */
+typedef struct {
+    int32_t tid;
+    int32_t pending_sig;
+} afw_sigwait_slot;
+
+static afw_sigwait_slot g_sigwait[64];
+static int32_t g_sigwait_spin;
+
+static afw_sigwait_slot *sigwait_slot_for(int32_t tid) {
+    int i, free_idx = -1;
+    while (afw_os_atomic_cmpxchg_i32(&g_sigwait_spin, 0, 1) != 0) {}
+    for (i = 0; i < 64; i++) {
+        if (g_sigwait[i].tid == tid) {
+            afw_os_atomic_store_i32(&g_sigwait_spin, 0);
+            return &g_sigwait[i];
+        }
+        if (free_idx < 0 && g_sigwait[i].tid == 0) free_idx = i;
+    }
+    if (free_idx >= 0) {
+        g_sigwait[free_idx].tid = tid;
+        g_sigwait[free_idx].pending_sig = 0;
+        afw_os_atomic_store_i32(&g_sigwait_spin, 0);
+        return &g_sigwait[free_idx];
+    }
+    afw_os_atomic_store_i32(&g_sigwait_spin, 0);
+    return NULL;
+}
+
+static int64_t sys_tgkill_deliver(int64_t tid, int64_t sig) {
+    afw_sigwait_slot *s;
+    if (sig == 0) return 0;
+    if (sig < 0 || sig > 64) return -LNX_EINVAL;
+    s = sigwait_slot_for((int32_t)tid);
+    if (s) {
+        afw_os_atomic_store_i32(&s->pending_sig, (int32_t)sig);
+        afw_os_wake_address_all(&s->pending_sig);
+    }
+    return 0;
+}
+
+static int64_t sys_rt_sigtimedwait(const void *uthese, void *uinfo,
+                                   const struct lnx_timespec *uts, uint64_t sigsetsize) {
+    uint64_t mask = 0;
+    afw_sigwait_slot *s;
+    if (sigsetsize != 8) return -LNX_EINVAL;
+    if (!uthese) return -LNX_EFAULT;
+    memcpy(&mask, uthese, 8);
+    s = sigwait_slot_for((int32_t)sys_gettid());
+    if (!s) return -LNX_EAGAIN;
+    for (;;) {
+        int32_t cur = afw_os_atomic_load_i32(&s->pending_sig);
+        if (cur >= 1 && cur <= 64) {
+            if (afw_os_atomic_cmpxchg_i32(&s->pending_sig, cur, 0) == cur) {
+                if (mask & (1ULL << (cur - 1))) {
+                    if (uinfo) {
+                        memset(uinfo, 0, 128);
+                        memcpy(uinfo, &cur, 4); /* si_signo */
+                    }
+                    return (int64_t)cur;
+                }
+            }
+            continue;
+        }
+        {
+            int64_t wr = sys_futex((int64_t)(uintptr_t)&s->pending_sig, FUTEX_WAIT, 0,
+                                   (int64_t)(uintptr_t)uts, 0, 0);
+            if (wr == -LNX_ETIMEDOUT) return -LNX_EAGAIN;
+            if (wr < 0 && wr != -LNX_EAGAIN) return wr;
+        }
+    }
+}
+
+/* ---- uname(63) ---------------------------------------------------------- */
+struct lnx_utsname {
+    char sysname[65];
+    char nodename[65];
+    char release[65];
+    char version[65];
+    char machine[65];
+    char domainname[65];
+};
+_Static_assert(sizeof(struct lnx_utsname) == 390, "struct new_utsname must be 390 bytes");
+
+static int64_t sys_uname(void *buf) {
+    struct lnx_utsname u;
+    if (!buf) return -LNX_EFAULT;
+    memset(&u, 0, sizeof u);
+    strcpy(u.sysname,    "Linux");
+    strcpy(u.nodename,   "android-win");
+    strcpy(u.release,    "6.1.0-android14-afw");
+    strcpy(u.version,    "#1 SMP PREEMPT");
+    strcpy(u.machine,    "x86_64");
+    strcpy(u.domainname, "(none)");
+    memcpy(buf, &u, sizeof u);
+    return 0;
+}
+
+/* ---- prctl(157) --------------------------------------------------------- */
+static int64_t sys_prctl(int64_t opt, int64_t a2, int64_t a3, int64_t a4, int64_t a5) {
+    (void)a3; (void)a4; (void)a5;
+    switch (opt) {
+    case 0x53564d41: /* PR_SET_VMA */
+        return 0;
+    case 15: /* PR_SET_NAME */ {
+        const char *name = (const char *)(uintptr_t)a2;
+        if (!name) return -LNX_EFAULT;
+        strncpy(t_thread_comm, name, sizeof(t_thread_comm) - 1);
+        t_thread_comm[sizeof(t_thread_comm) - 1] = '\0';
+        return 0;
+    }
+    case 16: /* PR_GET_NAME */ {
+        char *out = (char *)(uintptr_t)a2;
+        if (!out) return -LNX_EFAULT;
+        memcpy(out, t_thread_comm, sizeof t_thread_comm);
+        return 0;
+    }
+    case 3:  /* PR_GET_DUMPABLE */ return 1;
+    case 4:  /* PR_SET_DUMPABLE */ return 0;
+    case 38: /* PR_SET_NO_NEW_PRIVS */ return 0;
+    case 39: /* PR_GET_NO_NEW_PRIVS */ return 0;
+    case 56: /* PR_GET_TAGGED_ADDR_CTRL */ return 0;
+    default:
+        return -LNX_EINVAL;
+    }
+}
+
+/* ---- rlimit(97/160/302) ------------------------------------------------- */
+struct lnx_rlimit64 {
+    uint64_t rlim_cur;
+    uint64_t rlim_max;
+};
+
+static int64_t sys_prlimit64(int64_t pid, int64_t res, const void *new_lim, void *old_lim) {
+    (void)new_lim;
+    if (pid != 0 && pid != sys_getpid()) return -LNX_ESRCH;
+    if (res < 0 || res >= 16) return -LNX_EINVAL;
+    if (old_lim) {
+        struct lnx_rlimit64 rl;
+        switch (res) {
+        case 3: /* RLIMIT_STACK */
+            rl.rlim_cur = 8ULL * 1024ULL * 1024ULL;
+            rl.rlim_max = ~0ULL;
+            break;
+        case 4: /* RLIMIT_CORE */
+            rl.rlim_cur = 0;
+            rl.rlim_max = 0;
+            break;
+        case 7: /* RLIMIT_NOFILE */
+            rl.rlim_cur = AFW_MAX_FDS;
+            rl.rlim_max = 4096;
+            break;
+        default:
+            rl.rlim_cur = ~0ULL;
+            rl.rlim_max = ~0ULL;
+            break;
+        }
+        memcpy(old_lim, &rl, sizeof rl);
+    }
+    return 0;
+}
+
+/* ---- sched & cpu: sched_getaffinity(204), sched_yield(24), getcpu(309) -- */
+static int64_t sys_sched_getaffinity(int64_t pid, uint64_t cpusetsize, void *mask) {
+    uint64_t bits = 0;
+    unsigned ncpu = 1;
+    (void)pid;
+    if (!mask) return -LNX_EFAULT;
+    if (cpusetsize < 8) return -LNX_EINVAL;
+#if defined(_WIN32)
+    {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        if (si.dwNumberOfProcessors > 0) ncpu = (unsigned)si.dwNumberOfProcessors;
+    }
+#else
+    {
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        if (n > 0) ncpu = (unsigned)n;
+    }
+#endif
+    if (ncpu > 64) ncpu = 64;
+    bits = (ncpu == 64) ? ~0ULL : ((1ULL << ncpu) - 1ULL);
+    memset(mask, 0, cpusetsize > 128 ? 128 : (size_t)cpusetsize);
+    memcpy(mask, &bits, sizeof bits);
+    return 8;
+}
+
+static int64_t sys_sched_yield(void) {
+#if defined(_WIN32)
+    SwitchToThread();
+#else
+    sched_yield();
+#endif
+    return 0;
+}
+
+static int64_t sys_getcpu(uint32_t *cpu, uint32_t *node) {
+    if (cpu)  *cpu  = 0;
+    if (node) *node = 0;
+    return 0;
+}
+
+/* ---- getcwd(79) & readlinkat(89/267) ------------------------------------ */
+static int64_t sys_getcwd(char *buf, uint64_t size) {
+    char tmp[4096];
+    size_t len;
+    if (!buf) return -LNX_EFAULT;
+    if (size == 0) return -LNX_EINVAL;
+#if defined(_WIN32)
+    {
+        DWORD n = GetCurrentDirectoryA((DWORD)sizeof(tmp), tmp);
+        DWORD i;
+        if (n == 0 || n >= sizeof(tmp)) return -LNX_ERANGE;
+        for (i = 0; i < n; i++) if (tmp[i] == '\\') tmp[i] = '/';
+        len = (size_t)n;
+    }
+#else
+    if (!getcwd(tmp, sizeof tmp)) return -(int64_t)errno;
+    len = strlen(tmp);
+#endif
+    if (len + 1 > size) return -LNX_ERANGE;
+    memcpy(buf, tmp, len + 1);
+    return (int64_t)(len + 1);
+}
+
+static int64_t sys_readlinkat(int64_t dirfd, const char *path, char *buf, int64_t bufsiz) {
+    (void)dirfd;
+    if (!path || !buf) return -LNX_EFAULT;
+    if (bufsiz <= 0) return -LNX_EINVAL;
+    if (strcmp(path, "/proc/self/exe") == 0) {
+        char tmp[4096];
+        size_t len, n;
+#if defined(_WIN32)
+        DWORD r = GetModuleFileNameA(NULL, tmp, (DWORD)sizeof(tmp));
+        DWORD i;
+        if (r == 0 || r >= sizeof(tmp)) return -LNX_EINVAL;
+        for (i = 0; i < r; i++) if (tmp[i] == '\\') tmp[i] = '/';
+        len = (size_t)r;
+#else
+        ssize_t r = readlink("/proc/self/exe", tmp, sizeof(tmp));
+        if (r < 0) return -(int64_t)errno;
+        len = (size_t)r;
+#endif
+        n = len < (size_t)bufsiz ? len : (size_t)bufsiz;
+        memcpy(buf, tmp, n);
+        return (int64_t)n;
+    }
+#if !defined(_WIN32)
+    {
+        ssize_t r = readlink(path, buf, (size_t)bufsiz);
+        return r < 0 ? -(int64_t)errno : (int64_t)r;
+    }
+#else
+    return -LNX_EINVAL;
+#endif
+}
+
+/* ---- time extras: clock_getres(229), nanosleep(35/230), gettimeofday(96) */
+static int64_t sys_clock_getres(int64_t clk, struct lnx_timespec *tp) {
+    if (clk < 0 || clk > 7) return -LNX_EINVAL;
+    if (tp) {
+        tp->tv_sec = 0;
+        tp->tv_nsec = 1;
+    }
+    return 0;
+}
+
+static int64_t sys_clock_nanosleep(int64_t clk, int64_t flags, const struct lnx_timespec *req,
+                                   struct lnx_timespec *rem) {
+    int64_t wait_ns;
+    (void)rem;
+    if (!req) return -LNX_EFAULT;
+    if (req->tv_sec < 0 || req->tv_nsec < 0 || req->tv_nsec >= 1000000000LL) return -LNX_EINVAL;
+    if (clk < 0 || clk > 7) return -LNX_EINVAL;
+    wait_ns = req->tv_sec * 1000000000LL + req->tv_nsec;
+    if (flags & 1 /* TIMER_ABSTIME */) {
+        int64_t now = clock_ns(clk);
+        if (now < 0) return -LNX_EINVAL;
+        wait_ns = wait_ns > now ? (wait_ns - now) : 0;
+    }
+    if (wait_ns > 0) {
+#if defined(_WIN32)
+        int64_t ms = (wait_ns + 999999LL) / 1000000LL;
+        Sleep(ms > 0x7fffffffLL ? 0x7fffffffu : (DWORD)ms);
+#else
+        struct timespec ts;
+        ts.tv_sec = (time_t)(wait_ns / 1000000000LL);
+        ts.tv_nsec = (long)(wait_ns % 1000000000LL);
+        nanosleep(&ts, NULL);
+#endif
+    }
+    return 0;
+}
+
+static int64_t sys_gettimeofday(int64_t *tv, void *tz) {
+    int64_t ns = clock_ns(LNX_CLOCK_REALTIME);
+    if (ns < 0) return -LNX_EINVAL;
+    if (tv) {
+        tv[0] = ns / 1000000000LL;
+        tv[1] = (ns % 1000000000LL) / 1000LL;
+    }
+    if (tz) memset(tz, 0, 8);
+    return 0;
+}
+
+struct lnx_sysinfo {
+    int64_t  uptime;
+    uint64_t loads[3];
+    uint64_t totalram;
+    uint64_t freeram;
+    uint64_t sharedram;
+    uint64_t bufferram;
+    uint64_t totalswap;
+    uint64_t freeswap;
+    uint16_t procs;
+    uint16_t pad;
+    uint32_t pad2;
+    uint64_t totalhigh;
+    uint64_t freehigh;
+    uint32_t mem_unit;
+    char     _f[4];
+};
+_Static_assert(sizeof(struct lnx_sysinfo) == 112, "struct sysinfo must be 112 bytes");
+
+static int64_t sys_sysinfo(void *buf) {
+    struct lnx_sysinfo si;
+    if (!buf) return -LNX_EFAULT;
+    memset(&si, 0, sizeof si);
+    si.uptime   = 3600;
+    si.totalram = 8ULL * 1024ULL * 1024ULL * 1024ULL;
+    si.freeram  = 4ULL * 1024ULL * 1024ULL * 1024ULL;
+    si.procs    = 16;
+    si.mem_unit = 1;
+#if defined(_WIN32)
+    {
+        MEMORYSTATUSEX ms;
+        ms.dwLength = sizeof ms;
+        if (GlobalMemoryStatusEx(&ms)) {
+            si.totalram = ms.ullTotalPhys;
+            si.freeram  = ms.ullAvailPhys;
+        }
+    }
+#endif
+    memcpy(buf, &si, sizeof si);
+    return 0;
+}
+
+struct lnx_statfs {
+    int64_t f_type;
+    int64_t f_bsize;
+    uint64_t f_blocks;
+    uint64_t f_bfree;
+    uint64_t f_bavail;
+    uint64_t f_files;
+    uint64_t f_ffree;
+    int32_t  f_fsid[2];
+    int64_t  f_namelen;
+    int64_t  f_frsize;
+    int64_t  f_flags;
+    int64_t  f_spare[4];
+};
+_Static_assert(sizeof(struct lnx_statfs) == 120, "struct statfs must be 120 bytes");
+
+static int64_t sys_statfs_fill(void *buf) {
+    struct lnx_statfs sf;
+    if (!buf) return -LNX_EFAULT;
+    memset(&sf, 0, sizeof sf);
+    sf.f_type    = 0xef53; /* EXT4_SUPER_MAGIC */
+    sf.f_bsize   = 4096;
+    sf.f_blocks  = 2097152;
+    sf.f_bfree   = 1048576;
+    sf.f_bavail  = 1048576;
+    sf.f_files   = 131072;
+    sf.f_ffree   = 65536;
+    sf.f_namelen = 255;
+    sf.f_frsize  = 4096;
+    memcpy(buf, &sf, sizeof sf);
+    return 0;
+}
+
+static int32_t g_umask = 0022;
 
 static int64_t dispatch_ex(int64_t nr, int64_t *a, const afw_clone_regs *regs, uintptr_t cur_sp);
 
@@ -533,9 +985,39 @@ static long atomic_inc_long(long *p) {
 #endif
 }
 
+static void (*g_abort_cb)(uintptr_t sp);
+void afw_syscall_set_abort_cb(void (*on_abort)(uintptr_t sp)) { g_abort_cb = on_abort; }
+
+static int (*g_net_cb)(int64_t nr, const int64_t *args, int64_t *ret_out);
+void afw_syscall_set_net_cb(int (*net_cb)(int64_t nr, const int64_t *args, int64_t *ret_out)) {
+    g_net_cb = net_cb;
+}
+
+static void (*g_set_gs_cb)(uintptr_t);
+static uintptr_t (*g_get_gs_cb)(void);
+static _Thread_local uintptr_t t_fallback_gs;
+
+void afw_syscall_set_gs_ops(void (*set_gs)(uintptr_t), uintptr_t (*get_gs)(void)) {
+    g_set_gs_cb = set_gs;
+    g_get_gs_cb = get_gs;
+}
+
+static void sys_set_art_gs(uintptr_t addr) {
+    if (g_set_gs_cb) g_set_gs_cb(addr);
+    else t_fallback_gs = addr;
+}
+
+static uintptr_t sys_get_art_gs(void) {
+    return g_get_gs_cb ? g_get_gs_cb() : t_fallback_gs;
+}
+
 static int64_t dispatch_ex(int64_t nr, int64_t *a, const afw_clone_regs *regs, uintptr_t cur_sp) {
     if (nr >= 0 && nr < AFW_MAX_SYSCALL) (void)atomic_inc_long(&afw_syscall_counts[nr]);
     if (afw_syscall_probe_log) probe_log_syscall(nr, a);
+    if (g_net_cb) {
+        int64_t net_ret = 0;
+        if (g_net_cb(nr, a, &net_ret)) return net_ret;
+    }
     switch (nr) {
     case 0:   return afw_fd_read(a[0], (void *)(uintptr_t)a[1], (uint64_t)a[2]);
     case 1:   return afw_fd_write(a[0], (const void *)(uintptr_t)a[1], (uint64_t)a[2]);
@@ -545,20 +1027,108 @@ static int64_t dispatch_ex(int64_t nr, int64_t *a, const afw_clone_regs *regs, u
     case 5:   return afw_fd_fstat(a[0], (void *)(uintptr_t)a[1]);
     case 6:   return afw_fd_newfstatat(-100, (const char *)(uintptr_t)a[0], (void *)(uintptr_t)a[1], 0x100);
     case 8:   return afw_fd_lseek(a[0], a[1], a[2]);
+    case 13:  return sys_rt_sigaction(a[0], (const void *)(uintptr_t)a[1],
+                                      (void *)(uintptr_t)a[2], (uint64_t)a[3]);
+    case 16:  return -25; /* ioctl: ENOTTY (isatty -> 0) */
+    case 17:  return afw_fd_pread(a[0], (void *)(uintptr_t)a[1], (uint64_t)a[2], a[3]);
+    case 18:  return afw_fd_pwrite(a[0], (const void *)(uintptr_t)a[1], (uint64_t)a[2], a[3]);
     case 19:  return afw_fd_readv(a[0], (const uint64_t *)(uintptr_t)a[1], a[2]);
     case 20:  return afw_fd_writev(a[0], (const uint64_t *)(uintptr_t)a[1], a[2]);
+    case 21:  return afw_fd_faccessat(-100, (const char *)(uintptr_t)a[0], a[1], 0);
+    case 24:  return sys_sched_yield();
+    case 26:  return 0; /* msync */
+    case 35:  return sys_clock_nanosleep(LNX_CLOCK_MONOTONIC, 0,
+                                         (const struct lnx_timespec *)(uintptr_t)a[0],
+                                         (struct lnx_timespec *)(uintptr_t)a[1]);
     case 39:  return sys_getpid();
     case 56:  return afw_sys_clone((uint64_t)a[0], (uint64_t)a[1], (uint64_t)a[2],
                                    (uint64_t)a[3], (uint64_t)a[4], regs);
+    case 63:  return sys_uname((void *)(uintptr_t)a[0]);
     case 72:  return afw_fd_fcntl(a[0], a[1], a[2]);
+    case 74:  case 75: return 0; /* fsync, fdatasync */
+    case 79:  return sys_getcwd((char *)(uintptr_t)a[0], (uint64_t)a[1]);
+    case 82:  return (a[0] && a[1]) ? afw_os_rename((const char *)(uintptr_t)a[0], (const char *)(uintptr_t)a[1]) : -LNX_EFAULT;
+    case 83:  return a[0] ? afw_os_mkdir((const char *)(uintptr_t)a[0], (uint32_t)a[1]) : -LNX_EFAULT;
     case 87:  return afw_fd_unlinkat(-100, (const char *)(uintptr_t)a[0], 0);
+    case 89:  return sys_readlinkat(-100, (const char *)(uintptr_t)a[0],
+                                    (char *)(uintptr_t)a[1], a[2]);
+    case 90:  case 91: return 0; /* chmod, fchmod */
+    case 95:  return (int64_t)afw_os_atomic_xchg_i32(&g_umask, (int32_t)(a[0] & 0777));
+    case 96:  return sys_gettimeofday((int64_t *)(uintptr_t)a[0], (void *)(uintptr_t)a[1]);
+    case 97:  return sys_prlimit64(0, a[0], NULL, (void *)(uintptr_t)a[1]);
+    case 99:  return sys_sysinfo((void *)(uintptr_t)a[0]);
+    case 110: return 1;            /* getppid */
+    case 111: return sys_getpid(); /* getpgrp */
+    case 121: return sys_getpid(); /* getpgid */
+    case 124: return sys_getpid(); /* getsid */
+    case 128: return sys_rt_sigtimedwait((const void *)(uintptr_t)a[0], (void *)(uintptr_t)a[1],
+                                         (const struct lnx_timespec *)(uintptr_t)a[2], (uint64_t)a[3]);
+    case 131: return sys_sigaltstack((const void *)(uintptr_t)a[0], (void *)(uintptr_t)a[1]);
+    case 137: /* statfs */
+        if (!a[0]) return -LNX_EFAULT;
+        return sys_statfs_fill((void *)(uintptr_t)a[1]);
+    case 138: /* fstatfs */
+        return sys_statfs_fill((void *)(uintptr_t)a[1]);
+    case 140: return 20;           /* getpriority (Linux returns 20 - nice; default nice=0 -> 20) */
+    case 141: return 0;            /* setpriority */
+    case 143: /* sched_getparam */
+        if (!a[1]) return -LNX_EFAULT;
+        *(int32_t *)(uintptr_t)a[1] = 0;
+        return 0;
+    case 144: return 0;            /* sched_setscheduler */
+    case 145: return 0;            /* sched_getscheduler (SCHED_OTHER) */
+    case 146: return 0;            /* sched_get_priority_max */
+    case 147: return 0;            /* sched_get_priority_min */
+    case 160: return sys_prlimit64(0, a[0], (const void *)(uintptr_t)a[1], NULL);
     case 202: return sys_futex(a[0], a[1], a[2], a[3], a[4], a[5]);
+    case 203: return 0;            /* sched_setaffinity */
+    case 204: return sys_sched_getaffinity(a[0], (uint64_t)a[1], (void *)(uintptr_t)a[2]);
     case 218: return afw_sys_set_tid_address((uint64_t)a[0]);
     case 228: return sys_clock_gettime(a[0], (struct lnx_timespec *)(uintptr_t)a[1]);
+    case 229: return sys_clock_getres(a[0], (struct lnx_timespec *)(uintptr_t)a[1]);
+    case 230: return sys_clock_nanosleep(a[0], a[1],
+                                         (const struct lnx_timespec *)(uintptr_t)a[2],
+                                         (struct lnx_timespec *)(uintptr_t)a[3]);
+    case 234: /* tgkill */
+        if (a[2] != 6) return sys_tgkill_deliver(a[1], a[2]);
+        fprintf(stderr, "[syscall] signal nr=%lld tgid=%lld tid=%lld sig=%lld\n",
+                (long long)nr, (long long)a[0], (long long)a[1], (long long)a[2]);
+        if (atomic_inc_long(&g_unimplemented[234]) == 0) {
+            if (g_abort_cb) g_abort_cb(cur_sp);
+            afw_syscall_report();
+            fflush(stdout);
+        }
+        fflush(stderr);
+        return -LNX_ENOSYS;
+    case 297: /* rt_tgsigqueueinfo */
+        fprintf(stderr, "[syscall] signal nr=%lld tgid=%lld tid=%lld sig=%lld\n",
+                (long long)nr, (long long)a[0], (long long)a[1], (long long)a[2]);
+        if (a[2] == 6 && atomic_inc_long(&g_unimplemented[297]) == 0) {
+            if (g_abort_cb) g_abort_cb(cur_sp);
+            afw_syscall_report();
+            fflush(stdout);
+        }
+        fflush(stderr);
+        return -LNX_ENOSYS;
     case 257: return afw_fd_openat(a[0], (const char *)(uintptr_t)a[1], a[2], (uint64_t)a[3]);
+    case 258: /* mkdirat */
+        if (!a[1]) return -LNX_EFAULT;
+        return afw_os_mkdir((const char *)(uintptr_t)a[1], (uint32_t)a[2]);
     case 262: return afw_fd_newfstatat(a[0], (const char *)(uintptr_t)a[1], (void *)(uintptr_t)a[2], a[3]);
     case 263: return afw_fd_unlinkat(a[0], (const char *)(uintptr_t)a[1], a[2]);
+    case 264: /* renameat */
+        return (a[1] && a[3]) ? afw_os_rename((const char *)(uintptr_t)a[1], (const char *)(uintptr_t)a[3]) : -LNX_EFAULT;
+    case 267: return sys_readlinkat(a[0], (const char *)(uintptr_t)a[1],
+                                    (char *)(uintptr_t)a[2], a[3]);
+    case 268: return 0; /* fchmodat */
+    case 269: return afw_fd_faccessat(a[0], (const char *)(uintptr_t)a[1], a[2], 0);
+    case 302: return sys_prlimit64(a[0], a[1], (const void *)(uintptr_t)a[2],
+                                   (void *)(uintptr_t)a[3]);
+    case 309: return sys_getcpu((uint32_t *)(uintptr_t)a[0], (uint32_t *)(uintptr_t)a[1]);
+    case 316: /* renameat2 */
+        return (a[1] && a[3]) ? afw_os_rename((const char *)(uintptr_t)a[1], (const char *)(uintptr_t)a[3]) : -LNX_EFAULT;
     case 318: return sys_getrandom((void *)(uintptr_t)a[0], (uint64_t)a[1], a[2]);
+    case 439: return afw_fd_faccessat(a[0], (const char *)(uintptr_t)a[1], a[2], a[3]);
     /* one app user, as AT_UID/AT_GID say (bionic_shim.c): uid 10000 */
     case 102: case 104: case 107: case 108: return 10000;   /* getuid getgid geteuid getegid */
     case 186: return sys_gettid();
@@ -574,8 +1144,18 @@ static int64_t dispatch_ex(int64_t nr, int64_t *a, const afw_clone_regs *regs, u
                                         (void *)(uintptr_t)a[2], (uint64_t)a[3]);
     case 28:  return afw_madvise((uint64_t)a[0], (uint64_t)a[1], (int)a[2]);
     case 12:  return -12;  /* brk: no heap break; bionic and Scudo use mmap */
-    case 157: /* prctl */
-        if (a[0] == 0x53564d41) return 0;  /* PR_SET_VMA (naming an area): accepted */
+    case 157: return sys_prctl(a[0], a[1], a[2], a[3], a[4]);
+    case 158: /* arch_prctl(code, addr) */
+        if (a[0] == 0x1001) { /* ARCH_SET_GS */
+            sys_set_art_gs((uintptr_t)a[1]);
+            return 0;
+        }
+        if (a[0] == 0x1004) { /* ARCH_GET_GS */
+            uintptr_t *out = (uintptr_t *)(uintptr_t)a[1];
+            if (!out) return -14; /* EFAULT */
+            *out = sys_get_art_gs();
+            return 0;
+        }
         return -22;
     case 60:  /* exit: ends only the calling thread */
         if (afw_thread_is_cloned())

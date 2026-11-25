@@ -32,6 +32,7 @@ uintptr_t *afw_tls_block(void) { return t_block; }
 #define TEB_TLS_SLOTS 0x1480
 
 static DWORD g_slot[BIONIC_TLS_SLOTS];
+static DWORD g_art_gs_slots[3]; /* 0: art %gs base, 1: scratch1, 2: scratch2 */
 static volatile LONG g_patches;
 static int g_ready;
 
@@ -40,6 +41,16 @@ long afw_tls_patch_count(void) { return g_patches; }
 int afw_tls_teb_offset(int slot) {
     if (!g_ready || slot < 0 || slot >= BIONIC_TLS_SLOTS) return -1;
     return TEB_TLS_SLOTS + 8 * (int)g_slot[slot];
+}
+
+int afw_tls_art_gs_base_off(void)     { return g_ready ? TEB_TLS_SLOTS + 8 * (int)g_art_gs_slots[0] : -1; }
+int afw_tls_art_gs_scratch1_off(void) { return g_ready ? TEB_TLS_SLOTS + 8 * (int)g_art_gs_slots[1] : -1; }
+int afw_tls_art_gs_scratch2_off(void) { return g_ready ? TEB_TLS_SLOTS + 8 * (int)g_art_gs_slots[2] : -1; }
+void afw_tls_set_art_gs(uintptr_t addr) {
+    if (g_ready) TlsSetValue(g_art_gs_slots[0], (void *)addr);
+}
+uintptr_t afw_tls_get_art_gs(void) {
+    return g_ready ? (uintptr_t)TlsGetValue(g_art_gs_slots[0]) : 0;
 }
 
 /* Find the fs: prefix and disp32 of an "fs:[disp32]" instruction. */
@@ -147,6 +158,18 @@ int afw_tls_init(void) {
             }
             g_slot[i] = idx; nslots = i + 1;
         }
+        {
+            static int ngs;
+            for (i = ngs; i < 3; i++) {
+                DWORD idx = TlsAlloc();
+                if (idx == TLS_OUT_OF_INDEXES || idx >= 64) {
+                    if (idx != TLS_OUT_OF_INDEXES) TlsFree(idx);
+                    fprintf(stderr, "[tls] not enough Windows TLS slots for ART gs:\n");
+                    return -1;
+                }
+                g_art_gs_slots[i] = idx; ngs = i + 1;
+            }
+        }
         if (g_fls == FLS_OUT_OF_INDEXES) g_fls = FlsAlloc(fls_release);
         if (g_fls == FLS_OUT_OF_INDEXES) { fprintf(stderr, "[tls] no FLS index\n"); return -1; }
         if (!g_veh) g_veh = AddVectoredExceptionHandler(1, fs_handler);
@@ -220,6 +243,12 @@ static uintptr_t thread_id(void) { return (uintptr_t)GetCurrentThreadId(); }
 /* Linux: fs: already works natively; nothing to patch. */
 long afw_tls_patch_count(void) { return 0; }
 int afw_tls_teb_offset(int slot) { (void)slot; return -1; }
+static _Thread_local uintptr_t t_art_gs;
+int afw_tls_art_gs_base_off(void)     { return -1; }
+int afw_tls_art_gs_scratch1_off(void) { return -1; }
+int afw_tls_art_gs_scratch2_off(void) { return -1; }
+void afw_tls_set_art_gs(uintptr_t addr) { t_art_gs = addr; }
+uintptr_t afw_tls_get_art_gs(void)      { return t_art_gs; }
 #include <pthread.h>
 /* Same rule as FLS on Windows: the key frees a thread's block at exit. */
 static pthread_key_t g_key;
@@ -269,22 +298,40 @@ int afw_tls_init(void) {   /* the key once; the thread's block until it succeeds
 /* Slots that point into the thread area: bionic dereferences them in memory
  * (__errno: [[tp] + 8] + 0x300, measured), so they hold pointers, never ids. */
 static void point_into_area(uintptr_t *blk, unsigned char *area) {
-    blk[TLS_SLOT_THREAD_ID] = (uintptr_t)(area + AFW_PTHREAD_INTERNAL_OFF);
-    blk[TLS_SLOT_BIONIC_TLS] = (uintptr_t)(area + AFW_BIONIC_TLS_OFF);
+    unsigned char *pti = area + AFW_PTHREAD_INTERNAL_OFF;
+    uintptr_t btls = (uintptr_t)(area + AFW_BIONIC_TLS_OFF);
+    blk[TLS_SLOT_THREAD_ID] = (uintptr_t)pti;
+    blk[TLS_SLOT_BIONIC_TLS] = btls;
+    memcpy(pti + AFW_PTI_BIONIC_TLS, &btls, sizeof btls);
+}
+
+static void init_pti_fields(unsigned char *area) {
+    unsigned char *pti = area + AFW_PTHREAD_INTERNAL_OFF;
+    int32_t tid = (int32_t)thread_id();
+    uint32_t cpid = afw_os_current_pid() & 0x7fffffffu;
+    uint64_t lo = 0, hi = 0;
+    memcpy(pti + AFW_PTI_TID, &tid, 4);
+    memcpy(pti + AFW_PTI_CACHED_PID, &cpid, 4);
+    if (afw_os_current_stack_limits(&lo, &hi) == 0 && hi > lo + 8192) {
+        uint64_t sbase = (lo + 4096u) & ~(uint64_t)4095u;
+        uint64_t ssize = hi - sbase;
+        uint64_t gsize = 4096u;
+        memcpy(pti + AFW_PTI_ATTR_STACK_BASE, &sbase, 8);
+        memcpy(pti + AFW_PTI_ATTR_STACK_SIZE, &ssize, 8);
+        memcpy(pti + AFW_PTI_ATTR_GUARD_SIZE, &gsize, 8);
+    }
 }
 
 int afw_tls_thread_init(void) {
     void *alloc;
     unsigned char *area;
     uintptr_t *blk;
-    int32_t tid;
     if (t_block) return 0;
     blk = afw_tls_static_alloc(&alloc, &area);
     if (!blk) { fprintf(stderr, "[tls] cannot allocate the thread's TLS block\n"); return -1; }
     blk[TLS_SLOT_SELF] = (uintptr_t)blk;
     point_into_area(blk, area);
-    tid = (int32_t)thread_id();
-    memcpy(area + AFW_PTHREAD_INTERNAL_OFF + AFW_PTI_TID, &tid, 4);
+    init_pti_fields(area);
     blk[TLS_SLOT_STACK_GUARD] = g_guard;
     if (publish(blk, alloc) != 0) {
         fprintf(stderr, "[tls] cannot publish the thread's TLS block\n");
@@ -306,8 +353,7 @@ int afw_tls_thread_rebuild(void) {
         memcpy(nb, t_block, BIONIC_TLS_SLOTS * sizeof *nb);
         memcpy(new_area, t_area, AFW_THREAD_AREA_SIZE);     /* errno, tid... carry over */
     } else {
-        int32_t tid = (int32_t)thread_id();
-        memcpy(new_area + AFW_PTHREAD_INTERNAL_OFF + AFW_PTI_TID, &tid, 4);
+        init_pti_fields(new_area);
         nb[TLS_SLOT_STACK_GUARD] = g_guard;
     }
     nb[TLS_SLOT_SELF] = (uintptr_t)nb;

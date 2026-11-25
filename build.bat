@@ -26,7 +26,7 @@ rem name the loader's own functions (DbgHelp)
 clang-cl /nologo /O2 /W3 /Z7 /D_CRT_SECURE_NO_WARNINGS -Wno-unused-function -Iout\zydis-amalg ^
     /Fe:out\afw-loader.exe /Foout\ ^
     src\main.c src\elf_loader.c src\bionic_shim.c src\platform.c src\tls_patch.c src\crash.c ^
-    src\patch.c src\attest.c src\sha256.c src\syscall.c src\thread.c src\fd.c src\filemap.c src\funcs.c src\vma.c src\tls_layout.c src\tls_static.c src\loader_api.c src\callback_bridge.c src\exec.c out\zydis-amalg\Zydis.c ^
-    /link /DEBUG:FULL dbghelp.lib
+    src\patch.c src\attest.c src\sha256.c src\syscall.c src\thread.c src\fd.c src\filemap.c src\funcs.c src\vma.c src\tls_layout.c src\tls_static.c src\loader_api.c src\callback_bridge.c src\exec.c src\win_host.c src\net.c out\zydis-amalg\Zydis.c ^
+    /link /DEBUG:FULL /STACK:8388608,8388608 dbghelp.lib user32.lib gdi32.lib winmm.lib ws2_32.lib ole32.lib windowscodecs.lib mfplat.lib mfreadwrite.lib mfuuid.lib
 if errorlevel 1 exit /b 1
 echo Built out\afw-loader.exe
