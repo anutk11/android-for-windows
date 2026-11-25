@@ -191,5 +191,8 @@ void afw_dlopen_unlock(void);
 void *afw_os_aligned_alloc_zero(size_t align, size_t size);
 void  afw_os_aligned_free(void *p);
 int   afw_os_dtv_fls_set(void (*release_cb)(void *), void *dtv);
+#ifdef AFW_TEST
+void  afw_os_test_fail_dtv_fls_clear(int count);
+#endif
 
 #endif

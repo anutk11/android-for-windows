@@ -389,7 +389,7 @@ jobs:
              -o out/tls_layout_test tools/tls_layout_test.c src/tls_layout.c
           cc -g -O1 -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined -Wall -Wextra -pthread \
              -o out/loader_lock_test tools/loader_lock_test.c src/platform.c
-          cc -g -O1 -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined -Wall -Wextra -pthread \
+          cc -g -O1 -DAFW_TEST -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined -Wall -Wextra -pthread \
              -o out/dtv_bridge_test tools/dtv_bridge_test.c src/tls_static.c src/tls_layout.c src/tls_patch.c src/callback_bridge.c src/funcs.c src/platform.c
       - name: "Attestation checks (PR #7 + cross-block must_hold_table): queue self-test, variants 1-15 & stale"
         run: |
@@ -428,7 +428,7 @@ jobs:
           set -euo pipefail
           export ASAN_OPTIONS=detect_invalid_pointer_pairs=2
           nm out/afw-asan > out/afw-asan.syms
-          if grep -Eq " (afw_vma_test_fail_os|afw_vma_test_fail_meta|afw_vma_test_fail_ww|afw_vma_test_ww_active|afw_load_test_fail_adopt|afw_attest_set_tamper|afw_attest_add_test|afw_patch_test_must_queue)$" out/afw-asan.syms; then
+          if grep -Eq " (afw_vma_test_fail_os|afw_vma_test_fail_meta|afw_vma_test_fail_ww|afw_vma_test_ww_active|afw_load_test_fail_adopt|afw_attest_set_tamper|afw_attest_add_test|afw_patch_test_must_queue|afw_os_test_fail_dtv_fls_clear)$" out/afw-asan.syms; then
             echo "fault injection present in non-test loader"; exit 1
           fi
           out/vma_test
@@ -650,7 +650,7 @@ jobs:
         shell: cmd
         run: |
           if not exist out\dtvobj mkdir out\dtvobj
-          clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Fe:out\dtv_bridge_test.exe /Foout\dtvobj\ tools\dtv_bridge_test.c src\tls_static.c src\tls_layout.c src\tls_patch.c src\callback_bridge.c src\funcs.c src\platform.c
+          clang-cl /nologo /O2 /W3 /DAFW_TEST /D_CRT_SECURE_NO_WARNINGS /Fe:out\dtv_bridge_test.exe /Foout\dtvobj\ tools\dtv_bridge_test.c src\tls_static.c src\tls_layout.c src\tls_patch.c src\callback_bridge.c src\funcs.c src\platform.c
           if errorlevel 1 exit /b 1
           out\dtv_bridge_test.exe
       - name: "C++ exceptions: every landing pad found, nothing unproven (static)"

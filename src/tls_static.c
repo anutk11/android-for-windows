@@ -53,8 +53,11 @@ static void dtv_release_cb(void *p) {
 void afw_tls_dtv_free_current(void) {
     afw_dtv *d = t_dtv;
     if (!d) return;
+    /* Release only after the OS FLS/key slot is cleared; on failure keep t_dtv
+     * and the OS registration intact so the thread-exit callback cleans it up
+     * once without a double-free or UAF. */
+    if (afw_os_dtv_fls_set(NULL, NULL) != 0) return;
     t_dtv = NULL;
-    (void)afw_os_dtv_fls_set(NULL, NULL);
     dtv_release_cb(d);
 }
 

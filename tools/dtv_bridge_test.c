@@ -133,6 +133,38 @@ static void dtv_worker(void *p) {
     w->ok = good;
 }
 
+#ifdef AFW_TEST
+static void dtv_clear_fail_worker(void *p) {
+    worker_arg *w = (worker_arg *)p;
+    afw_tls_index ti;
+    unsigned char *blk;
+    uint64_t tag = 0xFA110000ULL + (uint64_t)w->id;
+    uint64_t readback = 0;
+    int good = 1;
+
+    ti.module = (uint64_t)g_dyn_mod;
+    ti.offset = 0;
+    blk = (unsigned char *)afw_tls_get_addr(&ti);
+    if (!blk) { w->ok = 0; return; }
+    memcpy(blk + 40, &tag, 8);
+
+    /* Fault injected: afw_os_dtv_fls_set(NULL, NULL) returns -1.
+     * afw_tls_dtv_free_current() MUST NOT free blk or clear t_dtv. */
+    afw_tls_dtv_free_current();
+    if (afw_tls_resolve_existing((uint64_t)g_dyn_mod) != blk) good = 0;
+    memcpy(&readback, blk + 40, 8);
+    if (readback != tag) good = 0;
+
+    if (w->explicit_free) {
+        /* Second call succeeds: must clear slot and free immediately. */
+        afw_tls_dtv_free_current();
+        if (afw_tls_resolve_existing((uint64_t)g_dyn_mod) != NULL) good = 0;
+    }
+    /* If !explicit_free, thread exit invokes FLS/pthread_key destructor once. */
+    w->ok = good;
+}
+#endif
+
 typedef struct {
     int a;
     int b;
@@ -229,6 +261,31 @@ static void test_dynamic_tls(void) {
             CHECK(w[i].tls_ptr != w[j].tls_ptr, "simultaneous worker DTV pointers are pairwise distinct");
         }
     }
+
+#ifdef AFW_TEST
+    /* Simulated FLS / pthread_key clear failure (Reviewer 2 blocker):
+     * 1) Clear fails -> afw_tls_dtv_free_current() leaves DTV + OS registration intact
+     *    so thread-exit callback frees it cleanly once (no UAF, no double-free, no leak).
+     * 2) Clear fails once, then retry succeeds -> freed immediately and exit callback is no-op. */
+    {
+        afw_os_thread ft1, ft2;
+        worker_arg fw1 = { 101, 0, 0, 0 };
+        worker_arg fw2 = { 102, 1, 0, 0 };
+
+        /* Helper lambda-like check via dedicated clear-fail worker */
+        afw_os_test_fail_dtv_fls_clear(1);
+        CHECK(afw_os_thread_start(dtv_clear_fail_worker, &fw1, &ft1) == 0,
+              "spawn DTV clear-fail deferred worker");
+        CHECK(afw_os_thread_join(ft1) == 0, "join DTV clear-fail deferred worker");
+        CHECK(fw1.ok == 1, "clear-fail keeps DTV intact until thread-exit callback frees it");
+
+        afw_os_test_fail_dtv_fls_clear(1);
+        CHECK(afw_os_thread_start(dtv_clear_fail_worker, &fw2, &ft2) == 0,
+              "spawn DTV clear-fail retry worker");
+        CHECK(afw_os_thread_join(ft2) == 0, "join DTV clear-fail retry worker");
+        CHECK(fw2.ok == 1, "clear-fail followed by retry frees DTV cleanly with no double-free");
+    }
+#endif
 
     /* Clean up main thread DTV so LSan sees zero leaks */
     afw_tls_dtv_free_current();

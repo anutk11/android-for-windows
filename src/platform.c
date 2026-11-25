@@ -922,10 +922,28 @@ static BOOL CALLBACK win_dtv_fls_init_cb(PINIT_ONCE once, PVOID param, PVOID *ct
     return TRUE;
 }
 
+#ifdef AFW_TEST
+static int32_t g_test_fail_dtv_fls_clear = 0;
+void afw_os_test_fail_dtv_fls_clear(int count) {
+    afw_os_atomic_store_i32(&g_test_fail_dtv_fls_clear, (int32_t)count);
+}
+static int consume_dtv_clear_fault(void) {
+    for (;;) {
+        int32_t cur = afw_os_atomic_load_i32(&g_test_fail_dtv_fls_clear);
+        if (cur <= 0) return 0;
+        if (afw_os_atomic_cmpxchg_i32(&g_test_fail_dtv_fls_clear, cur, cur - 1) == cur)
+            return 1;
+    }
+}
+#endif
+
 int afw_os_dtv_fls_set(void (*release_cb)(void *), void *dtv) {
     if (!release_cb && !dtv) {
-        if (afw_os_atomic_load_i32(&g_dtv_fls_ready)) (void)FlsSetValue(g_dtv_fls, NULL);
-        return 0;
+#ifdef AFW_TEST
+        if (consume_dtv_clear_fault()) return -1;
+#endif
+        if (!afw_os_atomic_load_i32(&g_dtv_fls_ready)) return 0;
+        return FlsSetValue(g_dtv_fls, NULL) ? 0 : -1;
     }
     if (!InitOnceExecuteOnce(&g_dtv_fls_once, win_dtv_fls_init_cb, (PVOID)release_cb, NULL))
         return -1;
@@ -1458,10 +1476,28 @@ static void posix_dtv_key_init(void) {
         afw_os_atomic_store_i32(&g_dtv_key_ok, 1);
 }
 
+#ifdef AFW_TEST
+static int32_t g_test_fail_dtv_fls_clear = 0;
+void afw_os_test_fail_dtv_fls_clear(int count) {
+    afw_os_atomic_store_i32(&g_test_fail_dtv_fls_clear, (int32_t)count);
+}
+static int consume_dtv_clear_fault(void) {
+    for (;;) {
+        int32_t cur = afw_os_atomic_load_i32(&g_test_fail_dtv_fls_clear);
+        if (cur <= 0) return 0;
+        if (afw_os_atomic_cmpxchg_i32(&g_test_fail_dtv_fls_clear, cur, cur - 1) == cur)
+            return 1;
+    }
+}
+#endif
+
 int afw_os_dtv_fls_set(void (*release_cb)(void *), void *dtv) {
     if (!release_cb && !dtv) {
-        if (afw_os_atomic_load_i32(&g_dtv_key_ok)) (void)pthread_setspecific(g_dtv_key, NULL);
-        return 0;
+#ifdef AFW_TEST
+        if (consume_dtv_clear_fault()) return -1;
+#endif
+        if (!afw_os_atomic_load_i32(&g_dtv_key_ok)) return 0;
+        return pthread_setspecific(g_dtv_key, NULL) == 0 ? 0 : -1;
     }
     if (release_cb)
         afw_os_atomic_store_uptr(&g_dtv_key_cb, (uintptr_t)release_cb);

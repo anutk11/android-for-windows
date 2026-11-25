@@ -94,7 +94,7 @@ static cur image_cur(const afw_lib *lib, const unsigned char *p) {
     cur c;
     uintptr_t pa = (uintptr_t)p, lo = (uintptr_t)lib->base, hi = lo + lib->size;
     c.p = p;
-    c.end = lib->base + lib->size;
+    c.end = lib->base ? lib->base + lib->size : NULL;
     c.bad = !(lib->base && hi >= lo && pa >= lo && pa < hi);
     return c;
 }
