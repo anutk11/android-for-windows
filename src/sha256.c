@@ -60,3 +60,68 @@ void afw_sha256_hex(const uint8_t h[32], char out[65]) {
     for (i = 0; i < 32; i++) sprintf(out + 2 * i, "%02x", h[i]);
     out[64] = 0;
 }
+
+typedef struct {
+    uint32_t h[8];
+    uint8_t  buf[64];
+    size_t   used;
+    uint64_t total;
+} sha256_ctx;
+
+static void sha256_init(sha256_ctx *c) {
+    static const uint32_t iv[8] = {
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+    };
+    memcpy(c->h, iv, sizeof iv);
+    c->used = 0;
+    c->total = 0;
+}
+
+static void sha256_update(sha256_ctx *c, const void *data, size_t len) {
+    const uint8_t *p = (const uint8_t *)data;
+    c->total += len;
+    if (c->used) {
+        size_t take = 64 - c->used;
+        if (take > len) take = len;
+        memcpy(c->buf + c->used, p, take);
+        c->used += take; p += take; len -= take;
+        if (c->used == 64) { block(c->h, c->buf); c->used = 0; }
+    }
+    while (len >= 64) { block(c->h, p); p += 64; len -= 64; }
+    if (len) { memcpy(c->buf, p, len); c->used = len; }
+}
+
+static void sha256_final(sha256_ctx *c, uint8_t out[32]) {
+    uint8_t tail[128];
+    uint64_t bits = c->total * 8;
+    size_t n, i;
+    memset(tail, 0, sizeof tail);
+    if (c->used) memcpy(tail, c->buf, c->used);
+    tail[c->used] = 0x80;
+    n = c->used + 1 + 8 <= 64 ? 64 : 128;
+    for (i = 0; i < 8; i++) tail[n - 1 - i] = (uint8_t)(bits >> (8 * i));
+    block(c->h, tail);
+    if (n == 128) block(c->h, tail + 64);
+    for (i = 0; i < 8; i++) {
+        out[4 * i] = (uint8_t)(c->h[i] >> 24); out[4 * i + 1] = (uint8_t)(c->h[i] >> 16);
+        out[4 * i + 2] = (uint8_t)(c->h[i] >> 8); out[4 * i + 3] = (uint8_t)c->h[i];
+    }
+}
+
+void afw_hmac_sha256_zero_key_slices(const void *const *ptrs, const size_t *lens, int n, uint8_t out[32]) {
+    uint8_t pad[64], inner[32];
+    sha256_ctx c;
+    int i;
+    memset(pad, 0x36, sizeof pad);
+    sha256_init(&c);
+    sha256_update(&c, pad, sizeof pad);
+    for (i = 0; i < n; i++)
+        if (lens[i]) sha256_update(&c, ptrs[i], lens[i]);
+    sha256_final(&c, inner);
+    memset(pad, 0x5c, sizeof pad);
+    sha256_init(&c);
+    sha256_update(&c, pad, sizeof pad);
+    sha256_update(&c, inner, sizeof inner);
+    sha256_final(&c, out);
+}
