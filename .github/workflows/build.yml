@@ -763,8 +763,7 @@ jobs:
           findstr /c:"G2B GATE PASSED" out\g2b-gate.txt >nul || (echo G2b g2b_gate_exe did not pass & exit /b 1)
           findstr /c:"G2B MAIN DYN TLS DTOR OK" out\g2b-gate.txt >nul || (echo G2b main dynamic thread_local dtor did not run cleanly & exit /b 1)
           exit /b 0
-      - name: "G3 ART Live Probe: boot real Android 14 libart.so (JNI_CreateJavaVM) on Windows"
-        continue-on-error: true
+      - name: "G3 Gate: boot real Android 14 libart.so (JNI_CreateJavaVM) & run multi-threaded Java + BoringSSL + JNI on Windows (required)"
         timeout-minutes: 3
         shell: cmd
         run: |

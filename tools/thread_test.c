@@ -177,6 +177,75 @@ int main(void) {
         CHECK(tid > 0 && tid == (int64_t)afw_os_current_tid(), "set_tid_address returned %lld", (long long)tid);
     }
 
+    /* 8. G3 ART syscalls: uname, prctl, prlimit64, sysinfo, statfs, sigaction, sigaltstack, FUTEX_CMP_REQUEUE, sigtimedwait+tgkill */
+    {
+        char uts[390];
+        char comm[16];
+        uint64_t rl[2] = {0, 0};
+        unsigned char si[112], sf[120], sa[32], old_sa[32], ss[24], old_ss[24];
+        int32_t futex_w = 42, futex_w2 = 0;
+        uint64_t mask = (1ULL << 9); /* SIGUSR1 = 10 */
+        unsigned char siginfo[128];
+        int64_t a[6] = {0};
+
+        memset(uts, 0, sizeof uts);
+        a[0] = (int64_t)(uintptr_t)uts;
+        CHECK(afw_syscall_dispatch(63, a) == 0 && strcmp(uts, "Linux") == 0 &&
+              strcmp(uts + 260, "x86_64") == 0, "uname returns Linux x86_64");
+
+        a[0] = 15; a[1] = (int64_t)(uintptr_t)"g3-worker";
+        CHECK(afw_syscall_dispatch(157, a) == 0, "prctl(PR_SET_NAME) succeeds");
+        memset(comm, 0, sizeof comm);
+        a[0] = 16; a[1] = (int64_t)(uintptr_t)comm;
+        CHECK(afw_syscall_dispatch(157, a) == 0 && strcmp(comm, "g3-worker") == 0,
+              "prctl(PR_GET_NAME) round-trips");
+
+        memset(a, 0, sizeof a);
+        a[1] = 3; /* RLIMIT_STACK */ a[3] = (int64_t)(uintptr_t)rl;
+        CHECK(afw_syscall_dispatch(302, a) == 0 && rl[0] == 8ULL * 1024ULL * 1024ULL,
+              "prlimit64(RLIMIT_STACK) returns 8MB");
+
+        memset(si, 0, sizeof si);
+        a[0] = (int64_t)(uintptr_t)si;
+        CHECK(afw_syscall_dispatch(99, a) == 0, "sysinfo(99) succeeds");
+
+        memset(sf, 0, sizeof sf);
+        a[0] = (int64_t)(uintptr_t)"/"; a[1] = (int64_t)(uintptr_t)sf;
+        CHECK(afw_syscall_dispatch(137, a) == 0, "statfs(137) succeeds");
+
+        memset(sa, 0, sizeof sa); memset(old_sa, 0, sizeof old_sa);
+        sa[0] = 0x55;
+        a[0] = 10; a[1] = (int64_t)(uintptr_t)sa; a[2] = (int64_t)(uintptr_t)old_sa; a[3] = 8;
+        CHECK(afw_syscall_dispatch(13, a) == 0, "rt_sigaction(SIGUSR1) sets handler");
+        a[1] = 0; a[2] = (int64_t)(uintptr_t)old_sa;
+        CHECK(afw_syscall_dispatch(13, a) == 0 && old_sa[0] == 0x55, "rt_sigaction returns stored handler");
+
+        memset(ss, 0, sizeof ss); memset(old_ss, 0, sizeof old_ss);
+        {
+            uint64_t spv = 0x12340000ULL, szv = 16384ULL;
+            memcpy(ss, &spv, 8); memcpy(ss + 16, &szv, 8);
+        }
+        a[0] = (int64_t)(uintptr_t)ss; a[1] = (int64_t)(uintptr_t)old_ss;
+        CHECK(afw_syscall_dispatch(131, a) == 0, "sigaltstack set succeeds");
+        a[0] = 0; a[1] = (int64_t)(uintptr_t)old_ss;
+        CHECK(afw_syscall_dispatch(131, a) == 0 && memcmp(old_ss, ss, 8) == 0, "sigaltstack query round-trips");
+
+        /* FUTEX_CMP_REQUEUE (4 | PRIVATE): mismatch -> -EAGAIN, match -> >= 0 */
+        a[0] = (int64_t)(uintptr_t)&futex_w; a[1] = 4 | 128; a[2] = 1; a[3] = 1;
+        a[4] = (int64_t)(uintptr_t)&futex_w2; a[5] = 99;
+        CHECK(afw_syscall_dispatch(202, a) == -11 /* -EAGAIN */, "FUTEX_CMP_REQUEUE mismatch -> -EAGAIN");
+        a[5] = 42;
+        CHECK(afw_syscall_dispatch(202, a) >= 0, "FUTEX_CMP_REQUEUE match succeeds");
+
+        /* tgkill(SIGUSR1) + rt_sigtimedwait(SIGUSR1) round-trip */
+        a[0] = 0; a[1] = (int64_t)afw_os_current_tid(); a[2] = 10;
+        CHECK(afw_syscall_dispatch(234, a) == 0, "tgkill(SIGUSR1) queues signal");
+        memset(siginfo, 0, sizeof siginfo);
+        a[0] = (int64_t)(uintptr_t)&mask; a[1] = (int64_t)(uintptr_t)siginfo; a[2] = 0; a[3] = 8;
+        CHECK(afw_syscall_dispatch(128, a) == 10 && *(int32_t *)siginfo == 10,
+              "rt_sigtimedwait consumes queued SIGUSR1");
+    }
+
     CHECK(afw_munmap(map_addr, 10 * 4096) == 0, "cleanup thread mapping");
     CHECK(afw_vma_alloc_count() == 0, "zero VMA leaks (got %d)", afw_vma_alloc_count());
 

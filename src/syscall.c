@@ -1080,11 +1080,19 @@ static int64_t dispatch_ex(int64_t nr, int64_t *a, const afw_clone_regs *regs, u
                                          (struct lnx_timespec *)(uintptr_t)a[3]);
     case 234: /* tgkill */
         if (a[2] != 6) return sys_tgkill_deliver(a[1], a[2]);
-        /* fall through on SIGABRT */
+        fprintf(stderr, "[syscall] signal nr=%lld tgid=%lld tid=%lld sig=%lld\n",
+                (long long)nr, (long long)a[0], (long long)a[1], (long long)a[2]);
+        if (atomic_inc_long(&g_unimplemented[234]) == 0) {
+            if (g_abort_cb) g_abort_cb(cur_sp);
+            afw_syscall_report();
+            fflush(stdout);
+        }
+        fflush(stderr);
+        return -LNX_ENOSYS;
     case 297: /* rt_tgsigqueueinfo */
         fprintf(stderr, "[syscall] signal nr=%lld tgid=%lld tid=%lld sig=%lld\n",
                 (long long)nr, (long long)a[0], (long long)a[1], (long long)a[2]);
-        if (a[2] == 6 && nr >= 0 && nr < AFW_MAX_SYSCALL && atomic_inc_long(&g_unimplemented[nr]) == 0) {
+        if (a[2] == 6 && atomic_inc_long(&g_unimplemented[297]) == 0) {
             if (g_abort_cb) g_abort_cb(cur_sp);
             afw_syscall_report();
             fflush(stdout);

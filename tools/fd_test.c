@@ -489,6 +489,41 @@ int main(void) {
     chk("openat after unlinkat -> -ENOENT", afw_fd_openat(LNX_AT_FDCWD, path, AFW_O_RDONLY, 0) == -LNX_ENOENT);
     chk("newfstatat after unlinkat -> -ENOENT", afw_fd_newfstatat(LNX_AT_FDCWD, path, &st, 0) == -LNX_ENOENT);
 
+    /* 9. G3 pread/pwrite/faccessat and virtual /dev/null + /proc/self/cmdline */
+    {
+        const char *pp = "out/fd_test_pread.dat";
+        int64_t pfd, vfd;
+        char pb[32];
+        (void)afw_fd_unlinkat(LNX_AT_FDCWD, pp, 0);
+        pfd = afw_fd_openat(LNX_AT_FDCWD, pp, AFW_O_RDWR | AFW_O_CREAT | AFW_O_TRUNC, 0644);
+        chk("pwrite at offset 4 + write at 0 preserves cursor",
+            pfd >= 3 && afw_fd_write(pfd, "0123", 4) == 4 &&
+            afw_fd_pwrite(pfd, "WXYZ", 4, 4) == 4 &&
+            afw_fd_lseek(pfd, 0, AFW_SEEK_CUR) == 4);
+        memset(pb, 0, sizeof pb);
+        chk("pread at offset 2 reads \"23WX\" without moving cursor",
+            afw_fd_pread(pfd, pb, 4, 2) == 4 && memcmp(pb, "23WX", 4) == 0 &&
+            afw_fd_lseek(pfd, 0, AFW_SEEK_CUR) == 4);
+        chk("pread negative offset -> -EINVAL", afw_fd_pread(pfd, pb, 4, -1) == -LNX_EINVAL);
+        chk("faccessat existing file -> 0, missing -> -ENOENT",
+            afw_fd_faccessat(LNX_AT_FDCWD, pp, 4, 0) == 0 &&
+            afw_fd_faccessat(LNX_AT_FDCWD, "out/no_such_faccess_file", 0, 0) == -LNX_ENOENT);
+        chk("close + unlink pread test file",
+            afw_fd_close(pfd) == 0 && afw_fd_unlinkat(LNX_AT_FDCWD, pp, 0) == 0);
+
+        vfd = afw_fd_openat(LNX_AT_FDCWD, "/dev/null", AFW_O_RDWR, 0);
+        chk("/dev/null open/write/read/fstat/close",
+            vfd >= 3 && afw_fd_write(vfd, "discard", 7) == 7 &&
+            afw_fd_read(vfd, pb, 8) == 0 && afw_fd_fstat(vfd, &st) == 0 &&
+            afw_fd_close(vfd) == 0);
+
+        vfd = afw_fd_openat(LNX_AT_FDCWD, "/proc/self/cmdline", AFW_O_RDONLY, 0);
+        memset(pb, 0, sizeof pb);
+        chk("/proc/self/cmdline open/read/pread/close",
+            vfd >= 3 && afw_fd_read(vfd, pb, sizeof pb) > 0 &&
+            afw_fd_pread(vfd, pb, 4, 0) == 4 && afw_fd_close(vfd) == 0);
+    }
+
     printf("\nfd_test: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
