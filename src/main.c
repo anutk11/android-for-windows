@@ -869,7 +869,7 @@ int main(int argc, char **argv) {
             if (strcmp(argv[a], "--strict") == 0) strict = 1;
             else if (strcmp(argv[a], "--allow-unproven") == 0) afw_load_allow_unproven = 1;
             else if (strcmp(argv[a], "--attest-dump") == 0) afw_attest_dump = 1;
-            else if (strcmp(argv[a], "--art-gs") == 0) afw_load_enable_art_gs = 1;
+            else if (strcmp(argv[a], "--art-gs") == 0) { afw_load_enable_art_gs = 1; afw_crash_enable_probe_veh(); }
 #ifdef AFW_TEST
             else if (strncmp(argv[a], "--attest-tamper=", 16) == 0) afw_attest_set_tamper(argv[a] + 16);
             else if (strncmp(argv[a], "--attest-add=", 13) == 0) {

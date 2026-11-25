@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "syscall.h"
+#include "tls_patch.h"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -52,8 +53,12 @@ static LONG WINAPI on_crash(EXCEPTION_POINTERS *ep) {
         else
             fprintf(stderr, "(not readable)");
     }
-    fprintf(stderr, "\n  rax=%llx rbx=%llx rcx=%llx rdx=%llx\n  rsi=%llx rdi=%llx rbp=%llx rsp=%llx\n",
-            c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->Rbp, c->Rsp);
+    fprintf(stderr, "\n  rax=%llx rbx=%llx rcx=%llx rdx=%llx\n  rsi=%llx rdi=%llx rbp=%llx rsp=%llx\n"
+                    "  r8 =%llx r9 =%llx r10=%llx r11=%llx\n  r12=%llx r13=%llx r14=%llx r15=%llx\n"
+                    "  art_gs=%llx\n",
+            c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->Rbp, c->Rsp,
+            c->R8, c->R9, c->R10, c->R11, c->R12, c->R13, c->R14, c->R15,
+            (unsigned long long)afw_tls_get_art_gs());
     fprintf(stderr, "  possible callers (from stack):\n");
     {
         uint64_t st[64];
@@ -200,6 +205,9 @@ static LONG CALLBACK probe_veh_handler(EXCEPTION_POINTERS *ep) {
     if (InterlockedExchange(&g_probe_veh_logged, 1) == 0) {
         on_crash(ep);
         afw_syscall_probe_summary();
+        afw_syscall_report();
+        fflush(stdout);
+        fflush(stderr);
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }

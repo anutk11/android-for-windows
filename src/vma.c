@@ -666,7 +666,31 @@ static int64_t mmap_locked(uint64_t addr, uint64_t len, int prot, int flags, int
         }
         if (os_reserve_anon(addr, n, &base, &ww) != 0) return -LNX_ENOMEM;
     } else {
-        if (os_reserve_anon(0, n, &base, &ww) != 0) return -LNX_ENOMEM;
+        int reserved = 0;
+        if (addr != 0) {
+            uint64_t hint = addr & ~(GRAN - 1);
+            if (hint >= GRAN && hint + n > hint) {
+                size_t idx = lower_bound_alloc(hint);
+                int clash = (idx < g_n && g_a[idx].base < hint + n) ||
+                            (idx > 0 && g_a[idx - 1].base + g_a[idx - 1].size > hint);
+                if (!clash && os_free_range(hint, n) && os_reserve_anon(hint, n, &base, &ww) == 0)
+                    reserved = 1;
+            }
+        }
+        if (!reserved && (flags & 0x40 /* MAP_32BIT */)) {
+            uint64_t probe;
+            for (probe = 0x10000000ULL; probe + n <= 0x7f000000ULL && probe + n > probe; probe += 0x01000000ULL) {
+                size_t idx = lower_bound_alloc(probe);
+                int clash = (idx < g_n && g_a[idx].base < probe + n) ||
+                            (idx > 0 && g_a[idx - 1].base + g_a[idx - 1].size > probe);
+                if (!clash && os_free_range(probe, n) && os_reserve_anon(probe, n, &base, &ww) == 0) {
+                    reserved = 1;
+                    break;
+                }
+            }
+        }
+        if (!reserved && os_reserve_anon(0, n, &base, &ww) != 0)
+            return -LNX_ENOMEM;
     }
     w = add(base, n);
     if (!w) { os_release(base, n); return -LNX_ENOMEM; }

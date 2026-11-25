@@ -659,6 +659,39 @@ static int64_t sys_sysinfo(void *buf) {
     return 0;
 }
 
+struct lnx_statfs {
+    int64_t f_type;
+    int64_t f_bsize;
+    uint64_t f_blocks;
+    uint64_t f_bfree;
+    uint64_t f_bavail;
+    uint64_t f_files;
+    uint64_t f_ffree;
+    int32_t  f_fsid[2];
+    int64_t  f_namelen;
+    int64_t  f_frsize;
+    int64_t  f_flags;
+    int64_t  f_spare[4];
+};
+_Static_assert(sizeof(struct lnx_statfs) == 120, "struct statfs must be 120 bytes");
+
+static int64_t sys_statfs_fill(void *buf) {
+    struct lnx_statfs sf;
+    if (!buf) return -LNX_EFAULT;
+    memset(&sf, 0, sizeof sf);
+    sf.f_type    = 0xef53; /* EXT4_SUPER_MAGIC */
+    sf.f_bsize   = 4096;
+    sf.f_blocks  = 2097152;
+    sf.f_bfree   = 1048576;
+    sf.f_bavail  = 1048576;
+    sf.f_files   = 131072;
+    sf.f_ffree   = 65536;
+    sf.f_namelen = 255;
+    sf.f_frsize  = 4096;
+    memcpy(buf, &sf, sizeof sf);
+    return 0;
+}
+
 static int32_t g_umask = 0022;
 
 static int64_t dispatch_ex(int64_t nr, int64_t *a, const afw_clone_regs *regs, uintptr_t cur_sp);
@@ -934,6 +967,11 @@ static int64_t dispatch_ex(int64_t nr, int64_t *a, const afw_clone_regs *regs, u
     case 121: return sys_getpid(); /* getpgid */
     case 124: return sys_getpid(); /* getsid */
     case 131: return sys_sigaltstack((const void *)(uintptr_t)a[0], (void *)(uintptr_t)a[1]);
+    case 137: /* statfs */
+        if (!a[0]) return -LNX_EFAULT;
+        return sys_statfs_fill((void *)(uintptr_t)a[1]);
+    case 138: /* fstatfs */
+        return sys_statfs_fill((void *)(uintptr_t)a[1]);
     case 140: return 20;           /* getpriority (Linux returns 20 - nice; default nice=0 -> 20) */
     case 141: return 0;            /* setpriority */
     case 143: /* sched_getparam */
