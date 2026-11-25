@@ -1554,13 +1554,28 @@ static int fs_reg_stub(ZydisDecoder *dec, const fsite *f, int32_t teb, unsigned 
 }
 
 /* ---- ART %gs: trampoline rewriter (Gate G3) ---------------------------- */
-static ZydisRegister pick_gs_scratch(const ZydisDecodedInstruction *ins, const ZydisDecodedOperand *ops) {
+static ZydisRegister reg64_to_32(ZydisRegister r) {
+    switch (r) {
+    case ZYDIS_REGISTER_RAX: return ZYDIS_REGISTER_EAX;
+    case ZYDIS_REGISTER_RCX: return ZYDIS_REGISTER_ECX;
+    case ZYDIS_REGISTER_RDX: return ZYDIS_REGISTER_EDX;
+    case ZYDIS_REGISTER_R8:  return ZYDIS_REGISTER_R8D;
+    case ZYDIS_REGISTER_R9:  return ZYDIS_REGISTER_R9D;
+    case ZYDIS_REGISTER_R10: return ZYDIS_REGISTER_R10D;
+    case ZYDIS_REGISTER_R11: return ZYDIS_REGISTER_R11D;
+    default: return ZYDIS_REGISTER_NONE;
+    }
+}
+
+static int pick_gs_scratch2(const ZydisDecodedInstruction *ins, const ZydisDecodedOperand *ops,
+                            ZydisRegister *r1_out, ZydisRegister *r2_out) {
     static const ZydisRegister cands[] = {
         ZYDIS_REGISTER_R11, ZYDIS_REGISTER_R10, ZYDIS_REGISTER_RAX,
         ZYDIS_REGISTER_RCX, ZYDIS_REGISTER_RDX, ZYDIS_REGISTER_R8, ZYDIS_REGISTER_R9
     };
     uint16_t used = 0;
-    int k, b;
+    int k, b, found = 0;
+    ZydisRegister out[2] = { ZYDIS_REGISTER_NONE, ZYDIS_REGISTER_NONE };
     for (k = 0; k < ins->operand_count; k++) {
         if (ops[k].type == ZYDIS_OPERAND_TYPE_REGISTER) {
             b = gpr_bit(ops[k].reg.value);
@@ -1572,11 +1587,19 @@ static ZydisRegister pick_gs_scratch(const ZydisDecodedInstruction *ins, const Z
             if (b >= 0) used |= (uint16_t)(1u << b);
         }
     }
-    for (k = 0; k < (int)(sizeof cands / sizeof cands[0]); k++) {
+    for (k = 0; k < (int)(sizeof cands / sizeof cands[0]) && found < 2; k++) {
         b = gpr_bit(cands[k]);
-        if (b >= 0 && !(used & (uint16_t)(1u << b))) return cands[k];
+        if (b >= 0 && !(used & (uint16_t)(1u << b))) out[found++] = cands[k];
     }
-    return ZYDIS_REGISTER_NONE;
+    if (r1_out) *r1_out = out[0];
+    if (r2_out) *r2_out = out[1];
+    return found;
+}
+
+static ZydisRegister pick_gs_scratch(const ZydisDecodedInstruction *ins, const ZydisDecodedOperand *ops) {
+    ZydisRegister r1 = ZYDIS_REGISTER_NONE;
+    (void)pick_gs_scratch2(ins, ops, &r1, NULL);
+    return r1;
 }
 
 static int enc_mov_reg_gs(ZydisRegister reg, int32_t teb_off, unsigned char *out, size_t room) {
@@ -1617,6 +1640,21 @@ static int enc_mov_gs_reg(int32_t teb_off, ZydisRegister reg, unsigned char *out
     return (int)len;
 }
 
+static int enc_mov_reg32_reg32(ZydisRegister dst32, ZydisRegister src32, unsigned char *out, size_t room) {
+    ZydisEncoderRequest req;
+    ZyanUSize len = room;
+    memset(&req, 0, sizeof req);
+    req.mnemonic = ZYDIS_MNEMONIC_MOV;
+    req.machine_mode = ZYDIS_MACHINE_MODE_LONG_64;
+    req.operand_count = 2;
+    req.operands[0].type = ZYDIS_OPERAND_TYPE_REGISTER;
+    req.operands[0].reg.value = dst32;
+    req.operands[1].type = ZYDIS_OPERAND_TYPE_REGISTER;
+    req.operands[1].reg.value = src32;
+    if (!ZYAN_SUCCESS(ZydisEncoderEncodeInstruction(&req, out, &len))) return -1;
+    return (int)len;
+}
+
 static int gs_site(ZydisDecoder *dec, unsigned char *p, unsigned char *fstart, unsigned char *end,
                    unsigned char *const prev[3], const ZydisDecodedInstruction *ins,
                    const ZydisDecodedOperand *ops, int pred_first, fsite *f, const char **why) {
@@ -1627,13 +1665,13 @@ static int gs_site(ZydisDecoder *dec, unsigned char *p, unsigned char *fstart, u
     for (k = 0; k < ins->operand_count_visible; k++)
         if (ops[k].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[k].mem.segment == ZYDIS_REGISTER_GS) break;
     if (k == ins->operand_count_visible) { *why = "no gs: memory operand"; return 0; }
-    if (ins->address_width != 64) { *why = "32-bit address size"; return 0; }
+    if (ins->address_width != 64 && ins->address_width != 32) { *why = "unsupported address size"; return 0; }
     if (ins->mnemonic == ZYDIS_MNEMONIC_LEA) { *why = "lea ignores gs:"; return 0; }
     if (ins->attributes & ZYDIS_ATTRIB_IS_RELATIVE) { *why = "rip-relative gs: instruction"; return 0; }
 
     is_call_jmp = (ins->mnemonic == ZYDIS_MNEMONIC_CALL || ins->mnemonic == ZYDIS_MNEMONIC_JMP);
     if (transfers_control(ins)) {
-        if (!is_call_jmp) { *why = "unsupported control transfer with gs:"; return 0; }
+        if (!is_call_jmp || ins->address_width != 64) { *why = "unsupported control transfer with gs:"; return 0; }
         if (ops[k].size != 64 || ops[k].mem.base != ZYDIS_REGISTER_NONE || ops[k].mem.index != ZYDIS_REGISTER_NONE) {
             *why = "call/jmp through gs: must be 64-bit disp-only";
             return 0;
@@ -1647,15 +1685,27 @@ static int gs_site(ZydisDecoder *dec, unsigned char *p, unsigned char *fstart, u
         *why = "gs:[base+index]: unsupported index form";
         return 0;
     }
-    if (ops[k].mem.base != ZYDIS_REGISTER_NONE &&
-        (ops[k].mem.base == ZYDIS_REGISTER_RIP ||
-         ZydisRegisterGetWidth(ZYDIS_MACHINE_MODE_LONG_64, ops[k].mem.base) != 64)) {
-        *why = "gs: base register is not a 64-bit GPR";
-        return 0;
-    }
-    if (pick_gs_scratch(ins, ops) == ZYDIS_REGISTER_NONE) {
-        *why = "no free scratch register for gs: trampoline";
-        return 0;
+    if (ins->address_width == 32) {
+        if (ops[k].mem.base == ZYDIS_REGISTER_NONE ||
+            ZydisRegisterGetWidth(ZYDIS_MACHINE_MODE_LONG_64, ops[k].mem.base) != 32) {
+            *why = "32-bit address gs: requires 32-bit base GPR";
+            return 0;
+        }
+        if (pick_gs_scratch2(ins, ops, NULL, NULL) < 2) {
+            *why = "need 2 scratch regs for 32-bit gs:[reg32]";
+            return 0;
+        }
+    } else {
+        if (ops[k].mem.base != ZYDIS_REGISTER_NONE &&
+            (ops[k].mem.base == ZYDIS_REGISTER_RIP ||
+             ZydisRegisterGetWidth(ZYDIS_MACHINE_MODE_LONG_64, ops[k].mem.base) != 64)) {
+            *why = "gs: base register is not a 64-bit GPR";
+            return 0;
+        }
+        if (pick_gs_scratch(ins, ops) == ZYDIS_REGISTER_NONE) {
+            *why = "no free scratch register for gs: trampoline";
+            return 0;
+        }
     }
 
     f->ends_ret = 0;
@@ -1754,18 +1804,31 @@ static int gs_stub(ZydisDecoder *dec, const fsite *f,
         return o;
     }
 
-    /* Case A: non-branch %gs: memory instruction */
+    /* Case A: non-branch %gs: memory instruction (64-bit or 32-bit addr size) */
     {
-        ZydisRegister scratch = pick_gs_scratch(&ins, ops);
+        ZydisRegister scratch = ZYDIS_REGISTER_NONE, scratch2 = ZYDIS_REGISTER_NONE;
         ZydisEncoderRequest req;
         unsigned char enc[ZYDIS_MAX_INSTRUCTION_LENGTH];
         ZyanUSize elen = sizeof enc;
         ZydisRegister orig_base = ops[m].mem.base;
+        int is_addr32 = (ins.address_width == 32);
 
-        if (scratch == ZYDIS_REGISTER_NONE) return -1;
+        if (is_addr32) {
+            if (pick_gs_scratch2(&ins, ops, &scratch, &scratch2) < 2) return -1;
+            if (reg64_to_32(scratch2) == ZYDIS_REGISTER_NONE) return -1;
+        } else {
+            scratch = pick_gs_scratch(&ins, ops);
+            if (scratch == ZYDIS_REGISTER_NONE) return -1;
+        }
         if (!ZYAN_SUCCESS(ZydisEncoderDecodedInstructionToEncoderRequest(&ins, ops, ins.operand_count_visible, &req)))
             return -1;
-        if (orig_base == ZYDIS_REGISTER_NONE) {
+        if (is_addr32) {
+            req.address_size_hint = ZYDIS_ADDRESS_SIZE_HINT_64;
+            req.prefixes &= ~(ZydisInstructionAttributes)ZYDIS_ATTRIB_HAS_ADDRESSSIZE;
+            req.operands[m].mem.base = scratch;
+            req.operands[m].mem.index = scratch2;
+            req.operands[m].mem.scale = 1;
+        } else if (orig_base == ZYDIS_REGISTER_NONE) {
             req.operands[m].mem.base = scratch;
             req.operands[m].mem.index = ZYDIS_REGISTER_NONE;
             req.operands[m].mem.scale = 0;
@@ -1787,7 +1850,7 @@ static int gs_stub(ZydisDecoder *dec, const fsite *f,
             ZydisDecodedOperand eops[ZYDIS_MAX_OPERAND_COUNT];
             int m2;
             if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, enc, elen, &e, eops)) ||
-                e.mnemonic != ins.mnemonic ||
+                e.mnemonic != ins.mnemonic || e.address_width != 64 ||
                 (e.attributes & ZYDIS_ATTRIB_HAS_SEGMENT_GS) ||
                 e.operand_count_visible != ins.operand_count_visible)
                 return -1;
@@ -1797,7 +1860,10 @@ static int gs_stub(ZydisDecoder *dec, const fsite *f,
                 eops[m2].size != ops[m].size ||
                 eops[m2].mem.disp.value != ops[m].mem.disp.value)
                 return -1;
-            if (orig_base == ZYDIS_REGISTER_NONE) {
+            if (is_addr32) {
+                if (eops[m2].mem.base != scratch || eops[m2].mem.index != scratch2 || eops[m2].mem.scale != 1)
+                    return -1;
+            } else if (orig_base == ZYDIS_REGISTER_NONE) {
                 if (eops[m2].mem.base != scratch || eops[m2].mem.index != ZYDIS_REGISTER_NONE) return -1;
             } else if (orig_base == ZYDIS_REGISTER_RSP) {
                 if (eops[m2].mem.base != ZYDIS_REGISTER_RSP || eops[m2].mem.index != scratch || eops[m2].mem.scale != 1)
@@ -1816,15 +1882,30 @@ static int gs_stub(ZydisDecoder *dec, const fsite *f,
             if (!dry_run && copy_insn(dec, stub + o, q)) return -1;
             o += n.length; q += n.length;
         }
-        /* Save scratch, load ART gs base, execute access, restore scratch (zero stack/EFLAGS) */
+        /* Save scratch(es), load ART gs base (+ zero-extend reg32 if 0x67), execute access, restore */
         el = enc_mov_gs_reg(teb_s1, scratch, stub + o, room - (size_t)o);
         if (el < 0) return -1;
         o += el;
+        if (is_addr32) {
+            el = enc_mov_gs_reg(teb_s2, scratch2, stub + o, room - (size_t)o);
+            if (el < 0) return -1;
+            o += el;
+        }
         el = enc_mov_reg_gs(scratch, teb_base, stub + o, room - (size_t)o);
         if (el < 0) return -1;
         o += el;
+        if (is_addr32) {
+            el = enc_mov_reg32_reg32(reg64_to_32(scratch2), orig_base, stub + o, room - (size_t)o);
+            if (el < 0) return -1;
+            o += el;
+        }
         if (room - (size_t)o < (size_t)elen + 48) return -1;
         memcpy(stub + o, enc, elen); o += (int)elen;
+        if (is_addr32) {
+            el = enc_mov_reg_gs(scratch2, teb_s2, stub + o, room - (size_t)o);
+            if (el < 0) return -1;
+            o += el;
+        }
         el = enc_mov_reg_gs(scratch, teb_s1, stub + o, room - (size_t)o);
         if (el < 0) return -1;
         o += el;

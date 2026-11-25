@@ -227,24 +227,81 @@ int afw_func_bounds(const afw_lib *lib, uint64_t addr, uint64_t *start, uint64_t
     return 0;
 }
 
+typedef struct { unsigned char *start; size_t size; } func_range_tmp;
+static int cmp_func_range(const void *a, const void *b) {
+    const func_range_tmp *x = (const func_range_tmp *)a, *y = (const func_range_tmp *)b;
+    if (x->start < y->start) return -1;
+    if (x->start > y->start) return 1;
+    return (x->size > y->size) - (x->size < y->size);
+}
+
 int afw_func_list(const afw_lib *lib, unsigned char ***starts, size_t **sizes) {
     const int32_t *tab;
     uint64_t count, i, hdr = (uint64_t)(uintptr_t)lib->eh_frame_hdr;
-    int n = 0;
+    func_range_tmp *tmp;
+    size_t cap, n = 0, k;
     *starts = NULL; *sizes = NULL;
     if (!hdr_table(lib, &tab, &count) || !count) return 0;
-    *starts = (unsigned char **)malloc((size_t)count * sizeof **starts);
-    *sizes = (size_t *)malloc((size_t)count * sizeof **sizes);
+    cap = (size_t)count + (lib->symtab ? lib->nsyms : 0);
+    tmp = (func_range_tmp *)malloc(cap * sizeof *tmp);
+    if (!tmp) return 0;
     for (i = 0; i < count; i++) {
         uint64_t s0, e0, lsda;
         const unsigned char *fde = (const unsigned char *)(uintptr_t)(hdr + (int64_t)tab[2 * i + 1]);
         if (fde_parse(lib, fde, &s0, &e0, &lsda) == FDE_BAD || e0 <= s0) continue;
         if (s0 < (uint64_t)(uintptr_t)lib->base || e0 > (uint64_t)(uintptr_t)lib->base + lib->size) continue;
-        (*starts)[n] = (unsigned char *)(uintptr_t)s0;
-        (*sizes)[n] = (size_t)(e0 - s0);
+        tmp[n].start = (unsigned char *)(uintptr_t)s0;
+        tmp[n].size  = (size_t)(e0 - s0);
         n++;
     }
-    return n;
+    /* Also include exported STT_FUNC symbols without .eh_frame FDEs (e.g.
+     * hand-written assembly entrypoints like ART's ExecuteNterpWithClinitImpl),
+     * skipping any that overlap an existing FDE. */
+    if (lib->symtab && lib->nsyms > 1 && n > 0) {
+        size_t nfde = n;
+        qsort(tmp, nfde, sizeof *tmp, cmp_func_range);
+        for (i = 1; i < lib->nsyms; i++) {
+            const Elf64_Sym *s = &lib->symtab[i];
+            uint64_t s0, e0;
+            size_t lo = 0, hi = nfde;
+            int overlap = 0;
+            if (s->st_shndx == SHN_UNDEF || ELF64_ST_TYPE(s->st_info) != STT_FUNC || !s->st_size) continue;
+            s0 = (uint64_t)lib->bias + s->st_value;
+            e0 = s0 + s->st_size;
+            if (e0 <= s0 || s0 < (uint64_t)(uintptr_t)lib->base || e0 > (uint64_t)(uintptr_t)lib->base + lib->size)
+                continue;
+            while (lo < hi) {
+                size_t mid = lo + (hi - lo) / 2;
+                if ((uint64_t)(uintptr_t)tmp[mid].start <= s0) lo = mid + 1; else hi = mid;
+            }
+            if (lo > 0 && (uint64_t)(uintptr_t)tmp[lo - 1].start + tmp[lo - 1].size > s0) overlap = 1;
+            if (lo < nfde && (uint64_t)(uintptr_t)tmp[lo].start < e0) overlap = 1;
+            if (!overlap && n < cap) {
+                tmp[n].start = (unsigned char *)(uintptr_t)s0;
+                tmp[n].size  = (size_t)(e0 - s0);
+                n++;
+            }
+        }
+        if (n > nfde) {
+            /* Sort and deduplicate any overlapping .dynsym aliases */
+            size_t w = 0;
+            qsort(tmp, n, sizeof *tmp, cmp_func_range);
+            for (k = 0; k < n; k++) {
+                if (w > 0 && tmp[k].start < tmp[w - 1].start + tmp[w - 1].size) continue;
+                tmp[w++] = tmp[k];
+            }
+            n = w;
+        }
+    }
+    *starts = (unsigned char **)malloc((n ? n : 1) * sizeof **starts);
+    *sizes = (size_t *)malloc((n ? n : 1) * sizeof **sizes);
+    if (!*starts || !*sizes) { free(*starts); free(*sizes); *starts = NULL; *sizes = NULL; free(tmp); return 0; }
+    for (k = 0; k < n; k++) {
+        (*starts)[k] = tmp[k].start;
+        (*sizes)[k]  = tmp[k].size;
+    }
+    free(tmp);
+    return (int)n;
 }
 
 /*

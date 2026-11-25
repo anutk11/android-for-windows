@@ -162,7 +162,7 @@ def extract_art_full(system, out):
     os.makedirs(jar_dir, exist_ok=True)
     os.makedirs(icu_dir, exist_ok=True)
 
-    bionic_skip = {"libc.so", "libm.so", "libdl.so"}
+    bionic_skip = {"libc.so", "libm.so", "libdl.so", "ld-android.so"}
     have = set(bionic_skip)
     queue = []
 

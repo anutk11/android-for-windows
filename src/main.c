@@ -725,7 +725,7 @@ static DWORD WINAPI art_gs_thread(LPVOID p) {
 #endif
 
 static int run_art_gs_tests(const afw_lib *lib) {
-    static const char *names[10] = {
+    static const char *names[11] = {
         "SYS_arch_prctl ARCH_SET_GS / ARCH_GET_GS",
         "movq read (gs:0x0, gs:0xe0) & write (gs:0xb0)",
         "movl read & write (gs:0x28)",
@@ -735,23 +735,24 @@ static int run_art_gs_tests(const afw_lib *lib) {
         "testl directly on gs:0x28 (EFLAGS preserved)",
         "pushq gs:0xe0 (zero stack clobber)",
         "call *gs:0x228 (all regs & return PC preserved)",
-        "gs:[reg] register-based read"
+        "gs:[reg] register-based read",
+        "0x67 32-bit addr-size gs:(%eax) zero-extended read (Thread::InitCpu)"
     };
     int bits, k;
     g_art_gs_fn = (art_gs_worker_fn)afw_sym(lib, "afw_art_gs_worker");
     printf("\n=== G3 ART %%gs: emulation tests (--art-gs, %d/%d trampolined) ===\n",
            lib->patch.gs_trampolined, lib->patch.gs_feasible);
     check("all gs: sites were trampolined with 0 unsupported",
-          lib->patch.gs_feasible >= 12 && lib->patch.gs_trampolined == lib->patch.gs_feasible &&
+          lib->patch.gs_feasible >= 13 && lib->patch.gs_trampolined == lib->patch.gs_feasible &&
           lib->patch.gs_unsupported == 0);
     bits = g_art_gs_fn ? g_art_gs_fn(0x1122334455667788ULL) : 0;
-    for (k = 0; k < 10; k++) check(names[k], (bits >> k) & 1);
+    for (k = 0; k < 11; k++) check(names[k], (bits >> k) & 1);
 #if defined(_WIN32)
     {
         int t_bits = 0;
         HANDLE t = CreateThread(NULL, 0, art_gs_thread, &t_bits, 0, NULL);
         if (t) { WaitForSingleObject(t, INFINITE); CloseHandle(t); }
-        check("second thread runs all 10 gs: checks with independent ARCH_SET_GS base", t_bits == 0x3FF);
+        check("second thread runs all 11 gs: checks with independent ARCH_SET_GS base", t_bits == 0x7FF);
     }
 #endif
     printf("%s\n", g_failed ? "G3 ART GS TESTS FAILED" : "G3 ART GS TESTS PASSED");

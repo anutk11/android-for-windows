@@ -165,5 +165,12 @@ int afw_art_gs_worker(uint64_t seed) {
     if (reg_v == seed)
         bits |= (1 << 9);
 
+    /* bit 10: 32-bit address size (0x67) movq %gs:(%eax), %reg (art::Thread::InitCpu)
+     * Put non-zero garbage in upper 32 bits of rax to prove zero-extension! */
+    uint64_t dirty_rax = 0xDEADBEEF000000E0ULL, reg32_v = 0;
+    __asm__ volatile("movq %%gs:(%%eax), %0" : "=r"(reg32_v) : "a"(dirty_rax));
+    if (reg32_v == seed)
+        bits |= (1 << 10);
+
     return bits;
 }
