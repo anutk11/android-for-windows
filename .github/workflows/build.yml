@@ -162,7 +162,7 @@ jobs:
           mkdir -p out/g3_java/cls
           javac --release 8 -Xlint:-options -d out/g3_java/cls test/G3ArtTest.java
           D8=$(find "${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}/build-tools" -name d8 -type f | sort -V | tail -n 1)
-          "$D8" --min-api 24 --output out/g3_java_test.jar out/g3_java/cls/G3ArtTest.class
+          "$D8" --min-api 24 --output out/g3_java_test.jar out/g3_java/cls/*.class
           echo "--- G2a/G2b/G3 Gate DT_NEEDED (must dynamically link libc++_shared.so across all DSOs and PIEs)"
           for f in out/libcxx_thrower.so out/libcxx_catcher.so out/libdlopen_cxx.so out/cxx_gate_exe out/libg2b_dlopen_tls.so out/g2b_gate_exe out/g3_art_gate_exe; do
             echo "$f:"
