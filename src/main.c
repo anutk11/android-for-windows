@@ -20,6 +20,7 @@
 #include "tls_patch.h"
 #include "crash.h"
 #include "syscall.h"
+#include "attest.h"
 #include "tls_static.h"
 #include "vma.h"
 
@@ -755,6 +756,10 @@ int main(int argc, char **argv) {
         printf("usage: %s <library.so> [-v]\n", argv[0]);
         return 2;
     }
+#ifdef AFW_TEST
+    if (strcmp(argv[1], "--test-must-queue") == 0)
+        return afw_patch_test_must_queue();
+#endif
     if (argc > 2 && strcmp(argv[2], "-v") == 0) verbose = 2;
     if (argc > 2 && strcmp(argv[2], "--patch-report") == 0) afw_load_patch_only = 1;
     {
@@ -762,6 +767,13 @@ int main(int argc, char **argv) {
         for (a = 2; a < argc; a++) {
             if (strcmp(argv[a], "--strict") == 0) strict = 1;
             else if (strcmp(argv[a], "--allow-unproven") == 0) afw_load_allow_unproven = 1;
+            else if (strcmp(argv[a], "--attest-dump") == 0) afw_attest_dump = 1;
+#ifdef AFW_TEST
+            else if (strncmp(argv[a], "--attest-tamper=", 16) == 0) afw_attest_set_tamper(argv[a] + 16);
+            else if (strncmp(argv[a], "--attest-add=", 13) == 0) {
+                if (afw_attest_add_test(argv[a] + 13) != 0) { fprintf(stderr, "bad --attest-add\n"); return 2; }
+            }
+#endif
             else if (strcmp(argv[a], "--call-trap") == 0) call_trap = 1;
             else if (strncmp(argv[a], "--min-landing-pads=", 19) == 0) min_pads = atoi(argv[a] + 19);
             else if (strncmp(argv[a], "--preload-fail=", 15) == 0) preload_fail = argv[a] + 15;
@@ -993,9 +1005,14 @@ int main(int argc, char **argv) {
     if (lib.patch.sys_refused_redzone)
         printf("  red zone refusals: %d [rsp-N], %d [frame reg - N] beyond sub rsp\n",
                lib.patch.redzone_direct, lib.patch.redzone_via_copy);
-    if (afw_load_patch_only)
+    if (afw_load_patch_only) {
+        printf("SHA256 %s: %s\n", lib.soname ? lib.soname : argv[1], lib.sha256);
+        printf("ATTEST %s: %d applied, %d rejected, %d look-alikes reached only through attested entries, "
+               "%d unproven left\n", lib.soname ? lib.soname : argv[1], lib.patch.attest_applied,
+               lib.patch.attest_rejected, lib.patch.via_attestation, lib.patch.unproven);
         printf("GATE %s: %s\n", lib.soname ? lib.soname : argv[1],
                afw_gate_ok(&lib) ? "would RUN" : "would REFUSE");
+    }
     if (afw_load_patch_only && !afw_gate_ok(&lib))
             printf("GATE reasons: unproven %d, lsda failures %d, syscall untouched %d, syscall outside %d, "
                    "fs unsupported %d, fs outside %d, gs unsupported %d, gs outside %d, fs:[reg] %d/%d\n",

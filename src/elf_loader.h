@@ -41,7 +41,13 @@ typedef struct afw_lib_s {
     const unsigned char *eh_frame_hdr;   /* for function boundaries */
     uint64_t xsec_vaddr[16], xsec_size[16]; /* SHF_EXECINSTR sections */
     int nxsec;
+    int xsec_truncated;                     /* >16 SHF_ALLOC|SHF_EXECINSTR sections */
     afw_patch_report patch;
+
+    char sha256[65];            /* of the file as read, before mapping or patching */
+    afw_attest attest_buf[16];  /* attestations matched to this binary */
+    const unsigned char *load_prot;  /* per-page PF_ flags from the file, only while patching */
+    size_t load_npages;
 
     int tls_module;
     /* IRELATIVE relocations, run only after the code is patched and executable */
@@ -83,6 +89,7 @@ extern int afw_load_patch_only;
  * (look-alikes in undecided functions, undecodable exception tables). This
  * flag overrides that, for diagnosis only. */
 extern int afw_load_allow_unproven;
+extern int afw_attest_dump;   /* print ATTEST-DETAIL evidence while loading */
 /* How many libraries are registered (tests: a failed load must not count). */
 int afw_loaded_count(void);
 /* How many failed libraries are quarantined (past point of no return: TLS

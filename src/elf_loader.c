@@ -11,10 +11,12 @@
  *   7. Run the library's constructors.
  */
 #include "elf_loader.h"
+#include "attest.h"
 #include "bionic_shim.h"
 #include "exec.h"
 #include "funcs.h"
 #include "platform.h"
+#include "sha256.h"
 #include "tls_static.h"
 #include "vma.h"
 
@@ -29,10 +31,11 @@ typedef SYSV void (*init_fn)(void);
 
 int afw_load_patch_only;
 int afw_load_allow_unproven;
+int afw_attest_dump;
 
 int afw_gate_ok(const afw_lib *lib) {
     const afw_patch_report *r = &lib->patch;
-    return !r->unproven && !r->lsda_failures && !r->sys_untouched && !r->sys_outside_functions &&
+    return !r->unproven && !r->attest_rejected && !r->lsda_failures && !r->sys_untouched && !r->sys_outside_functions &&
            !r->fs_unsupported &&
            !r->gs_unsupported && !r->gs_outside_functions &&   /* gs: is the TEB on Windows (issue #15) */
            !r->fs_outside_functions &&   /* fs: look-alikes outside .eh_frame (reviewer 4); measured 0 in bionic */
@@ -304,6 +307,20 @@ static int patch_bounds(const void *ctx, uint64_t addr, uint64_t *s, uint64_t *e
 static int patch_entries(const void *ctx, uint64_t func, uint64_t *out, int max) {
     return afw_func_landing_pads((const afw_lib *)ctx, func, out, max);
 }
+/* Every page of [addr, addr+len) is mapped by the file readable and NOT
+ * writable (no overflow, no crossing into a writable or unmapped page). */
+static int patch_readonly(const void *ctx, uint64_t addr, uint64_t len) {
+    const afw_lib *lib = (const afw_lib *)ctx;
+    uint64_t b = (uint64_t)(uintptr_t)lib->base, off, last, pg;
+    if (!lib->load_prot || len == 0 || !afw_lib_readable(lib, addr, len)) return 0;
+    off = addr - b;
+    last = off + len - 1;
+    for (pg = off / AFW_PAGE_SIZE; pg <= last / AFW_PAGE_SIZE; pg++) {
+        if (pg >= lib->load_npages) return 0;
+        if (!(lib->load_prot[pg] & PF_R) || (lib->load_prot[pg] & PF_W)) return 0;
+    }
+    return 1;
+}
 static int patch_readable(const void *ctx, uint64_t addr, uint64_t len) {
     return afw_lib_readable((const afw_lib *)ctx, addr, len);
 }
@@ -361,6 +378,11 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
 
     /* 1. Read and validate ------------------------------------------ */
     file = read_file(path, &fsize);
+    if (file) {                         /* identity of exactly these bytes (attestations, reports) */
+        uint8_t h[32];
+        afw_sha256(file, fsize, h);
+        afw_sha256_hex(h, lib->sha256);
+    }
     if (!file) { fprintf(stderr, "error: cannot read '%s'\n", path); return -1; }
     eh = (Elf64_Ehdr *)file;
 
@@ -398,11 +420,15 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
      * only these, not whole PT_LOAD segments that also hold .dynstr/.rodata */
     if (eh->e_shoff && eh->e_shnum && eh->e_shoff + (uint64_t)eh->e_shnum * sizeof(Elf64_Shdr) <= fsize) {
         const Elf64_Shdr *sh = (const Elf64_Shdr *)(file + eh->e_shoff);
-        for (i = 0; i < eh->e_shnum && lib->nxsec < 16; i++)
+        for (i = 0; i < eh->e_shnum; i++)
             if ((sh[i].sh_flags & (SHF_ALLOC | SHF_EXECINSTR)) == (SHF_ALLOC | SHF_EXECINSTR) && sh[i].sh_size) {
-                lib->xsec_vaddr[lib->nxsec] = sh[i].sh_addr;
-                lib->xsec_size[lib->nxsec] = sh[i].sh_size;
-                lib->nxsec++;
+                if (lib->nxsec < 16) {
+                    lib->xsec_vaddr[lib->nxsec] = sh[i].sh_addr;
+                    lib->xsec_size[lib->nxsec] = sh[i].sh_size;
+                    lib->nxsec++;
+                } else {
+                    lib->xsec_truncated = 1;
+                }
             }
     }
 
@@ -651,8 +677,8 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
          * fs: access or a syscall and be "patched" into garbage. Fallback,
          * when there is no .eh_frame_hdr: whole executable segments, where
          * patch.c still requires known function bounds before changing bytes. */
-        afw_code_range *cr, segs[8];
-        int nsegs = 0, have_funcs;
+        afw_code_range *cr, segs[16];
+        int nsegs = 0, segs_truncated = 0, have_funcs;
         unsigned char **fstart;
         size_t *fsize;
         int ncr = afw_func_list(lib, &fstart, &fsize), k;
@@ -661,8 +687,8 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
             cr = (afw_code_range *)malloc((size_t)ncr * sizeof *cr);
             for (k = 0; k < ncr; k++) { cr[k].addr = fstart[k]; cr[k].size = fsize[k]; }
         } else {
-            cr = (afw_code_range *)malloc(8 * sizeof *cr);
-            for (i = 0; i < npages && ncr < 8;) {
+            cr = (afw_code_range *)malloc(16 * sizeof *cr);
+            for (i = 0; i < npages && ncr < 16;) {
                 size_t j = i;
                 if (!(pageprot[i] & PF_X)) { i++; continue; }
                 while (j < npages && (pageprot[j] & PF_X)) j++;
@@ -674,33 +700,52 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
         }
         free(fstart); free(fsize);
         if (lib->nxsec) {
-            for (k = 0; k < lib->nxsec && k < 8; k++) {
+            for (k = 0; k < lib->nxsec && k < 16; k++) {
                 segs[k].addr = (unsigned char *)(lib->bias + lib->xsec_vaddr[k]);
                 segs[k].size = (size_t)lib->xsec_size[k];
             }
             nsegs = k;
+            segs_truncated = lib->xsec_truncated || (lib->nxsec > 16);
         } else {
             int nseg = 0;
-            for (i = 0; i < npages && nseg < 8;) {
+            for (i = 0; i < npages;) {
                 size_t j = i;
                 if (!(pageprot[i] & PF_X)) { i++; continue; }
                 while (j < npages && (pageprot[j] & PF_X)) j++;
-                segs[nseg].addr = lib->base + i * AFW_PAGE_SIZE;
-                segs[nseg].size = (j - i) * AFW_PAGE_SIZE;
-                nseg++;
+                if (nseg < 16) {
+                    segs[nseg].addr = lib->base + i * AFW_PAGE_SIZE;
+                    segs[nseg].size = (j - i) * AFW_PAGE_SIZE;
+                    nseg++;
+                } else {
+                    segs_truncated = 1;
+                }
                 i = j;
             }
             nsegs = nseg;
         }
         if (verbose) printf("Code:       %d %s decoded\n", ncr, lib->eh_frame_hdr ? "functions (.eh_frame)" : "segments (no .eh_frame_hdr)");
         afw_patch_ctx pc;
+        memset(&pc, 0, sizeof pc);
         pc.bounds = patch_bounds; pc.ctx = lib; pc.bias = lib->bias; pc.name = lib->soname ? lib->soname : path;
-        pc.ranges_are_functions = have_funcs; pc.segs = segs; pc.nsegs = nsegs;
+        pc.ranges_are_functions = have_funcs; pc.segs = segs; pc.nsegs = nsegs; pc.segs_truncated = segs_truncated;
         pc.entries = patch_entries;
-        pc.readable = patch_readable;
-        if (afw_patch_code(cr, ncr, lib->stub_area, AFW_STUB_RESERVE, &pc, &lib->patch, verbose) < 0) {
-            fprintf(stderr, "error: could not patch %s safely; refusing to run it\n", path);
+        pc.attest = afw_attest_for(lib->sha256, lib->attest_buf, (int)(sizeof lib->attest_buf / sizeof lib->attest_buf[0]), &pc.nattest);
+        pc.readonly = patch_readonly;
+        pc.attest_dump = afw_attest_dump;
+        lib->load_prot = pageprot; lib->load_npages = npages;
+        if (pc.nattest < 0) {
+            fprintf(stderr, "error: attestation table for %s cannot be read; refusing to run it\n", path);
+            lib->load_prot = NULL; lib->load_npages = 0;
             free(cr); free(pageprot); return -1;
+        }
+        pc.readable = patch_readable;
+        {
+            int prc = afw_patch_code(cr, ncr, lib->stub_area, AFW_STUB_RESERVE, &pc, &lib->patch, verbose);
+            lib->load_prot = NULL; lib->load_npages = 0;   /* pageprot is freed below */
+            if (prc < 0) {
+                fprintf(stderr, "error: could not patch %s safely; refusing to run it\n", path);
+                free(cr); free(pageprot); return -1;
+            }
         }
         free(cr);
         if (!afw_load_patch_only && !afw_load_allow_unproven && !afw_gate_ok(lib)) {
