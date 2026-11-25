@@ -57,7 +57,7 @@ public class LayoutInflater {
         else if ("View".equals(tag)) v = new View(mContext);
         else {
             try {
-                Class<?> c = Class.forName(tag);
+                Class<?> c = Class.forName(tag, true, com.afw.AfwLauncher.getAppClassLoader());
                 v = (View) c.getConstructor(Context.class).newInstance(mContext);
             } catch (Throwable ignored) {
                 v = new FrameLayout(mContext);

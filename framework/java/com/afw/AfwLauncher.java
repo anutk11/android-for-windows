@@ -44,6 +44,8 @@ public final class AfwLauncher {
     private static boolean sRunning = true;
     private static long sTouchDownTime = 0;
 
+    private static ClassLoader sAppClassLoader;
+
     private AfwLauncher() {}
 
     public static ZipFile getApkZip() { return sApkZip; }
@@ -52,6 +54,9 @@ public final class AfwLauncher {
     public static AfwAxml.ManifestInfo getManifest() { return sManifest; }
     public static Application getApplication() { return sApplication; }
     public static Map<Integer, String> getResourceStrings() { return sResStrings; }
+    public static ClassLoader getAppClassLoader() {
+        return sAppClassLoader != null ? sAppClassLoader : ClassLoader.getSystemClassLoader();
+    }
 
     public static void requestFinish(Activity act) {
         if (sActivityStack.size() <= 1) {
@@ -71,7 +76,7 @@ public final class AfwLauncher {
         try {
             Activity prev = sActivityStack.peek();
             if (prev != null) prev.dispatchPause();
-            Class<?> cls = Class.forName(intent.getClassName());
+            Class<?> cls = Class.forName(intent.getClassName(), true, getAppClassLoader());
             Activity next = (Activity) cls.getDeclaredConstructor().newInstance();
             next.attachAfw(sApplication, intent);
             sActivityStack.push(next);
@@ -176,8 +181,11 @@ public final class AfwLauncher {
             AssetManager am = new AssetManager(sApkZip);
             Resources res = new Resources(am, dm, sResStrings);
 
+            sAppClassLoader = ClassLoader.getSystemClassLoader();
+            Thread.currentThread().setContextClassLoader(sAppClassLoader);
+
             if (sManifest.applicationClass != null) {
-                Class<?> appCls = Class.forName(sManifest.applicationClass);
+                Class<?> appCls = Class.forName(sManifest.applicationClass, true, sAppClassLoader);
                 sApplication = (Application) appCls.getDeclaredConstructor().newInstance();
             } else {
                 sApplication = new Application();
@@ -185,7 +193,7 @@ public final class AfwLauncher {
             sApplication.initAfw(sManifest.packageName, sDataDir, res, am);
             sApplication.onCreate();
 
-            Class<?> actCls = Class.forName(sManifest.mainActivity);
+            Class<?> actCls = Class.forName(sManifest.mainActivity, true, sAppClassLoader);
             Activity mainAct = (Activity) actCls.getDeclaredConstructor().newInstance();
             Intent launchIntent = new Intent(Intent.ACTION_MAIN);
             launchIntent.setClassName(sManifest.packageName, sManifest.mainActivity);
