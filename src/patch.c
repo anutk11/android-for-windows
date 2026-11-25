@@ -1260,6 +1260,18 @@ static unsigned char *reach_map(ZydisDecoder *dec, unsigned char *base, size_t s
                         if (f->bound[src] && f->bound[src] <= 0x100000000ull &&
                             (!keep_bound || f->bound[src] < keep_bound)) keep_bound = f->bound[src];
                         recognised = 1;
+                    } else if (ins.mnemonic == ZYDIS_MNEMONIC_AND && ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+                               ((ops[0].size == 32 && ZydisRegisterGetClass(ops[0].reg.value) == ZYDIS_REGCLASS_GPR32) ||
+                                (ops[0].size == 64 && ZydisRegisterGetClass(ops[0].reg.value) == ZYDIS_REGCLASS_GPR64))) {
+                        /* Bitwise AND with immediate M bounds the full 64-bit register to [0, M]:
+                         *   - AND r32, M zero-extends to 64 bits (x86-64 ISA), so r64 <= (M & 0xFFFFFFFFu).
+                         *   - AND r64, M masks all 64 bits (Zydis sign-extends imm8/imm32, so negative
+                         *     immediates become >= 0xFFFFFFFF80000000 and are rejected by mask < 4096). */
+                        uint64_t mask = (ops[0].size == 32) ? (ops[1].imm.value.u & 0xFFFFFFFFu) : ops[1].imm.value.u;
+                        if (mask < 4096u) {
+                            keep_bound = mask + 1u;
+                            recognised = 1;
+                        }
                     } else if (ins.mnemonic == ZYDIS_MNEMONIC_MOVSXD && ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
                                ops[1].mem.scale == 4 && ops[1].mem.disp.value == 0 &&
                                ops[1].mem.base != ZYDIS_REGISTER_NONE && f->lea[ops[1].mem.base] &&

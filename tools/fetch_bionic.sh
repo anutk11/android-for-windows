@@ -71,6 +71,7 @@ for A in com.android.runtime.apex com.android.runtime.capex; do
     if [ -f "$W/apex/apex_payload.img" ] && dbg_dump "$W/apex/apex_payload.img" /lib64/bionic/libc.so "$W/libc.so"; then
       GOT="runtime APEX ($A) /lib64/bionic/libc.so"
       dbg_ls "$W/apex/apex_payload.img" /lib64/bionic
+      dbg_dump "$W/apex/apex_payload.img" /lib64/bionic/libm.so "$W/libm.so" || true
       dbg_dump "$W/apex/apex_payload.img" /bin/linker64 "$W/linker64" || true
       break
     fi

@@ -195,7 +195,7 @@ jobs:
           bash tools/build_linux.sh
           NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
           cp "$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/x86_64-linux-android/libc++_shared.so" out/
-          for f in out/bionic/libc.so out/bionic/linker64 out/libc++_shared.so; do
+          for f in out/bionic/libc.so out/bionic/libm.so out/bionic/linker64 out/libc++_shared.so; do
             echo "================ $f"
             out/afw-loader "$f" --patch-report 2>&1 | grep -vE "^  MISSING" | tee -a out/patch-scan.txt
           done
@@ -204,6 +204,9 @@ jobs:
           test "$(grep -c "fs:\[reg\] at libc.so+0x[0-9a-f]*: ELF TLS access, trampoline" out/patch-scan.txt)" -eq 17
           grep -E "fs:\[reg\] at libc" out/patch-scan.txt || true
           grep -q "GATE libc.so: would RUN" out/patch-scan.txt
+          # libm: RUN with 0 attestations and 0 unproven (quadrant switch `and r32, 3` proven by reach_map)
+          grep -q "ATTEST libm.so: 0 applied, 0 rejected, 0 look-alikes reached only through attested entries, 0 unproven left" out/patch-scan.txt
+          grep -q "GATE libm.so: would RUN" out/patch-scan.txt
           # linker64 & libc++_shared.so: RUN only through the pinned attestations in src/attest.c
           # (issue #2, PR #7 + cross-block must_hold_table); all 9 sites are ATTESTED, never proven
           grep -E "^(SHA256|ATTEST|GATE) |\[attest\]|\[audit\] ATTESTED" out/patch-scan.txt || true
