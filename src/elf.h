@@ -85,6 +85,7 @@ typedef struct {
 #define DT_RELR 36
 #define DT_ANDROID_REL 0x6000000f
 #define DT_ANDROID_RELA 0x60000011
+#define DT_ANDROID_RELASZ 0x60000012
 #define DT_GNU_HASH 0x6ffffef5
 
 typedef struct {

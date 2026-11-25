@@ -268,6 +268,8 @@ static const shim_entry g_shims[] = {
     S("__loader_dlclose", afw_l_dlclose),
     S("__loader_dladdr", afw_l_dladdr),
     S("__loader_dl_iterate_phdr", afw_l_dl_iterate_phdr),
+    S("__loader_add_thread_local_dtor", afw_l_add_thread_local_dtor),
+    S("__loader_remove_thread_local_dtor", afw_l_remove_thread_local_dtor),
     S("__loader_android_get_LD_LIBRARY_PATH", afw_l_android_get_LD_LIBRARY_PATH),
     S("__loader_android_get_application_target_sdk_version", afw_l_android_get_application_target_sdk_version),
     S("__loader_android_handle_signal", afw_l_android_handle_signal),

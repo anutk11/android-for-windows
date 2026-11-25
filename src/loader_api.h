@@ -20,4 +20,6 @@ SYSV void afw_l_cfi_fail(uint64_t id, void *ptr, void *diag, const void *caller)
 /* info: bionic's Dl_info / dl_phdr_info (LP64), laid out in loader_api.c */
 SYSV int afw_l_dladdr(const void *addr, void *info);
 SYSV int afw_l_dl_iterate_phdr(SYSV int (*cb)(void *info, size_t size, void *data), void *data);
+SYSV void afw_l_add_thread_local_dtor(void *dso_handle);
+SYSV void afw_l_remove_thread_local_dtor(void *dso_handle);
 #endif

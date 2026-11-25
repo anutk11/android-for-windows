@@ -165,6 +165,9 @@ void      afw_os_event_destroy(afw_os_event ev);
 int       afw_os_thread_ctx_fls_set(void (*release_cb)(void *), void *ctx);
 void      afw_os_atomic_store_i32(void *addr, int32_t val);
 int32_t   afw_os_atomic_xchg_i32(int32_t *addr, int32_t val);
+int32_t   afw_os_atomic_add_i32(int32_t *addr, int32_t delta);
+int32_t   afw_os_atomic_cmpxchg_i32(int32_t *addr, int32_t expected, int32_t desired);
+int32_t   afw_os_atomic_load_i32(const int32_t *addr);
 uintptr_t afw_os_atomic_xchg_uptr(uintptr_t *addr, uintptr_t val);
 void      afw_os_atomic_store_uptr(uintptr_t *addr, uintptr_t val);
 void      afw_os_wake_address_all(void *addr);
@@ -173,5 +176,14 @@ int       afw_os_clone_supported(void);
 void      afw_os_clone_enter_bionic(afw_os_clone_trampoline *t);
 void      afw_os_clone_exit_on_host(afw_os_clone_trampoline *t, void *ctx,
                                     int exit_code, void (*fn)(void *, int));
+
+/* ---- G2-5a Loader registry RW lock & recursive dlopen lock (Rule 8) ----
+ * Completely separate from VMA g_lock and NEVER acquired inside VEH. */
+void afw_libs_rdlock(void);
+void afw_libs_rdunlock(void);
+void afw_libs_wrlock(void);
+void afw_libs_wrunlock(void);
+void afw_dlopen_lock(void);
+void afw_dlopen_unlock(void);
 
 #endif

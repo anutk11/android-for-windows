@@ -44,42 +44,63 @@ int afw_gate_ok(const afw_lib *lib) {
            (afw_load_patch_only || r->fs_reg_trampolined == r->fs_reg_feasible);
 }
 
-#define MAX_LIBS 64
+#define MAX_LIBS AFW_MAX_LIBS
 static afw_lib *g_libs[MAX_LIBS];
 static int g_nlibs;
+static unsigned long long g_libs_adds;   /* monotonic finished-library count (dlpi_adds) */
 static afw_lib *g_quarantine_head;   /* intrusive list: unbounded, zero-alloc, fail-safe under OOM */
 static int g_nquarantine;
+
+/* Append-only, immutable crash-diagnostic table for VEH (src/crash.c).
+ * Entries are written once in lib_finish() under afw_libs_wrlock() ONLY after
+ * a library reaches pending == 0 (never discarded/freed/moved) and published
+ * via seq_cst store to g_ncrash_libs. */
+typedef struct {
+    uintptr_t        base;
+    size_t           size;
+    intptr_t         bias;
+    const Elf64_Sym *symtab;
+    const char      *strtab;
+    size_t           nsyms;
+    const char      *name;
+} afw_crash_entry;
+
+static afw_crash_entry g_crash_libs[MAX_LIBS];
+static int32_t         g_ncrash_libs;
 
 #ifdef AFW_TEST
 static int g_fail_adopt;
 void afw_load_test_fail_adopt(int nth) { g_fail_adopt = nth; }
 #endif
 
+/* Crash-handler diagnostic (called from VEH in src/crash.c): MUST remain
+ * lock-free and never acquire afw_libs_rdlock() or VMA g_lock. Reads only
+ * immutable entries published before the acquire load of g_ncrash_libs. */
 int afw_describe_address(uintptr_t addr, char *out, size_t outsz) {
-    int k;
-    for (k = 0; k < g_nlibs; k++) {
-        const afw_lib *lib = g_libs[k];
-        uintptr_t b = (uintptr_t)lib->base;
+    int32_t k, n = afw_os_atomic_load_i32(&g_ncrash_libs);
+    if (n < 0) n = 0;
+    if (n > MAX_LIBS) n = MAX_LIBS;
+    for (k = 0; k < n; k++) {
+        const afw_crash_entry *e = &g_crash_libs[k];
         const char *best = NULL;
         uint64_t best_v = 0, off;
         size_t i;
-        if (!lib->base || addr < b || addr - b >= lib->size) continue;
-        off = (uint64_t)(addr - (uintptr_t)lib->bias);
-        for (i = 1; i < lib->nsyms; i++) {
-            const Elf64_Sym *s = &lib->symtab[i];
+        if (!e->base || addr < e->base || addr - e->base >= e->size) continue;
+        off = (uint64_t)(addr - (uintptr_t)e->bias);
+        for (i = 1; i < e->nsyms; i++) {
+            const Elf64_Sym *s = &e->symtab[i];
             if (s->st_shndx == SHN_UNDEF || ELF64_ST_TYPE(s->st_info) != STT_FUNC) continue;
             if (s->st_value <= off && s->st_value >= best_v) {
                 best_v = s->st_value;
-                best = lib->strtab + s->st_name;
+                best = e->strtab + s->st_name;
             }
         }
         if (best)
             snprintf(out, outsz, "%s+0x%llx (%s+0x%llx)",
-                     lib->soname ? lib->soname : lib->path, (unsigned long long)off,
+                     e->name, (unsigned long long)off,
                      best, (unsigned long long)(off - best_v));
         else
-            snprintf(out, outsz, "%s+0x%llx", lib->soname ? lib->soname : lib->path,
-                     (unsigned long long)off);
+            snprintf(out, outsz, "%s+0x%llx", e->name, (unsigned long long)off);
         return 1;
     }
     snprintf(out, outsz, "%p (outside Android libraries)", (void *)addr);
@@ -126,17 +147,21 @@ static const Elf64_Sym *find_def(const afw_lib *lib, const char *name) {
  * (libc's memcpy, strlen... are IFUNCs on x86_64). */
 static void *global_lookup(const char *name, const afw_lib *self, int *is_ifunc) {
     int k;
+    void *res = NULL;
     *is_ifunc = 0;
+    afw_libs_rdlock();
     for (k = 0; k < g_nlibs; k++) {
         const Elf64_Sym *s;
         if (g_libs[k] == self) continue;
         s = find_def(g_libs[k], name);
         if (s) {
             *is_ifunc = ELF64_ST_TYPE(s->st_info) == STT_GNU_IFUNC;
-            return (void *)(g_libs[k]->bias + s->st_value);
+            res = (void *)(g_libs[k]->bias + s->st_value);
+            break;
         }
     }
-    return NULL;
+    afw_libs_rdunlock();
+    return res;
 }
 
 /* Symbols the loader itself must provide even when a loaded library exports
@@ -206,9 +231,23 @@ static int apply_rela(afw_lib *lib, const Elf64_Rela *rel, size_t count,
     for (i = 0; i < count; i++) {
         uint32_t type = ELF64_R_TYPE(rel[i].r_info);
         uint32_t sym = ELF64_R_SYM(rel[i].r_info);
-        uint64_t *where = (uint64_t *)(lib->bias + rel[i].r_offset);
-        uint64_t S = sym ? symaddr[sym] : 0;
+        uintptr_t waddr = (uintptr_t)lib->bias + (uintptr_t)rel[i].r_offset;
+        uint64_t *where = (uint64_t *)waddr;
+        uint64_t S;
         int64_t A = rel[i].r_addend;
+        if (type != R_X86_64_NONE) {
+            uintptr_t lb = (uintptr_t)lib->base;
+            if (waddr < lb || lib->size < sizeof(uint64_t) || waddr - lb > lib->size - sizeof(uint64_t)) {
+                fprintf(stderr, "error: relocation offset 0x%llx outside mapped image\n",
+                        (unsigned long long)rel[i].r_offset);
+                return -1;
+            }
+        }
+        if (sym >= lib->nsyms && sym != 0) {
+            fprintf(stderr, "error: relocation symbol index %u out of range (nsyms %zu)\n", sym, lib->nsyms);
+            return -1;
+        }
+        S = sym ? symaddr[sym] : 0;
 
         /* an IFUNC of this library, or one imported from another loaded
          * library: S is the RESOLVER; the address comes from running it,
@@ -301,6 +340,135 @@ static void apply_relr(afw_lib *lib, const uint64_t *relr, size_t count) {
     }
 }
 
+/* Signed LEB128 reader for Android APS2 packed relocations (DT_ANDROID_RELA).
+ * Rejects truncated or overlong (>10-byte) encodings without UB. */
+static int sleb128_read(const unsigned char **cur, const unsigned char *end, int64_t *out) {
+    const unsigned char *p = *cur;
+    uint64_t val = 0;
+    unsigned shift = 0;
+    while (p < end) {
+        unsigned char byte = *p++;
+        if (shift == 63) {
+            if ((byte & 0x80u) != 0 || (byte != 0x00u && byte != 0x7fu))
+                return -1;
+            val |= ((uint64_t)(byte & 1u)) << 63;
+            *cur = p;
+            *out = (int64_t)val;
+            return 0;
+        }
+        val |= ((uint64_t)(byte & 0x7fu)) << shift;
+        shift += 7;
+        if ((byte & 0x80u) == 0) {
+            if (shift < 64 && (byte & 0x40u))
+                val |= (~0ULL) << shift;
+            *cur = p;
+            *out = (int64_t)val;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Android packed RELA relocations (APS2, used by real Android 14 libm.so and
+ * NDK libc++_shared.so). Decodes each group and feeds single Elf64_Rela
+ * entries into apply_rela() so all IFUNC/TLS/error checks stay identical. */
+static int apply_android_rela(afw_lib *lib, const unsigned char *buf, size_t sz,
+                              const uint64_t *symaddr, const unsigned char *imp_ifunc) {
+    const unsigned char *cur, *end;
+    int64_t reloc_count = 0, init_off = 0, emitted = 0;
+    uint64_t r_offset, r_info = 0;
+    int64_t r_addend = 0;
+    if (!buf || sz < 4 || memcmp(buf, "APS2", 4) != 0) {
+        fprintf(stderr, "error: invalid Android packed relocation header (expected APS2)\n");
+        return -1;
+    }
+    cur = buf + 4;
+    end = buf + sz;
+    if (sleb128_read(&cur, end, &reloc_count) != 0 || reloc_count < 0 ||
+        sleb128_read(&cur, end, &init_off) != 0) {
+        fprintf(stderr, "error: truncated APS2 relocation header\n");
+        return -1;
+    }
+    r_offset = (uint64_t)init_off;
+    while (emitted < reloc_count) {
+        int64_t group_size = 0, group_flags_s = 0, group_off_delta = 0, gi;
+        uint64_t flags;
+        if (sleb128_read(&cur, end, &group_size) != 0 ||
+            sleb128_read(&cur, end, &group_flags_s) != 0) {
+            fprintf(stderr, "error: truncated APS2 relocation group header\n");
+            return -1;
+        }
+        if (group_size <= 0 || group_size > reloc_count - emitted) {
+            fprintf(stderr, "error: invalid APS2 relocation group size %lld\n", (long long)group_size);
+            return -1;
+        }
+        flags = (uint64_t)group_flags_s;
+        if (flags & ~15ULL) {
+            fprintf(stderr, "error: unknown APS2 relocation group flags 0x%llx\n", (unsigned long long)flags);
+            return -1;
+        }
+        if (flags & 2u) { /* RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG */
+            if (sleb128_read(&cur, end, &group_off_delta) != 0) {
+                fprintf(stderr, "error: truncated APS2 group offset delta\n");
+                return -1;
+            }
+        }
+        if (flags & 1u) { /* RELOCATION_GROUPED_BY_INFO_FLAG */
+            int64_t v = 0;
+            if (sleb128_read(&cur, end, &v) != 0) {
+                fprintf(stderr, "error: truncated APS2 group info\n");
+                return -1;
+            }
+            r_info = (uint64_t)v;
+        }
+        if ((flags & 4u) && (flags & 8u)) { /* GROUPED_BY_ADDEND && HAS_ADDEND */
+            int64_t d = 0;
+            if (sleb128_read(&cur, end, &d) != 0) {
+                fprintf(stderr, "error: truncated APS2 group addend\n");
+                return -1;
+            }
+            r_addend = (int64_t)((uint64_t)r_addend + (uint64_t)d);
+        } else if (!(flags & 8u)) { /* !RELOCATION_GROUP_HAS_ADDEND_FLAG */
+            r_addend = 0;
+        }
+        for (gi = 0; gi < group_size; gi++) {
+            Elf64_Rela one;
+            if (flags & 2u) {
+                r_offset += (uint64_t)group_off_delta;
+            } else {
+                int64_t d = 0;
+                if (sleb128_read(&cur, end, &d) != 0) {
+                    fprintf(stderr, "error: truncated APS2 relocation offset delta\n");
+                    return -1;
+                }
+                r_offset += (uint64_t)d;
+            }
+            if (!(flags & 1u)) {
+                int64_t v = 0;
+                if (sleb128_read(&cur, end, &v) != 0) {
+                    fprintf(stderr, "error: truncated APS2 relocation info\n");
+                    return -1;
+                }
+                r_info = (uint64_t)v;
+            }
+            if ((flags & 8u) && !(flags & 4u)) {
+                int64_t d = 0;
+                if (sleb128_read(&cur, end, &d) != 0) {
+                    fprintf(stderr, "error: truncated APS2 relocation addend delta\n");
+                    return -1;
+                }
+                r_addend = (int64_t)((uint64_t)r_addend + (uint64_t)d);
+            }
+            one.r_offset = r_offset;
+            one.r_info = r_info;
+            one.r_addend = r_addend;
+            if (apply_rela(lib, &one, 1, symaddr, imp_ifunc) != 0) return -1;
+            emitted++;
+        }
+    }
+    return 0;
+}
+
 static int patch_bounds(const void *ctx, uint64_t addr, uint64_t *s, uint64_t *e) {
     return afw_func_bounds((const afw_lib *)ctx, addr, s, e);
 }
@@ -364,8 +532,9 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
     Elf64_Phdr *dyn_ph = NULL, *relro_ph = NULL, *tls_ph = NULL;
     const uint32_t *hash = NULL, *gnu_hash = NULL;
     const Elf64_Rela *rela = NULL, *jmprel = NULL;
-    size_t relasz = 0, pltrelsz = 0, relrsz = 0;
+    size_t relasz = 0, pltrelsz = 0, relrsz = 0, android_relasz = 0;
     const uint64_t *relr = NULL;
+    const unsigned char *android_rela = NULL;
     int64_t pltrel = DT_RELA;
     uint64_t soname_off = 0, needed_off[AFW_MAX_NEEDED];
     uint64_t *symaddr;
@@ -558,11 +727,15 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
                 fprintf(stderr, "error: REL relocations are not used on x86_64\n");
                 free(pageprot); return -1;
             case DT_ANDROID_REL:
-            case DT_ANDROID_RELA:
                 if (afw_load_patch_only) { skip_relocs = 1; break; }
-                fprintf(stderr, "error: Android packed relocations (APS2) not supported yet.\n"
-                                "       Rebuild with -Wl,--pack-dyn-relocs=none\n");
+                fprintf(stderr, "error: Android packed REL relocations are not used on x86_64\n");
                 free(pageprot); return -1;
+            case DT_ANDROID_RELA:
+                android_rela = (const unsigned char *)(uintptr_t)ptr;
+                break;
+            case DT_ANDROID_RELASZ:
+                android_relasz = d->d_val;
+                break;
             default: break;
             }
         }
@@ -586,7 +759,17 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
         printf("\nSymbols:    %zu\n", lib->nsyms);
     }
 
-    if (g_nlibs < MAX_LIBS) g_libs[g_nlibs++] = lib;
+    /* Mark pending BEFORE publishing to g_libs[] so concurrent dl_iterate_phdr /
+     * dlsym readers never observe a half-relocated/unpatched library as finished. */
+    lib->pending = 1;
+    afw_libs_wrlock();
+    if (g_nlibs >= MAX_LIBS) {
+        afw_libs_wrunlock();
+        fprintf(stderr, "error: too many loaded libraries (limit %d)\n", MAX_LIBS);
+        free(pageprot); return -1;
+    }
+    g_libs[g_nlibs++] = lib;
+    afw_libs_wrunlock();
 
     /* 3b. Static TLS: register this library's PT_TLS (its .tdata image stays
      *     in the mapped library; each thread copies it after relocation). */
@@ -659,9 +842,19 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
     /* 5. Relocate ---------------------------------------------------- */
     if (skip_relocs) {
         fprintf(stderr, "note: packed relocations present: relocation skipped (measurement mode)\n");
-        relr = NULL; rela = NULL; jmprel = NULL;
+        relr = NULL; rela = NULL; android_rela = NULL; jmprel = NULL;
     }
     if (relr) apply_relr(lib, relr, relrsz / 8);
+    if (android_rela) {
+        uintptr_t ab = (uintptr_t)android_rela, lb = (uintptr_t)lib->base;
+        if (ab < lb || (size_t)(ab - lb) > lib->size || android_relasz > lib->size - (size_t)(ab - lb)) {
+            fprintf(stderr, "error: DT_ANDROID_RELA range outside mapped image\n");
+            free(symaddr); free(imp_ifunc); free(pageprot); return -1;
+        }
+        if (apply_android_rela(lib, android_rela, android_relasz, symaddr, imp_ifunc) != 0) {
+            free(symaddr); free(imp_ifunc); free(pageprot); return -1;
+        }
+    }
     if (rela && apply_rela(lib, rela, relasz / sizeof(Elf64_Rela), symaddr, imp_ifunc) != 0) {
         free(symaddr); free(imp_ifunc); free(pageprot); return -1;
     }
@@ -865,7 +1058,23 @@ static int lib_finish(afw_lib *lib, int verbose) {
         lib->vma_adopted = 1;
     }
     free(pageprot);
+    afw_libs_wrlock();
     lib->pending = 0;
+    g_libs_adds++;
+    if (!afw_load_patch_only) {
+        int32_t ci = afw_os_atomic_load_i32(&g_ncrash_libs);
+        if (ci >= 0 && ci < MAX_LIBS) {
+            g_crash_libs[ci].base   = (uintptr_t)lib->base;
+            g_crash_libs[ci].size   = lib->size;
+            g_crash_libs[ci].bias   = lib->bias;
+            g_crash_libs[ci].symtab = lib->symtab;
+            g_crash_libs[ci].strtab = lib->strtab;
+            g_crash_libs[ci].nsyms  = lib->nsyms;
+            g_crash_libs[ci].name   = lib->soname ? lib->soname : lib->path;
+            afw_os_atomic_store_i32(&g_ncrash_libs, ci + 1);
+        }
+    }
+    afw_libs_wrunlock();
 
     if (afw_load_patch_only) return 0;
 
@@ -883,14 +1092,28 @@ static int lib_finish(afw_lib *lib, int verbose) {
 
 /* A failed load leaves nothing behind (reviewer 4, #8): no entry in the
  * library list (main's lib is on its stack), no mapping, no TLS module. */
-int afw_loaded_count(void) { return g_nlibs; }
-int afw_quarantined_count(void) { return g_nquarantine; }
+int afw_loaded_count(void) {
+    int n;
+    afw_libs_rdlock();
+    n = g_nlibs;
+    afw_libs_rdunlock();
+    return n;
+}
+int afw_quarantined_count(void) {
+    int n;
+    afw_libs_rdlock();
+    n = g_nquarantine;
+    afw_libs_rdunlock();
+    return n;
+}
 const afw_lib *afw_quarantined_at(int k) {
-    const afw_lib *q;
+    const afw_lib *q, *res = NULL;
     if (k < 0) return NULL;
+    afw_libs_rdlock();
     for (q = g_quarantine_head; q; q = q->quarantine_next)
-        if (k-- == 0) return q;
-    return NULL;
+        if (k-- == 0) { res = q; break; }
+    afw_libs_rdunlock();
+    return res;
 }
 
 /* DT_NEEDED names of an ELF file on disk (without mapping it). Returns the
@@ -937,38 +1160,94 @@ static const char *base_name(const char *p) {
     return b ? b + 1 : p;
 }
 
-afw_lib *afw_lib_at(int k) { return (k >= 0 && k < g_nlibs) ? g_libs[k] : NULL; }
+afw_lib *afw_lib_at(int k) {
+    afw_lib *res;
+    afw_libs_rdlock();
+    res = (k >= 0 && k < g_nlibs) ? g_libs[k] : NULL;
+    afw_libs_rdunlock();
+    return res;
+}
+
+int afw_libs_snapshot_finished(afw_lib **out, int max, unsigned long long *adds_out) {
+    int k, n = 0;
+    afw_libs_rdlock();
+    for (k = 0; k < g_nlibs && n < max; k++) {
+        if (g_libs[k] && !g_libs[k]->pending)
+            out[n++] = g_libs[k];
+    }
+    if (adds_out) *adds_out = g_libs_adds;
+    afw_libs_rdunlock();
+    return n;
+}
+
+afw_lib *afw_lib_containing(const void *addr) {
+    uintptr_t a = (uintptr_t)addr;
+    int k;
+    afw_lib *res = NULL;
+    if (!addr) return NULL;
+    afw_libs_rdlock();
+    for (k = 0; k < g_nlibs; k++) {
+        afw_lib *l = g_libs[k];
+        if (!l || l->pending || !l->base) continue;
+        if (a >= (uintptr_t)l->base && a - (uintptr_t)l->base < l->size) {
+            res = l;
+            break;
+        }
+    }
+    afw_libs_rdunlock();
+    return res;
+}
+
+int32_t afw_lib_tls_dtor_count(const afw_lib *lib) {
+    if (!lib) return 0;
+    return afw_os_atomic_load_i32(&lib->tls_dtor_refcount);
+}
 
 afw_lib *afw_find_loaded(const char *name) {
     int k;
     const char *want = base_name(name);
+    afw_lib *res = NULL;
+    afw_libs_rdlock();
     for (k = 0; k < g_nlibs; k++)
         if ((g_libs[k]->soname && strcmp(g_libs[k]->soname, want) == 0) ||
-            strcmp(base_name(g_libs[k]->path), want) == 0)
-            return g_libs[k];
-    return NULL;
+            strcmp(base_name(g_libs[k]->path), want) == 0) {
+            res = g_libs[k];
+            break;
+        }
+    afw_libs_rdunlock();
+    return res;
 }
 
 int afw_is_loaded(const void *handle) {
-    int k;
-    for (k = 0; k < g_nlibs; k++) if ((const void *)g_libs[k] == handle) return 1;
-    return 0;
+    int k, found = 0;
+    afw_libs_rdlock();
+    for (k = 0; k < g_nlibs; k++)
+        if ((const void *)g_libs[k] == handle) { found = 1; break; }
+    afw_libs_rdunlock();
+    return found;
 }
 
 int afw_is_retained(const void *handle) {
+    int k, found = 0;
     const afw_lib *q;
-    if (afw_is_loaded(handle)) return 1;
-    for (q = g_quarantine_head; q; q = q->quarantine_next)
-        if ((const void *)q == handle) return 1;
-    return 0;
+    afw_libs_rdlock();
+    for (k = 0; k < g_nlibs; k++)
+        if ((const void *)g_libs[k] == handle) { found = 1; break; }
+    if (!found) {
+        for (q = g_quarantine_head; q; q = q->quarantine_next)
+            if ((const void *)q == handle) { found = 1; break; }
+    }
+    afw_libs_rdunlock();
+    return found;
 }
 
 /* RTLD_DEFAULT order: every finished library, in load order (an IFUNC is
- * resolved by afw_sym, never for an unfinished library). */
+ * resolved by afw_sym OUTSIDE afw_libs_rdlock, never for an unfinished library). */
 void *afw_global_sym(const char *name) {
-    int k;
-    for (k = 0; k < g_nlibs; k++) {
-        void *p = g_libs[k]->pending ? NULL : afw_sym(g_libs[k], name);
+    afw_lib *snap[MAX_LIBS];
+    int k, n = afw_libs_snapshot_finished(snap, MAX_LIBS, NULL);
+    for (k = 0; k < n; k++) {
+        void *p = afw_sym(snap[k], name);
         if (p) return p;
     }
     return NULL;
@@ -984,26 +1263,30 @@ int afw_find_lib(const char *name, char *out, size_t outsz) {
         return 1;
     }
     /* AFW_LIB_PATH, then the directory of the first library loaded */
+    afw_libs_rdlock();
     if (g_nlibs) {
         const char *p = g_libs[0]->path, *b = base_name(p);
         snprintf(dir, sizeof dir, "%.*s", b > p ? (int)(b - p - 1) : 1, b > p ? p : ".");
     } else {
         snprintf(dir, sizeof dir, ".");
     }
+    afw_libs_rdunlock();
     return find_lib(name, dir, out, outsz);
 }
 
 static int already_loaded(const char *name) {
-    int k;
+    int k, found = 0;
     const char *base;
+    afw_libs_rdlock();
     for (k = 0; k < g_nlibs; k++) {
-        if (g_libs[k]->soname && strcmp(g_libs[k]->soname, name) == 0) return 1;
+        if (g_libs[k]->soname && strcmp(g_libs[k]->soname, name) == 0) { found = 1; break; }
         base = strrchr(g_libs[k]->path, '/');
         if (!base) base = strrchr(g_libs[k]->path, '\\');
         base = base ? base + 1 : g_libs[k]->path;
-        if (strcmp(base, name) == 0) return 1;
+        if (strcmp(base, name) == 0) { found = 1; break; }
     }
-    return 0;
+    afw_libs_rdunlock();
+    return found;
 }
 
 /* Find name in the search path: the directories in AFW_LIB_PATH (';' or ':'
@@ -1066,12 +1349,23 @@ static int prepare_with_deps(const char *path, afw_lib *lib, afw_lib *deps, int 
 }
 
 int afw_load_with_deps(const char *path, afw_lib *lib, afw_lib *deps, int maxdeps, int *ndeps, int verbose) {
-    int k, first = g_nlibs, rc;
+    afw_lib *batch[MAX_LIBS];
+    int k, first, nbatch = 0, rc, prev_defer;
+    afw_dlopen_lock();
+    afw_libs_rdlock();
+    first = g_nlibs;
+    afw_libs_rdunlock();
+    prev_defer = g_defer_finish;
     g_defer_finish = 1;
     rc = prepare_with_deps(path, lib, deps, maxdeps, ndeps, verbose);
-    g_defer_finish = 0;
+    g_defer_finish = prev_defer;
+    afw_libs_rdlock();
+    for (k = first; k < g_nlibs && nbatch < MAX_LIBS; k++)
+        batch[nbatch++] = g_libs[k];
+    afw_libs_rdunlock();
     if (rc != 0) {                       /* nothing of the set ran: undo it, newest first */
-        for (k = g_nlibs - 1; k >= first; k--) retire_failed(g_libs[k]);
+        for (k = nbatch - 1; k >= 0; k--) retire_failed(batch[k]);
+        afw_dlopen_unlock();
         return -1;
     }
     /* Now that the executable and all dependencies are mapped (Phase A), install
@@ -1079,29 +1373,31 @@ int afw_load_with_deps(const char *path, afw_lib *lib, afw_lib *deps, int maxdep
      * libc.so's or the executable's constructors. */
     if (!afw_load_patch_only && lib->is_exec && lib->entry)
         afw_exec_prepare_auxv(lib, path);
-    if (verbose) printf("\n== all %d libraries mapped and relocated; TLS layout closes now\n", g_nlibs - first);
-    for (k = first; k < g_nlibs; k++)    /* dependency order: a library after the ones it needs */
-        if (g_libs[k]->pending && lib_finish(g_libs[k], verbose) != 0) {
+    if (verbose) printf("\n== all %d libraries mapped and relocated; TLS layout closes now\n", nbatch);
+    for (k = 0; k < nbatch; k++)         /* dependency order: a library after the ones it needs */
+        if (batch[k]->pending && lib_finish(batch[k], verbose) != 0) {
             int j;
-            const char *who = g_libs[k]->soname ? g_libs[k]->soname : g_libs[k]->path;
-            int late = g_libs[k]->code_ran || afw_tls_static_is_finished();
+            const char *who = batch[k]->soname ? batch[k]->soname : batch[k]->path;
+            int late = batch[k]->code_ran || afw_tls_static_is_finished();
             fprintf(stderr, "error: %s failed to finish (%s); retiring it and %d unfinished library(ies)\n",
-                    who, late ? "after point of no return" : "before TLS close", g_nlibs - k - 1);
-            /* Retire [k..g_nlibs) newest first:
+                    who, late ? "after point of no return" : "before TLS close", nbatch - k - 1);
+            /* Retire batch[k..nbatch) newest first:
              *  - Before the point of no return (no code ran and TLS module not
              *    locked in a closed layout): discard() rolls back completely.
              *  - After the point of no return (IFUNC ran or TLS module locked in
              *    the closed layout): quarantine() removes the library from active
              *    g_libs[] while keeping its mapping, TLS module, and struct alive.
-             * Earlier libraries [first..k-1] whose constructors already ran stay
+             * Earlier libraries batch[0..k-1] whose constructors already ran stay
              * loaded in g_libs[] (callers check afw_is_retained()). */
-            for (j = g_nlibs - 1; j >= k; j--) retire_failed(g_libs[j]);
+            for (j = nbatch - 1; j >= k; j--) retire_failed(batch[j]);
+            afw_dlopen_unlock();
             return -1;
         }
+    afw_dlopen_unlock();
     return 0;
 }
 
-static void remove_from_registry(afw_lib *lib) {
+static void remove_from_registry_locked(afw_lib *lib) {
     int k;
     for (k = 0; k < g_nlibs; k++)
         if (g_libs[k] == lib) {
@@ -1109,6 +1405,12 @@ static void remove_from_registry(afw_lib *lib) {
             g_nlibs--;
             break;
         }
+}
+
+static void remove_from_registry(afw_lib *lib) {
+    afw_libs_wrlock();
+    remove_from_registry_locked(lib);
+    afw_libs_wrunlock();
 }
 
 static int can_discard(const afw_lib *lib) {
@@ -1140,21 +1442,22 @@ static void discard(afw_lib *lib) {
 }
 
 /* Past the point of no return (IFUNC/constructors ran, or static TLS layout
- * closed with this library's module in it): remove from active g_libs[] so no
- * lookup returns a failed library, and link onto the unbounded intrusive
- * quarantine list (zero allocation: cannot fail even under OOM). Keeps the
- * mapping, TLS module, path, and afw_lib struct alive (no UAF, no orphan TLS
- * module, reachable for LSan). */
+ * closed with this library's module in it): atomically move from active g_libs[]
+ * onto the unbounded intrusive quarantine list under afw_libs_wrlock so no
+ * lookup returns a failed library and afw_is_retained() never sees a gap. */
 static void quarantine(afw_lib *lib) {
-    remove_from_registry(lib);
+    afw_libs_wrlock();
+    remove_from_registry_locked(lib);
+    if (!lib->quarantined) {
+        lib->quarantined = 1;
+        lib->quarantine_next = g_quarantine_head;
+        g_quarantine_head = lib;
+        g_nquarantine++;
+    }
+    afw_libs_wrunlock();
     free(lib->irel); lib->irel = NULL; lib->nirel = lib->capirel = 0;
     free(lib->pageprot); lib->pageprot = NULL;
     free(lib->phdr); lib->phdr = NULL; lib->phnum = 0;
-    if (lib->quarantined) return;
-    lib->quarantined = 1;
-    lib->quarantine_next = g_quarantine_head;
-    g_quarantine_head = lib;
-    g_nquarantine++;
 }
 
 static void retire_failed(afw_lib *lib) {
@@ -1163,8 +1466,11 @@ static void retire_failed(afw_lib *lib) {
 }
 
 int afw_load(const char *path, afw_lib *lib, int verbose) {
-    int rc = load_inner(path, lib, verbose);
+    int rc;
+    afw_dlopen_lock();
+    rc = load_inner(path, lib, verbose);
     if (rc != 0) retire_failed(lib);
+    afw_dlopen_unlock();
     return rc;
 }
 
