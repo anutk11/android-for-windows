@@ -61,7 +61,7 @@ static LONG WINAPI on_crash(EXCEPTION_POINTERS *ep) {
             (unsigned long long)afw_tls_get_art_gs());
     fprintf(stderr, "  possible callers (from stack):\n");
     {
-        uint64_t st[64];
+        uint64_t st[256];
         SIZE_T got = 0;
         if (ReadProcessMemory(GetCurrentProcess(), sp, st, sizeof st, &got))
             for (i = 0; i < (int)(got / 8); i++)
