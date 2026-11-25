@@ -333,10 +333,12 @@ jobs:
             echo "--- RVA $rva ---" >> out/art-deps-scan.txt
             "$TC/llvm-objdump" -d --start-address=$lo --stop-address=$hi out/artfull/art/lib64/libart.so >> out/art-deps-scan.txt 2>&1 || true
           done
+          echo "=== libart.so --patch-report --art-gs summary ===" >> out/art-deps-scan.txt
+          out/afw-loader out/artfull/art/lib64/libart.so --patch-report --art-gs 2>&1 | grep -E "^(GATE|PATCH REPORT|  fs:|  \[patch\]|  \[audit\] WARNING)" >> out/art-deps-scan.txt || true
           echo "=== Transitive symbol resolution check (AFW_LIB_PATH=out/artfull:out/artfull/art/lib64) ===" >> out/art-deps-scan.txt
           AFW_LIB_PATH="out/artfull:out/artfull/art/lib64" out/afw-loader out/artfull/art/lib64/libart.so --with-deps --patch-report --art-gs --allow-unproven 2>&1 | grep -E "(missing|unresolved|error:|GATE|Loaded|== dependency|PATCH REPORT|imports missing)" | head -200 >> out/art-deps-scan.txt || true
           rm -rf out/artfull
-          tail -n 80 out/art-deps-scan.txt
+          grep -E "^(===|GATE|PATCH REPORT|  fs:|  \[patch\]|  \[audit\] WARNING|imports missing|error:|unresolved)" out/art-deps-scan.txt | tail -n 80
       - name: "G2-1 / G2-4a Measure: bionic pthread/clone/StaticTlsLayout ABI oracle"
         continue-on-error: true
         run: |

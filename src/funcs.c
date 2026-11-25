@@ -320,9 +320,11 @@ int afw_func_landing_pads(const afw_lib *lib, uint64_t func, uint64_t *out, int 
     cur c;
     const unsigned char *cs_end;
     int n = 0, st;
-    if (!fde) return -1;                                   /* func came from this table: must exist */
+    if (!fde) return 0;                                    /* .dynsym function without an FDE: no LSDA */
     st = fde_parse(lib, fde, &s0, &e0, &lsda);
-    if (st == FDE_BAD || s0 != func) return -1;
+    if (st == FDE_BAD) return -1;
+    if (func < s0 || func >= e0) return 0;                 /* nearest FDE does not cover func: no LSDA */
+    if (s0 != func) return -1;
     if (st == FDE_OK) return 0;                            /* decoded: no exception table */
     c = image_cur(lib, (const unsigned char *)(uintptr_t)lsda);
     lp_enc = rd_u8(&c);
