@@ -18,13 +18,124 @@ static const void *g_image[AFW_TLS_MAX_MODULES];
 static afw_tls_segment g_seg[AFW_TLS_MAX_MODULES];
 static int g_finished;
 
-int afw_tls_static_register(const void *image, const afw_tls_segment *seg, const char *name) {
-    int m;
-    if (g_finished) {
-        fprintf(stderr, "error: %s has thread-local storage but was loaded after startup; "
-                        "dynamic TLS is not supported yet (G2)\n", name);
+/* ---- G2-5b: Dynamic PT_TLS modules (dlopen after startup) + per-thread DTV ---- */
+typedef struct {
+    const void     *raw_image; /* mapped .tdata before finalize (Phase A) */
+    unsigned char  *image;     /* owned heap copy of relocated .tdata (Phase B) */
+    size_t          filesz;
+    size_t          memsz;
+    size_t          align;
+    int32_t         ready;     /* seq_cst published once image is copied & immutable */
+} afw_dyn_tls_mod;
+
+typedef struct {
+    void *slots[AFW_TLS_MAX_DYN];
+} afw_dtv;
+
+static afw_dyn_tls_mod g_dyn_mods[AFW_TLS_MAX_DYN];
+static int g_ndyn;
+static _Thread_local afw_dtv *t_dtv;
+
+static void dtv_release_cb(void *p) {
+    afw_dtv *d = (afw_dtv *)p;
+    int i;
+    if (!d) return;
+    if (t_dtv == d) t_dtv = NULL;
+    for (i = 0; i < AFW_TLS_MAX_DYN; i++) {
+        if (d->slots[i]) {
+            afw_os_aligned_free(d->slots[i]);
+            d->slots[i] = NULL;
+        }
+    }
+    free(d);
+}
+
+void afw_tls_dtv_free_current(void) {
+    afw_dtv *d = t_dtv;
+    if (!d) return;
+    /* Release only after the OS FLS/key slot is cleared; on failure keep t_dtv
+     * and the OS registration intact so the thread-exit callback cleans it up
+     * once without a double-free or UAF. */
+    if (afw_os_dtv_fls_set(NULL, NULL) != 0) return;
+    t_dtv = NULL;
+    dtv_release_cb(d);
+}
+
+int afw_tls_is_static_module(int mod) {
+    return mod >= 1 && mod <= g_layout.nmod;
+}
+
+int afw_tls_is_dynamic_module(int mod) {
+    return mod >= AFW_TLS_DYN_BASE && mod < AFW_TLS_DYN_BASE + g_ndyn;
+}
+
+static int register_dynamic(const void *image, const afw_tls_segment *seg, const char *name) {
+    uint64_t align;
+    int idx;
+    if (!seg) return 0;
+    if (g_ndyn >= AFW_TLS_MAX_DYN) {
+        fprintf(stderr, "error: %s: too many dynamic TLS modules (limit %d)\n", name, AFW_TLS_MAX_DYN);
         return 0;
     }
+    align = seg->p_align ? seg->p_align : 1u;
+    if ((align & (align - 1u)) != 0 || align > AFW_TLS_MAX_ALIGN) {
+        fprintf(stderr, "error: %s: invalid dynamic TLS alignment %llu\n",
+                name, (unsigned long long)seg->p_align);
+        return 0;
+    }
+    if (seg->p_filesz > seg->p_memsz) {
+        fprintf(stderr, "error: %s: dynamic TLS file size above memory size\n", name);
+        return 0;
+    }
+    if (seg->p_memsz > (64ULL * 1024ULL * 1024ULL)) {
+        fprintf(stderr, "error: %s: dynamic TLS size %llu exceeds 64MB limit\n",
+                name, (unsigned long long)seg->p_memsz);
+        return 0;
+    }
+    idx = g_ndyn++;
+    g_dyn_mods[idx].raw_image = image;
+    g_dyn_mods[idx].image     = NULL;
+    g_dyn_mods[idx].filesz    = (size_t)seg->p_filesz;
+    g_dyn_mods[idx].memsz     = (size_t)seg->p_memsz;
+    g_dyn_mods[idx].align     = (size_t)align;
+    afw_os_atomic_store_i32(&g_dyn_mods[idx].ready, 0);
+    return AFW_TLS_DYN_BASE + idx;
+}
+
+int afw_tls_dynamic_finalize(int mod) {
+    int idx;
+    afw_dyn_tls_mod *m;
+    unsigned char *copy = NULL;
+    if (mod < AFW_TLS_DYN_BASE || mod >= AFW_TLS_DYN_BASE + g_ndyn) return -1;
+    idx = mod - AFW_TLS_DYN_BASE;
+    m = &g_dyn_mods[idx];
+    if (afw_os_atomic_load_i32(&m->ready) != 0) return 0;
+    if (m->filesz > 0) {
+        if (!m->raw_image) return -1;
+        copy = (unsigned char *)malloc(m->filesz);
+        if (!copy) {
+            fprintf(stderr, "error: out of memory copying dynamic TLS .tdata image\n");
+            return -1;
+        }
+        memcpy(copy, m->raw_image, m->filesz);
+    }
+    m->image = copy;
+    m->raw_image = NULL;
+    afw_os_atomic_store_i32(&m->ready, 1);
+    return 0;
+}
+
+int afw_tls_dynamic_is_finalized(int mod) {
+    int idx;
+    if (mod < AFW_TLS_DYN_BASE || mod >= AFW_TLS_DYN_BASE + AFW_TLS_MAX_DYN) return 0;
+    idx = mod - AFW_TLS_DYN_BASE;
+    return afw_os_atomic_load_i32(&g_dyn_mods[idx].ready) != 0;
+}
+
+int afw_tls_static_register(const void *image, const afw_tls_segment *seg, const char *name) {
+    int m;
+    if (g_finished)
+        return register_dynamic(image, seg, name);
     m = afw_tls_layout_add(&g_layout, seg);
     if (m < 0) {
         static const char *why[] = {"", "too many TLS modules", "TLS alignment is not a power of two",
@@ -39,6 +150,19 @@ int afw_tls_static_register(const void *image, const afw_tls_segment *seg, const
 }
 
 int afw_tls_static_unregister(int mod) {
+    if (mod >= AFW_TLS_DYN_BASE) {
+        int idx = mod - AFW_TLS_DYN_BASE;
+        if (idx < 0 || idx != g_ndyn - 1) return -1;
+        if (afw_os_atomic_load_i32(&g_dyn_mods[idx].ready) != 0) return -1;
+        g_dyn_mods[idx].raw_image = NULL;
+        g_dyn_mods[idx].image     = NULL;
+        g_dyn_mods[idx].filesz    = 0;
+        g_dyn_mods[idx].memsz     = 0;
+        g_dyn_mods[idx].align     = 0;
+        afw_os_atomic_store_i32(&g_dyn_mods[idx].ready, 0);
+        g_ndyn--;
+        return 0;
+    }
     if (g_finished || mod < 1 || mod != g_layout.nmod) return -1;
     g_layout.nmod--;
     g_layout.off[mod - 1] = 0;
@@ -159,7 +283,12 @@ int afw_tls_static_is_finished(void) { return g_finished; }
 int afw_tls_static_count(void) { return g_layout.nmod; }
 
 uint64_t afw_tls_static_memsz(int mod) {
-    return (mod >= 1 && mod <= g_layout.nmod) ? g_seg[mod - 1].p_memsz : 0;
+    if (mod >= 1 && mod <= g_layout.nmod) return g_seg[mod - 1].p_memsz;
+    if (mod >= AFW_TLS_DYN_BASE && mod < AFW_TLS_DYN_BASE + AFW_TLS_MAX_DYN) {
+        int idx = mod - AFW_TLS_DYN_BASE;
+        return afw_os_atomic_load_i32(&g_dyn_mods[idx].ready) ? (uint64_t)g_dyn_mods[idx].memsz : 0;
+    }
+    return 0;
 }
 
 void *afw_tls_static_resolve(uint64_t module, uint64_t offset) {
@@ -171,12 +300,58 @@ void *afw_tls_static_resolve(uint64_t module, uint64_t offset) {
     return (unsigned char *)tp - g_layout.off[module - 1] + offset;
 }
 
+static void *tls_dynamic_resolve(uint64_t module, uint64_t offset, int do_alloc) {
+    uint64_t idx64;
+    const afw_dyn_tls_mod *m;
+    void *blk;
+    if (module < (uint64_t)AFW_TLS_DYN_BASE) return NULL;
+    idx64 = module - (uint64_t)AFW_TLS_DYN_BASE;
+    if (idx64 >= (uint64_t)AFW_TLS_MAX_DYN) return NULL;
+    m = &g_dyn_mods[idx64];
+    /* Acquire load of ready synchronizes-with release store in afw_tls_dynamic_finalize(). */
+    if (afw_os_atomic_load_i32(&m->ready) == 0) return NULL;
+    if (offset >= (uint64_t)m->memsz) return NULL;
+    if (!t_dtv) {
+        afw_dtv *d;
+        if (!do_alloc) return NULL;
+        d = (afw_dtv *)calloc(1, sizeof *d);
+        if (!d) return NULL;
+        if (afw_os_dtv_fls_set(dtv_release_cb, d) != 0) {
+            free(d);
+            return NULL;
+        }
+        t_dtv = d;
+    }
+    blk = t_dtv->slots[idx64];
+    if (!blk) {
+        if (!do_alloc) return NULL;
+        blk = afw_os_aligned_alloc_zero(m->align, m->memsz);
+        if (!blk) return NULL;
+        if (m->filesz > 0 && m->image)
+            memcpy(blk, m->image, m->filesz);
+        t_dtv->slots[idx64] = blk;
+    }
+    return (unsigned char *)blk + offset;
+}
+
+void *afw_tls_resolve_existing(uint64_t module) {
+    if (module >= 1 && module <= (uint64_t)g_layout.nmod)
+        return afw_tls_static_resolve(module, 0);
+    return tls_dynamic_resolve(module, 0, 0);
+}
+
 SYSV void *afw_tls_get_addr(const afw_tls_index *ti) {
-    void *p = ti ? afw_tls_static_resolve(ti->module, ti->offset) : NULL;
+    void *p = NULL;
+    if (ti) {
+        if (ti->module >= 1 && ti->module <= (uint64_t)g_layout.nmod)
+            p = afw_tls_static_resolve(ti->module, ti->offset);
+        else
+            p = tls_dynamic_resolve(ti->module, ti->offset, 1);
+    }
     if (!p) {
         fprintf(stderr, "fatal: __tls_get_addr(module %llu, offset 0x%llx): outside every TLS block "
-                        "(%d modules)\n", ti ? (unsigned long long)ti->module : 0ULL,
-                ti ? (unsigned long long)ti->offset : 0ULL, g_layout.nmod);
+                        "(%d static, %d dynamic modules)\n", ti ? (unsigned long long)ti->module : 0ULL,
+                ti ? (unsigned long long)ti->offset : 0ULL, g_layout.nmod, g_ndyn);
         abort();
     }
     return p;

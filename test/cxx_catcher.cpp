@@ -57,3 +57,44 @@ extern "C" void cxx_catcher_touch_tls(int worker_id, void (*log_fn)(int, int, in
 extern "C" int cxx_catcher_get_tls_id(void) {
     return (g_catcher_tls.canary == 0x43415443u) ? g_catcher_tls.worker_id : -999;
 }
+
+/* G2b: loader-provided DWARF-unwound callback bridge trampoline (resolved by
+ * src/bionic_shim.c directly to the 4KB RX trampoline page). */
+extern "C" __attribute__((weak))
+int __loader_afw_callback_bridge(int (*cb)(void *), void *arg);
+
+struct BridgeThrowArg {
+    const char *msg;
+    int *raii_cleaned;
+    int value;
+};
+
+extern "C" int cxx_bridge_no_throw_cb(void *arg);
+extern "C" int cxx_bridge_throw_cb(void *arg);
+
+extern "C" int cxx_call_via_loader_bridge_no_throw(int value, int *calls_out) {
+    if (!__loader_afw_callback_bridge) return -3;
+    BridgeThrowArg arg{nullptr, calls_out, value};
+    return __loader_afw_callback_bridge(cxx_bridge_no_throw_cb, &arg);
+}
+
+/* Unwinds std::runtime_error thrown in libcxx_thrower.so through the loader's
+ * [afw-callback-bridge] DWARF frame back into libcxx_catcher.so. */
+extern "C" int cxx_catch_via_loader_bridge(const char *payload, char *got_buf,
+                                           size_t got_sz, int *raii_cleaned) {
+    if (!__loader_afw_callback_bridge) return -3;
+    BridgeThrowArg arg{payload, raii_cleaned, 0};
+    try {
+        (void)__loader_afw_callback_bridge(cxx_bridge_throw_cb, &arg);
+        return 0;
+    } catch (const std::runtime_error &e) {
+        const char *w = e.what();
+        if (got_buf && got_sz) {
+            std::snprintf(got_buf, got_sz, "%s", w ? w : "");
+        }
+        return (w && payload && std::strcmp(w, payload) == 0) ? 1 : -1;
+    } catch (...) {
+        return -2;
+    }
+}
+

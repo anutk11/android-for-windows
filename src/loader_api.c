@@ -25,6 +25,7 @@
 #include "loader_api.h"
 #include "elf_loader.h"
 #include "tls_static.h"
+#include "callback_bridge.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -217,9 +218,15 @@ typedef struct {            /* bionic's dl_phdr_info (LP64) */
 SYSV int afw_l_dl_iterate_phdr(SYSV int (*cb)(void *info, size_t size, void *data), void *data) {
     afw_lib *snap[AFW_MAX_LIBS];
     unsigned long long adds = 0;
-    int k, n, rc = 0;
+    uint64_t bridge_addr = 0;
+    const char *bridge_name = NULL;
+    const Elf64_Phdr *bridge_phdr = NULL;
+    uint16_t bridge_phnum = 0;
+    int k, n, has_bridge, rc = 0;
     if (!cb) return 0;
     n = afw_libs_snapshot_finished(snap, AFW_MAX_LIBS, &adds);
+    has_bridge = afw_callback_bridge_phdr(&bridge_addr, &bridge_name, &bridge_phdr, &bridge_phnum);
+    if (has_bridge) adds++;
     for (k = 0; k < n && rc == 0; k++) {
         afw_lib *l = snap[k];
         afw_dl_phdr_info info;
@@ -232,7 +239,18 @@ SYSV int afw_l_dl_iterate_phdr(SYSV int (*cb)(void *info, size_t size, void *dat
         info.dlpi_adds = adds;
         info.dlpi_subs = 0;
         info.dlpi_tls_modid = (size_t)l->tls_module;
-        info.dlpi_tls_data = l->tls_module ? afw_tls_static_resolve((uint64_t)l->tls_module, 0) : NULL;
+        info.dlpi_tls_data = l->tls_module ? afw_tls_resolve_existing((uint64_t)l->tls_module) : NULL;
+        rc = cb(&info, sizeof info, data);
+    }
+    if (rc == 0 && has_bridge) {
+        afw_dl_phdr_info info;
+        memset(&info, 0, sizeof info);
+        info.dlpi_addr = bridge_addr;
+        info.dlpi_name = bridge_name;
+        info.dlpi_phdr = bridge_phdr;
+        info.dlpi_phnum = bridge_phnum;
+        info.dlpi_adds = adds;
+        info.dlpi_subs = 0;
         rc = cb(&info, sizeof info, data);
     }
     return rc;

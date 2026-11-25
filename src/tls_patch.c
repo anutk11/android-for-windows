@@ -204,6 +204,7 @@ int afw_tls_thread_attach_external(uintptr_t *tp) {
 }
 
 void afw_tls_thread_detach_external(void) {
+    afw_tls_dtv_free_current();
     if (g_ready)
         TlsSetValue(g_slot[TLS_SLOT_SELF], NULL);
     t_block = NULL;
@@ -240,6 +241,7 @@ int afw_tls_thread_attach_external(uintptr_t *tp) {
     return 0;
 }
 void afw_tls_thread_detach_external(void) {
+    afw_tls_dtv_free_current();
     t_block = NULL;
     t_alloc = NULL;
     t_area = NULL;

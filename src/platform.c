@@ -20,6 +20,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winioctl.h>
+#include <malloc.h>
 #include <wchar.h>
 #pragma comment(lib, "synchronization.lib")
 
@@ -884,6 +885,72 @@ void afw_os_atomic_store_uptr(uintptr_t *addr, uintptr_t val) {
     (void)InterlockedExchangePointer((PVOID volatile *)addr, (PVOID)val);
 }
 
+uintptr_t afw_os_atomic_load_uptr(const uintptr_t *addr) {
+    return __atomic_load_n(addr, __ATOMIC_SEQ_CST);
+}
+
+void *afw_os_aligned_alloc_zero(size_t align, size_t size) {
+    void *p;
+    if (size == 0 || align == 0 || (align & (align - 1)) != 0) return NULL;
+    if (align < sizeof(void *)) align = sizeof(void *);
+    p = _aligned_malloc(size, align);
+    if (p) memset(p, 0, size);
+    return p;
+}
+
+void afw_os_aligned_free(void *p) {
+    if (p) _aligned_free(p);
+}
+
+static INIT_ONCE g_dtv_fls_once = INIT_ONCE_STATIC_INIT;
+static DWORD g_dtv_fls = FLS_OUT_OF_INDEXES;
+static int32_t g_dtv_fls_ready = 0;
+static void (*g_dtv_fls_cb)(void *);
+
+static VOID WINAPI win_dtv_fls_thunk(PVOID p) {
+    if (p && g_dtv_fls_cb) g_dtv_fls_cb(p);
+}
+
+static BOOL CALLBACK win_dtv_fls_init_cb(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+    DWORD idx;
+    (void)once; (void)ctx;
+    g_dtv_fls_cb = (void (*)(void *))param;
+    idx = FlsAlloc(win_dtv_fls_thunk);
+    if (idx == FLS_OUT_OF_INDEXES) return FALSE;
+    g_dtv_fls = idx;
+    afw_os_atomic_store_i32(&g_dtv_fls_ready, 1);
+    return TRUE;
+}
+
+#ifdef AFW_TEST
+static int32_t g_test_fail_dtv_fls_clear = 0;
+void afw_os_test_fail_dtv_fls_clear(int count) {
+    afw_os_atomic_store_i32(&g_test_fail_dtv_fls_clear, (int32_t)count);
+}
+static int consume_dtv_clear_fault(void) {
+    for (;;) {
+        int32_t cur = afw_os_atomic_load_i32(&g_test_fail_dtv_fls_clear);
+        if (cur <= 0) return 0;
+        if (afw_os_atomic_cmpxchg_i32(&g_test_fail_dtv_fls_clear, cur, cur - 1) == cur)
+            return 1;
+    }
+}
+#endif
+
+int afw_os_dtv_fls_set(void (*release_cb)(void *), void *dtv) {
+    if (!release_cb && !dtv) {
+#ifdef AFW_TEST
+        if (consume_dtv_clear_fault()) return -1;
+#endif
+        if (!afw_os_atomic_load_i32(&g_dtv_fls_ready)) return 0;
+        return FlsSetValue(g_dtv_fls, NULL) ? 0 : -1;
+    }
+    if (!InitOnceExecuteOnce(&g_dtv_fls_once, win_dtv_fls_init_cb, (PVOID)release_cb, NULL))
+        return -1;
+    if (!afw_os_atomic_load_i32(&g_dtv_fls_ready)) return -1;
+    return FlsSetValue(g_dtv_fls, dtv) ? 0 : -1;
+}
+
 void afw_os_wake_address_all(void *addr) {
     WakeByAddressAll(addr);
 }
@@ -1374,7 +1441,69 @@ uintptr_t afw_os_atomic_xchg_uptr(uintptr_t *addr, uintptr_t val) {
 }
 
 void afw_os_atomic_store_uptr(uintptr_t *addr, uintptr_t val) {
-    __atomic_store_n(addr, val, __ATOMIC_RELEASE);
+    __atomic_store_n(addr, val, __ATOMIC_SEQ_CST);
+}
+
+uintptr_t afw_os_atomic_load_uptr(const uintptr_t *addr) {
+    return __atomic_load_n(addr, __ATOMIC_SEQ_CST);
+}
+
+void *afw_os_aligned_alloc_zero(size_t align, size_t size) {
+    void *p = NULL;
+    if (size == 0 || align == 0 || (align & (align - 1)) != 0) return NULL;
+    if (align < sizeof(void *)) align = sizeof(void *);
+    if (posix_memalign(&p, align, size) != 0) return NULL;
+    memset(p, 0, size);
+    return p;
+}
+
+void afw_os_aligned_free(void *p) {
+    free(p);
+}
+
+static pthread_once_t g_dtv_key_once = PTHREAD_ONCE_INIT;
+static pthread_key_t g_dtv_key;
+static int32_t g_dtv_key_ok = 0;
+static uintptr_t g_dtv_key_cb = 0;
+
+static void posix_dtv_key_dtor(void *p) {
+    void (*cb)(void *) = (void (*)(void *))afw_os_atomic_load_uptr(&g_dtv_key_cb);
+    if (p && cb) cb(p);
+}
+
+static void posix_dtv_key_init(void) {
+    if (pthread_key_create(&g_dtv_key, posix_dtv_key_dtor) == 0)
+        afw_os_atomic_store_i32(&g_dtv_key_ok, 1);
+}
+
+#ifdef AFW_TEST
+static int32_t g_test_fail_dtv_fls_clear = 0;
+void afw_os_test_fail_dtv_fls_clear(int count) {
+    afw_os_atomic_store_i32(&g_test_fail_dtv_fls_clear, (int32_t)count);
+}
+static int consume_dtv_clear_fault(void) {
+    for (;;) {
+        int32_t cur = afw_os_atomic_load_i32(&g_test_fail_dtv_fls_clear);
+        if (cur <= 0) return 0;
+        if (afw_os_atomic_cmpxchg_i32(&g_test_fail_dtv_fls_clear, cur, cur - 1) == cur)
+            return 1;
+    }
+}
+#endif
+
+int afw_os_dtv_fls_set(void (*release_cb)(void *), void *dtv) {
+    if (!release_cb && !dtv) {
+#ifdef AFW_TEST
+        if (consume_dtv_clear_fault()) return -1;
+#endif
+        if (!afw_os_atomic_load_i32(&g_dtv_key_ok)) return 0;
+        return pthread_setspecific(g_dtv_key, NULL) == 0 ? 0 : -1;
+    }
+    if (release_cb)
+        afw_os_atomic_store_uptr(&g_dtv_key_cb, (uintptr_t)release_cb);
+    pthread_once(&g_dtv_key_once, posix_dtv_key_init);
+    if (!afw_os_atomic_load_i32(&g_dtv_key_ok)) return -1;
+    return pthread_setspecific(g_dtv_key, dtv) == 0 ? 0 : -1;
 }
 
 void afw_os_wake_address_all(void *addr) {

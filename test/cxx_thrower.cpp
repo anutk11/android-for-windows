@@ -45,3 +45,23 @@ extern "C" void cxx_thrower_touch_tls(int worker_id, void (*log_fn)(int, int, in
 extern "C" int cxx_thrower_get_tls_id(void) {
     return (g_thrower_tls.canary == 0x5448524Fu) ? g_thrower_tls.worker_id : -999;
 }
+
+struct BridgeThrowArg {
+    const char *msg;
+    int *raii_cleaned;
+    int value;
+};
+
+extern "C" int cxx_bridge_no_throw_cb(void *arg) {
+    BridgeThrowArg *a = static_cast<BridgeThrowArg *>(arg);
+    if (!a) return -1;
+    if (a->raii_cleaned) (*a->raii_cleaned) += 1;
+    return a->value * 3 + 7;
+}
+
+extern "C" int cxx_bridge_throw_cb(void *arg) {
+    BridgeThrowArg *a = static_cast<BridgeThrowArg *>(arg);
+    LocalRaiiGuard guard(a ? a->raii_cleaned : nullptr);
+    throw std::runtime_error((a && a->msg) ? a->msg : "");
+}
+

@@ -29,8 +29,13 @@
 
 typedef struct { const unsigned char *p, *end; int bad; } cur;
 
+static size_t cur_rem(const cur *c) {
+    uintptr_t p = (uintptr_t)c->p, e = (uintptr_t)c->end;
+    return (c->bad || p >= e) ? 0 : (size_t)(e - p);
+}
+
 static unsigned char rd_u8(cur *c) {
-    if (c->bad || c->p >= c->end) { c->bad = 1; return 0; }
+    if (c->bad || (uintptr_t)c->p >= (uintptr_t)c->end) { c->bad = 1; return 0; }
     return *c->p++;
 }
 static uint64_t rd_uleb(cur *c) {
@@ -55,7 +60,7 @@ static int64_t rd_sleb(cur *c) {
     return v;
 }
 static void rd_bytes(cur *c, void *out, size_t n) {
-    if (c->bad || (size_t)(c->end - c->p) < n) { c->bad = 1; memset(out, 0, n); return; }
+    if (c->bad || cur_rem(c) < n) { c->bad = 1; memset(out, 0, n); return; }
     memcpy(out, c->p, n);
     c->p += n;
 }
@@ -87,7 +92,10 @@ static uint64_t rd_enc(cur *c, unsigned char enc, uint64_t datarel) {
 
 static cur image_cur(const afw_lib *lib, const unsigned char *p) {
     cur c;
-    c.p = p; c.end = lib->base + lib->size; c.bad = !(p >= lib->base && p < c.end);
+    uintptr_t pa = (uintptr_t)p, lo = (uintptr_t)lib->base, hi = lo + lib->size;
+    c.p = p;
+    c.end = lib->base ? lib->base + lib->size : NULL;
+    c.bad = !(lib->base && hi >= lo && pa >= lo && pa < hi);
     return c;
 }
 
@@ -96,7 +104,7 @@ static int record(const afw_lib *lib, const unsigned char *at, cur *body) {
     cur c = image_cur(lib, at);
     uint32_t len;
     rd_bytes(&c, &len, 4);
-    if (c.bad || len == 0 || len == 0xffffffffu || (size_t)(c.end - c.p) < len) return 0;
+    if (c.bad || len == 0 || len == 0xffffffffu || cur_rem(&c) < len) return 0;
     body->p = c.p; body->end = c.p + len; body->bad = 0;
     return 1;
 }
@@ -116,7 +124,7 @@ static int fde_parse(const afw_lib *lib, const unsigned char *fde, uint64_t *sta
     if (!record(lib, fde, &f)) return FDE_BAD;
     rd_bytes(&f, &cie_off, 4);
     if (f.bad || cie_off == 0) return FDE_BAD;             /* 0 would be a CIE, not an FDE */
-    cie_at = fde + 4 - cie_off;
+    cie_at = (const unsigned char *)((uintptr_t)fde + 4u - (uintptr_t)cie_off);
     if (!record(lib, cie_at, &ci)) return FDE_BAD;
     {
         uint32_t id;
@@ -134,11 +142,11 @@ static int fde_parse(const afw_lib *lib, const unsigned char *fde, uint64_t *sta
         if (aug[0] == 'z') {
             const char *a;
             uint64_t alen;
-            const unsigned char *aend;
+            uintptr_t aend;
             has_z = 1;
             alen = rd_uleb(&ci);
-            if (ci.bad || (uint64_t)(ci.end - ci.p) < alen) return FDE_BAD;
-            aend = ci.p + alen;
+            if (ci.bad || (uint64_t)cur_rem(&ci) < alen) return FDE_BAD;
+            aend = (uintptr_t)ci.p + (uintptr_t)alen;
             for (a = aug + 1; *a; a++) {
                 if (*a == 'R') fde_enc = rd_u8(&ci);
                 else if (*a == 'L') lsda_enc = rd_u8(&ci);
@@ -146,7 +154,7 @@ static int fde_parse(const afw_lib *lib, const unsigned char *fde, uint64_t *sta
                 else if (*a == 'S' || *a == 'B') continue;
                 else return FDE_BAD;                         /* unknown augmentation: do not guess */
             }
-            if (ci.bad || ci.p > aend) return FDE_BAD;
+            if (ci.bad || (uintptr_t)ci.p > aend) return FDE_BAD;
         } else if (aug[0]) {
             return FDE_BAD;
         }
@@ -157,11 +165,12 @@ static int fde_parse(const afw_lib *lib, const unsigned char *fde, uint64_t *sta
     *end = *start + range;
     if (has_z) {
         uint64_t alen = rd_uleb(&f);
-        const unsigned char *aend = f.p + alen;
-        if (f.bad || (uint64_t)(f.end - f.p) < alen) return FDE_BAD;
+        uintptr_t aend;
+        if (f.bad || (uint64_t)cur_rem(&f) < alen) return FDE_BAD;
+        aend = (uintptr_t)f.p + (uintptr_t)alen;
         if (lsda_enc != PE_OMIT) {
             uint64_t v = rd_enc(&f, lsda_enc, 0);
-            if (f.bad || f.p > aend) return FDE_BAD;         /* present but undecodable */
+            if (f.bad || (uintptr_t)f.p > aend) return FDE_BAD; /* present but undecodable */
             *lsda = v;
             return v ? FDE_OK_LSDA : FDE_OK;
         }
@@ -182,7 +191,7 @@ static int hdr_table(const afw_lib *lib, const int32_t **tab, uint64_t *count) {
     if (c.bad || ver != 1 || tab_enc != (PE_DATAREL | PE_SDATA4)) return 0;
     rd_enc(&c, ptr_enc, hdr);
     *count = rd_enc(&c, cnt_enc, hdr);
-    if (c.bad || (uint64_t)(c.end - c.p) / 8 < *count) return 0;
+    if (c.bad || (uint64_t)cur_rem(&c) / 8 < *count) return 0;
     *tab = (const int32_t *)c.p;
     return 1;
 }
@@ -267,10 +276,10 @@ int afw_func_landing_pads(const afw_lib *lib, uint64_t func, uint64_t *out, int 
     cs_enc = rd_u8(&c);
     if (c.bad || cs_enc == PE_OMIT || (cs_enc & 0x70) != 0) return -1;  /* call sites: plain offsets */
     cs_len = rd_uleb(&c);
-    if (c.bad || (uint64_t)(c.end - c.p) < cs_len) return -1;
+    if (c.bad || (uint64_t)cur_rem(&c) < cs_len) return -1;
     cs_end = c.p + cs_len;
     c.end = cs_end;                                        /* entries must stay inside the table */
-    while (c.p < cs_end) {
+    while ((uintptr_t)c.p < (uintptr_t)cs_end) {
         uint64_t lp;
         rd_enc(&c, cs_enc, 0);                             /* start */
         rd_enc(&c, cs_enc, 0);                             /* length */

@@ -12,22 +12,38 @@
 #include "platform.h"
 #include "tls_layout.h"
 
+#define AFW_TLS_DYN_BASE (AFW_TLS_MAX_MODULES + 1)
+#define AFW_TLS_MAX_DYN  64
+
 /* Register a PT_TLS segment whose initial image (.tdata) is at `image`.
- * Returns the 1-based module id, or 0 on error (message printed): layout
- * already fixed, bad alignment, too many modules. */
+ * Before afw_tls_static_finish(): registers a static TLS module (1..32).
+ * After  afw_tls_static_finish(): registers a dynamic TLS module (33..96)
+ * served lazily from the per-thread DTV in afw_tls_get_addr().
+ * Returns the 1-based module id, or 0 on error. */
 int afw_tls_static_register(const void *image, const afw_tls_segment *seg, const char *name);
 
-/* Undo the last registration (a library that failed to load). Returns 0,
- * or -1 if mod is not the last module or the layout is already fixed. */
+/* Undo the last registration (a library that failed to load before finalize). */
 int afw_tls_static_unregister(int mod);
 
-/* Fix the layout. After this, register() refuses (dynamic TLS is G2).
- * Rebuilds the calling thread's block. Idempotent. Returns 0 or -1. */
+int afw_tls_is_static_module(int mod);
+int afw_tls_is_dynamic_module(int mod);
+
+/* Finalize a dynamically registered PT_TLS module after relocations (copies
+ * relocated .tdata image to owned heap memory and publishes ready = 1). */
+int afw_tls_dynamic_finalize(int mod);
+int afw_tls_dynamic_is_finalized(int mod);
+
+/* Release all lazily allocated dynamic DTV blocks for the calling thread
+ * (called after Bionic's __cxa_thread_finalize and before clear_child_tid wake). */
+void afw_tls_dtv_free_current(void);
+
+/* Fix the static layout (startup modules). After this, new PT_TLS modules
+ * use the dynamic DTV. Rebuilds the calling thread's block. Idempotent. */
 int afw_tls_static_finish(void);
 int afw_tls_static_is_finished(void);
 int afw_tls_static_count(void);
 
-/* Offset of module `mod` (1-based) below tp, or 0 if unknown. */
+/* Offset of static module `mod` (1-based) below tp, or 0 if unknown/dynamic. */
 uint64_t afw_tls_static_off(int mod);
 
 /* Copy the finalized Bionic StaticTlsLayout (valid after afw_tls_static_finish).
@@ -59,13 +75,16 @@ uintptr_t *afw_tls_static_alloc(void **block, unsigned char **area);
 #define AFW_PTI_TID            0x10   /* int: gettid() reads it (measured) */
 void afw_tls_static_free(void *block);
 
-/* Address of byte `offset` of module `module` (1-based) for the calling
+/* Address of byte `offset` of static module `module` (1-based) for the calling
  * thread, or NULL if the module does not exist or offset >= its p_memsz. */
 void *afw_tls_static_resolve(uint64_t module, uint64_t offset);
-uint64_t afw_tls_static_memsz(int mod);   /* p_memsz of module mod, 0 if unknown */
+/* Non-allocating TLS block lookup for dl_iterate_phdr() dlpi_tls_data:
+ * returns static block or already-allocated dynamic DTV block, else NULL. */
+void *afw_tls_resolve_existing(uint64_t module);
+uint64_t afw_tls_static_memsz(int mod);   /* p_memsz of module mod (static or dynamic), 0 if unknown */
 
-/* What general-dynamic code calls (resolved for every library in G1, ahead
- * of libc's own export: TEMPORARY until bionic's DTV is built in G2). */
+/* General-dynamic TLS resolver: handles both startup static TLS modules and
+ * dynamically dlopen'd PT_TLS modules via the internal per-thread DTV. */
 typedef struct { uint64_t module, offset; } afw_tls_index;
 SYSV void *afw_tls_get_addr(const afw_tls_index *ti);
 
