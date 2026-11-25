@@ -36,8 +36,27 @@ int main(int argc, char **argv) {
     std::string javalib = art_dir + "/javalib";
     std::string lib64   = art_dir + "/lib64";
 
+    setenv("ANDROID_ART_ROOT", art_dir.c_str(), 1);
+    setenv("ANDROID_I18N_ROOT", art_dir.c_str(), 1);
+    setenv("ANDROID_TZDATA_ROOT", art_dir.c_str(), 1);
+    setenv("ANDROID_ROOT", art_dir.c_str(), 1);
+    setenv("ANDROID_DATA", art_dir.c_str(), 1);
+
     std::printf("=== G3 ART Gate: booting real Android 14 libart.so ===\n");
     std::printf("  art_dir:  %s\n  test_jar: %s\n", art_dir.c_str(), test_jar.c_str());
+
+    /* Redirect Android liblog output to stderr so all ART LOG()/CHECK() messages are visible. */
+    void *h_log = dlopen("liblog.so", RTLD_NOW);
+    if (h_log) {
+        typedef void (*logger_fn)(const void *);
+        typedef void (*set_logger_fn)(logger_fn);
+        set_logger_fn set_logger = reinterpret_cast<set_logger_fn>(dlsym(h_log, "__android_log_set_logger"));
+        logger_fn stderr_logger = reinterpret_cast<logger_fn>(dlsym(h_log, "__android_log_stderr_logger"));
+        if (set_logger && stderr_logger) {
+            set_logger(stderr_logger);
+            std::printf("[G3] step 0 OK: liblog redirected to stderr\n");
+        }
+    }
 
     std::printf("[G3] step 1: dlopen(\"libart.so\", RTLD_NOW)...\n");
     void *h_art = dlopen("libart.so", RTLD_NOW);

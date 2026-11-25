@@ -157,10 +157,12 @@ def extract_art_full(system, out):
     """Extract libart.so, all APEX/system transitive .so deps, bootclasspath jars, and ICU data."""
     lib_dir = os.path.join(out, "art", "lib64")
     jar_dir = os.path.join(out, "art", "javalib")
-    icu_dir = os.path.join(out, "art", "icu")
+    icu_dir = os.path.join(out, "art", "etc", "icu")
+    tz_dir  = os.path.join(out, "art", "etc", "tz")
     os.makedirs(lib_dir, exist_ok=True)
     os.makedirs(jar_dir, exist_ok=True)
     os.makedirs(icu_dir, exist_ok=True)
+    os.makedirs(tz_dir, exist_ok=True)
 
     bionic_skip = {"libc.so", "libm.so", "libdl.so", "ld-android.so"}
     have = set(bionic_skip)
@@ -172,6 +174,7 @@ def extract_art_full(system, out):
         ("com.android.conscrypt.apex", "com.android.conscrypt.capex"),
         ("com.android.os.statsd.apex", "com.android.os.statsd.capex"),
         ("com.android.runtime.apex", "com.android.runtime.capex"),
+        ("com.android.tzdata.apex", "com.android.tzdata.capex"),
     ]
     for cand in apex_list:
         payload = open_apex(system, cand)
@@ -212,6 +215,18 @@ def extract_art_full(system, out):
                         with open(os.path.join(icu_dir, n), "wb") as df:
                             df.write(d)
                         print("== icu %-24s %9d bytes" % (n, len(d)))
+            except FileNotFoundError:
+                pass
+            try:
+                for n, ino in fs.listdir(fs.lookup("/etc/tz")):
+                    if not n.startswith("."):
+                        try:
+                            d = fs.data(ino)
+                        except (FileNotFoundError, IOError, ValueError):
+                            continue
+                        with open(os.path.join(tz_dir, n), "wb") as tf:
+                            tf.write(d)
+                        print("== tz  %-24s %9d bytes" % (n, len(d)))
             except FileNotFoundError:
                 pass
         os.remove(pimg)

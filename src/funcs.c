@@ -211,18 +211,43 @@ static const unsigned char *find_fde(const afw_lib *lib, uint64_t addr) {
     return (const unsigned char *)(uintptr_t)(hdr + (int64_t)tab[2 * lo + 1]);
 }
 
+static uint64_t sym_inferred_size(const afw_lib *lib, const Elf64_Sym *s) {
+    const char *nm;
+    char end_nm[160];
+    size_t i, nlen;
+    unsigned stt = ELF64_ST_TYPE(s->st_info);
+    if (stt == STT_FUNC && s->st_size) return s->st_size;
+    if (stt != STT_FUNC && stt != 0 /* STT_NOTYPE */) return 0;
+    if (s->st_size || !lib->strtab || !s->st_name) return 0;
+    nm = lib->strtab + s->st_name;
+    if (strncmp(nm, "ExecuteNterp", 12) != 0) return 0;
+    nlen = strlen(nm);
+    if (nlen + 4 > sizeof end_nm) return 0;
+    memcpy(end_nm, "End", 3);
+    memcpy(end_nm + 3, nm, nlen + 1);
+    for (i = 1; i < lib->nsyms; i++) {
+        const Elf64_Sym *e = &lib->symtab[i];
+        if (e->st_shndx != SHN_UNDEF && e->st_name &&
+            strcmp(lib->strtab + e->st_name, end_nm) == 0 && e->st_value > s->st_value)
+            return e->st_value - s->st_value;
+    }
+    return 0;
+}
+
 int afw_func_bounds(const afw_lib *lib, uint64_t addr, uint64_t *start, uint64_t *end) {
     const unsigned char *fde = find_fde(lib, addr);
     uint64_t lsda;
     size_t i;
     if (fde && fde_parse(lib, fde, start, end, &lsda) != FDE_BAD && addr >= *start && addr < *end)
         return 1;
-    /* fallback: exported function symbols with a size */
+    /* fallback: exported function symbols with a size (or End<name> pair) */
     for (i = 1; i < lib->nsyms; i++) {
         const Elf64_Sym *s = &lib->symtab[i];
-        uint64_t a = (uint64_t)lib->bias + s->st_value;
-        if (s->st_shndx == SHN_UNDEF || ELF64_ST_TYPE(s->st_info) != STT_FUNC || !s->st_size) continue;
-        if (addr >= a && addr < a + s->st_size) { *start = a; *end = a + s->st_size; return 1; }
+        uint64_t a = (uint64_t)lib->bias + s->st_value, sz;
+        if (s->st_shndx == SHN_UNDEF) continue;
+        sz = sym_inferred_size(lib, s);
+        if (!sz) continue;
+        if (addr >= a && addr < a + sz) { *start = a; *end = a + sz; return 1; }
     }
     return 0;
 }
@@ -262,12 +287,14 @@ int afw_func_list(const afw_lib *lib, unsigned char ***starts, size_t **sizes) {
         qsort(tmp, nfde, sizeof *tmp, cmp_func_range);
         for (i = 1; i < lib->nsyms; i++) {
             const Elf64_Sym *s = &lib->symtab[i];
-            uint64_t s0, e0;
+            uint64_t s0, e0, sz;
             size_t lo = 0, hi = nfde;
             int overlap = 0;
-            if (s->st_shndx == SHN_UNDEF || ELF64_ST_TYPE(s->st_info) != STT_FUNC || !s->st_size) continue;
+            if (s->st_shndx == SHN_UNDEF) continue;
+            sz = sym_inferred_size(lib, s);
+            if (!sz) continue;
             s0 = (uint64_t)lib->bias + s->st_value;
-            e0 = s0 + s->st_size;
+            e0 = s0 + sz;
             if (e0 <= s0 || s0 < (uint64_t)(uintptr_t)lib->base || e0 > (uint64_t)(uintptr_t)lib->base + lib->size)
                 continue;
             while (lo < hi) {
