@@ -137,19 +137,39 @@ static const wchar_t *utf8_to_wide(const char *path, wchar_t *sbuf, size_t scap,
     wchar_t *w, *p;
     *heap = NULL;
     if (!path) return NULL;
+    char drv_stack[1024];
+    char *drv_heap = NULL;
     if (strcmp(path, "/dev/null") == 0) return L"NUL";
+    if (strncmp(path, "/__afw_drv__/", 13) == 0 &&
+        ((path[13] >= 'A' && path[13] <= 'Z') || (path[13] >= 'a' && path[13] <= 'z')) &&
+        (path[14] == '/' || path[14] == '\0')) {
+        size_t rest_len = strlen(path + 14);
+        size_t need_utf8 = 2 + (rest_len ? rest_len : 1) + 1;
+        char *dst = drv_stack;
+        if (need_utf8 > sizeof drv_stack) {
+            drv_heap = (char *)malloc(need_utf8);
+            if (!drv_heap) return NULL;
+            dst = drv_heap;
+        }
+        dst[0] = path[13];
+        dst[1] = ':';
+        if (rest_len) memcpy(dst + 2, path + 14, rest_len + 1);
+        else { dst[2] = '/'; dst[3] = '\0'; }
+        path = dst;
+    }
     need = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
-    if (need <= 0) return NULL;
+    if (need <= 0) { free(drv_heap); return NULL; }
     if ((size_t)need <= scap) {
         w = sbuf;
     } else {
         w = (wchar_t *)malloc((size_t)need * sizeof(wchar_t));
-        if (!w) return NULL;
+        if (!w) { free(drv_heap); return NULL; }
         *heap = w;
     }
     if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, w, need) <= 0) {
-        free(*heap); *heap = NULL; return NULL;
+        free(drv_heap); free(*heap); *heap = NULL; return NULL;
     }
+    free(drv_heap);
     for (p = w; *p; p++) if (*p == L'/') *p = L'\\';
     return w;
 }
@@ -458,6 +478,26 @@ int afw_os_mkdir(const char *path, uint32_t mode) {
     err = ok ? 0 : GetLastError();
     free(wheap);
     return ok ? 0 : win_err_to_lnx(err);
+}
+
+int afw_os_rename(const char *oldpath, const char *newpath) {
+    wchar_t obuf[512], nbuf[512], *oheap = NULL, *nheap = NULL;
+    const wchar_t *wo, *wn;
+    BOOL ok;
+    DWORD err;
+    if (!oldpath || !newpath) return -14;
+    wo = utf8_to_wide(oldpath, obuf, sizeof obuf / sizeof obuf[0], &oheap);
+    wn = utf8_to_wide(newpath, nbuf, sizeof nbuf / sizeof nbuf[0], &nheap);
+    if (!wo || !wn) { free(oheap); free(nheap); return -22; }
+    ok = MoveFileExW(wo, wn, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    err = ok ? 0 : GetLastError();
+    free(oheap); free(nheap);
+    return ok ? 0 : win_err_to_lnx(err);
+}
+
+int afw_os_setenv(const char *name, const char *val) {
+    if (!name || !val) return -22;
+    return _putenv_s(name, val) == 0 ? 0 : -12;
 }
 
 #ifndef SYMBOLIC_LINK_FLAG_DIRECTORY
@@ -1317,6 +1357,16 @@ int afw_os_unlink(const char *path, int rmdir_flag) {
 int afw_os_mkdir(const char *path, uint32_t mode) {
     if (!path) return -EFAULT;
     return mkdir(path, (mode_t)(mode & 0777u)) == 0 ? 0 : -errno;
+}
+
+int afw_os_rename(const char *oldpath, const char *newpath) {
+    if (!oldpath || !newpath) return -EFAULT;
+    return rename(oldpath, newpath) == 0 ? 0 : -errno;
+}
+
+int afw_os_setenv(const char *name, const char *val) {
+    if (!name || !val) return -EINVAL;
+    return setenv(name, val, 1) == 0 ? 0 : -errno;
 }
 
 int afw_os_symlink(const char *target, const char *linkpath) {

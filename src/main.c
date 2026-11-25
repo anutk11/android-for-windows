@@ -23,6 +23,7 @@
 #include "attest.h"
 #include "tls_static.h"
 #include "vma.h"
+#include "win_host.h"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -33,7 +34,7 @@
 #include <unistd.h>
 #endif
 
-#define AFW_VERSION "0.2.0-M1-dev"
+#define AFW_VERSION "0.5.0-ART"
 
 /* Signatures of the test library's functions (Android = System V ABI). */
 typedef const char *(SYSV *greeting_fn)(void);
@@ -830,6 +831,48 @@ static char **build_exec_env(int clean_env, char **overrides, int noverrides) {
     return out;
 }
 
+static int file_exists_rb(const char *path) {
+    FILE *f = path ? fopen(path, "rb") : NULL;
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+static int ends_with_ci(const char *s, const char *suf) {
+    size_t ls = s ? strlen(s) : 0, lf = suf ? strlen(suf) : 0;
+    size_t i;
+    if (ls < lf) return 0;
+    s += ls - lf;
+    for (i = 0; i < lf; i++) {
+        char a = s[i], b = suf[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+static void dir_of_path(const char *path, char *out, size_t outsz) {
+    const char *s1 = strrchr(path, '/');
+    const char *s2 = strrchr(path, '\\');
+    const char *sep = (!s1 || (s2 && s2 > s1)) ? s2 : s1;
+    if (sep && sep > path)
+        snprintf(out, outsz, "%.*s", (int)(sep - path), path);
+    else
+        snprintf(out, outsz, ".");
+}
+
+static int find_first_file(const char *const *bases, int nbases, const char *rel,
+                           char *out, size_t outsz) {
+    int i;
+    for (i = 0; i < nbases; i++) {
+        if (!bases[i] || !bases[i][0]) continue;
+        snprintf(out, outsz, "%s/%s", bases[i], rel);
+        if (file_exists_rb(out)) return 1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     static afw_lib lib;   /* loaded libraries stay loaded: the registry points at it */
     int verbose = 1, rc = 0, strict = 0, min_pads = 0, call_trap = 0;
@@ -847,6 +890,10 @@ int main(int argc, char **argv) {
     int call_bad_ip = 0;   /* test: execute address 0x28 - must be a crash report, never a hang */
     static afw_lib deps[64];
     int ndeps = 0;
+    const char *apk_path = NULL;
+    const char *runtime_dir = NULL;
+    int win_w = 0, win_h = 0;
+    int parse_start = 2;
 
     setvbuf(stdout, NULL, _IONBF, 0); /* never lose output on a crash */
     afw_crash_init();
@@ -854,22 +901,50 @@ int main(int argc, char **argv) {
     printf("bionic-win provides %d functions\n\n", afw_shim_count());
 
     if (argc < 2) {
-        printf("usage: %s <library.so> [-v]\n", argv[0]);
+        printf("usage:\n"
+               "  %s --apk <app.apk> [--runtime-dir=DIR] [--width=W] [--height=H] [--headless]\n"
+               "  %s <library.so> [-v]\n", argv[0], argv[0]);
         return 2;
     }
 #ifdef AFW_TEST
     if (strcmp(argv[1], "--test-must-queue") == 0)
         return afw_patch_test_must_queue();
 #endif
-    if (argc > 2 && strcmp(argv[2], "-v") == 0) verbose = 2;
-    if (argc > 2 && strcmp(argv[2], "--patch-report") == 0) afw_load_patch_only = 1;
+    if (strcmp(argv[1], "--apk") == 0) {
+        if (argc < 3) { fprintf(stderr, "error: --apk requires an .apk file path\n"); return 2; }
+        apk_path = argv[2];
+        parse_start = 3;
+    } else if (strncmp(argv[1], "--apk=", 6) == 0) {
+        apk_path = argv[1] + 6;
+        parse_start = 2;
+    } else if (ends_with_ci(argv[1], ".apk")) {
+        apk_path = argv[1];
+        parse_start = 2;
+    } else {
+        if (argc > 2 && strcmp(argv[2], "-v") == 0) verbose = 2;
+        if (argc > 2 && strcmp(argv[2], "--patch-report") == 0) afw_load_patch_only = 1;
+    }
     {
         int a;
-        for (a = 2; a < argc; a++) {
+        for (a = parse_start; a < argc; a++) {
             if (strcmp(argv[a], "--strict") == 0) strict = 1;
             else if (strcmp(argv[a], "--allow-unproven") == 0) afw_load_allow_unproven = 1;
             else if (strcmp(argv[a], "--attest-dump") == 0) afw_attest_dump = 1;
             else if (strcmp(argv[a], "--art-gs") == 0) { afw_load_enable_art_gs = 1; afw_crash_enable_probe_veh(); }
+            else if (strcmp(argv[a], "--headless") == 0) afw_host_set_headless(1);
+            else if (strncmp(argv[a], "--width=", 8) == 0) win_w = atoi(argv[a] + 8);
+            else if (strncmp(argv[a], "--height=", 9) == 0) win_h = atoi(argv[a] + 9);
+            else if (strncmp(argv[a], "--screenshot=", 13) == 0) afw_host_set_screenshot(argv[a] + 13);
+            else if (strncmp(argv[a], "--inject-click=", 15) == 0) {
+                int cx = 0, cy = 0;
+                if (sscanf(argv[a] + 15, "%d,%d", &cx, &cy) == 2)
+                    afw_host_add_inject_click(cx, cy);
+                else { fprintf(stderr, "error: --inject-click expects X,Y\n"); return 2; }
+            }
+            else if (strncmp(argv[a], "--auto-exit=", 12) == 0) afw_host_set_auto_exit_ms(atoi(argv[a] + 12));
+            else if (strncmp(argv[a], "--runtime-dir=", 14) == 0) runtime_dir = argv[a] + 14;
+            else if (strcmp(argv[a], "--apk") == 0 && a + 1 < argc) apk_path = argv[++a];
+            else if (strncmp(argv[a], "--apk=", 6) == 0) apk_path = argv[a] + 6;
 #ifdef AFW_TEST
             else if (strncmp(argv[a], "--attest-tamper=", 16) == 0) afw_attest_set_tamper(argv[a] + 16);
             else if (strncmp(argv[a], "--attest-add=", 13) == 0) {
@@ -904,12 +979,121 @@ int main(int argc, char **argv) {
             }
         }
     }
+    if (win_w > 0 || win_h > 0) afw_host_set_size(win_w, win_h);
     if (afw_check_security() != 0) return 1;
     if (afw_tls_init() != 0) return 1;
     afw_syscall_set_gs_ops(afw_tls_set_art_gs, afw_tls_get_art_gs);
+    if (apk_path) {
+        afw_load_enable_art_gs = 1;
+        afw_load_allow_unproven = 1;
+        afw_crash_enable_probe_veh();
+    }
     if (afw_load_enable_art_gs) {
         extern void afw_main_abort_diag(uintptr_t sp);
         afw_syscall_set_abort_cb(afw_main_abort_diag);
+    }
+
+    /* Turnkey APK runner mode: afw-loader.exe --apk app.apk */
+    if (apk_path) {
+        char exe_dir[512], launcher[1024], fw_jar[1024], libc_probe[1024], art_probe[1024];
+        char bionic_dir[1024], art_dir[1024], lib_path[4096];
+        const char *bases[6];
+        int nb = 0;
+        const char *old_lp = getenv("AFW_LIB_PATH");
+        char *pargv[5];
+        if (!file_exists_rb(apk_path)) {
+            fprintf(stderr, "error: APK file not found: %s\n", apk_path);
+            return 2;
+        }
+        dir_of_path(argv[0], exe_dir, sizeof exe_dir);
+        if (runtime_dir && runtime_dir[0]) bases[nb++] = runtime_dir;
+        bases[nb++] = exe_dir;
+        bases[nb++] = "out";
+        bases[nb++] = ".";
+        if (!find_first_file(bases, nb, "afw_apk_launcher", launcher, sizeof launcher)) {
+            fprintf(stderr, "error: afw_apk_launcher not found (checked %s, %s, out, .)\n",
+                    runtime_dir ? runtime_dir : "(none)", exe_dir);
+            return 2;
+        }
+        if (!find_first_file(bases, nb, "afw-framework.jar", fw_jar, sizeof fw_jar)) {
+            fprintf(stderr, "error: afw-framework.jar not found\n");
+            return 2;
+        }
+        {
+            char rt_bionic[600], rt_runtime[600], exe_rt[600], exe_bionic[600];
+            const char *bb[8];
+            int nbb = 0;
+            if (runtime_dir && runtime_dir[0]) {
+                snprintf(rt_bionic, sizeof rt_bionic, "%s/bionic", runtime_dir);
+                snprintf(rt_runtime, sizeof rt_runtime, "%s/runtime", runtime_dir);
+                bb[nbb++] = rt_bionic;
+                bb[nbb++] = rt_runtime;
+                bb[nbb++] = runtime_dir;
+            }
+            snprintf(exe_rt, sizeof exe_rt, "%s/runtime", exe_dir);
+            snprintf(exe_bionic, sizeof exe_bionic, "%s/bionic", exe_dir);
+            bb[nbb++] = exe_rt;
+            bb[nbb++] = exe_bionic;
+            bb[nbb++] = "runtime";
+            bb[nbb++] = "out/bionic";
+            bb[nbb++] = ".";
+            if (!find_first_file(bb, nbb, "libc.so", libc_probe, sizeof libc_probe)) {
+                fprintf(stderr, "error: Android runtime (libc.so) not found.\n"
+                                "Run setup_runtime.bat (or: python tools/fetch_bionic.py runtime --art-full) first.\n");
+                return 2;
+            }
+            dir_of_path(libc_probe, bionic_dir, sizeof bionic_dir);
+        }
+        {
+            char c1[1100], c2[1100], c3[1100];
+            const char *ab[5];
+            int nab = 0;
+            snprintf(c1, sizeof c1, "%s/art", bionic_dir);
+            ab[nab++] = c1;
+            if (runtime_dir && runtime_dir[0]) {
+                snprintf(c2, sizeof c2, "%s/art", runtime_dir);
+                ab[nab++] = c2;
+            }
+            snprintf(c3, sizeof c3, "%s/art", exe_dir);
+            ab[nab++] = c3;
+            ab[nab++] = "runtime/art";
+            ab[nab++] = "out/bionic/art";
+            if (!find_first_file(ab, nab, "lib64/libart.so", art_probe, sizeof art_probe)) {
+                fprintf(stderr, "error: Android ART runtime (art/lib64/libart.so) not found.\n"
+                                "Run setup_runtime.bat (or: python tools/fetch_bionic.py runtime --art-full) first.\n");
+                return 2;
+            }
+            /* art_probe is <art_dir>/lib64/libart.so -> strip /lib64/libart.so */
+            dir_of_path(art_probe, art_dir, sizeof art_dir);
+            dir_of_path(art_dir, art_dir, sizeof art_dir);
+        }
+        snprintf(lib_path, sizeof lib_path, "%s;%s/lib64;%s;%s%s%s",
+                 bionic_dir, art_dir, exe_dir, runtime_dir ? runtime_dir : ".",
+                 (old_lp && old_lp[0]) ? ";" : "", (old_lp && old_lp[0]) ? old_lp : "");
+        afw_os_setenv("AFW_LIB_PATH", lib_path);
+
+        printf("APK:       %s\n", apk_path);
+        printf("Runtime:   %s\n", bionic_dir);
+        printf("ART:       %s\n", art_dir);
+        printf("Framework: %s\n\n", fw_jar);
+
+        penvp = build_exec_env(clean_env, env_overrides, nenv_overrides);
+        if (!penvp) return 1;
+        afw_shared_globals_set_process(NULL, penvp, launcher);
+        if (afw_load_with_deps(launcher, &lib, deps, 64, &ndeps, 0) != 0) {
+            fprintf(stderr, "error: failed to load %s\n", launcher);
+            free(penvp);
+            return 1;
+        }
+        pargv[0] = launcher;
+        pargv[1] = art_dir;
+        pargv[2] = fw_jar;
+        pargv[3] = (char *)apk_path;
+        pargv[4] = NULL;
+        afw_exec(&lib, 4, pargv, penvp);
+        fprintf(stderr, "error: could not start APK launcher\n");
+        free(penvp);
+        return 1;
     }
 
     /* test: a library that must FAIL to load leaves nothing behind - not in

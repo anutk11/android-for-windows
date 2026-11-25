@@ -163,6 +163,22 @@ jobs:
           javac --release 8 -Xlint:-options -d out/g3_java/cls test/G3ArtTest.java
           D8=$(find "${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}/build-tools" -name d8 -type f | sort -V | tail -n 1)
           "$D8" --min-api 24 --output out/g3_java_test.jar out/g3_java/cls/*.class
+          # G4/G5: Turnkey APK launcher PIE (static libc++ so zero external NDK .so needed),
+          # Android SDK framework JAR (afw-framework.jar), and real sample Music Synth APK
+          "$TC/clang++" --target=x86_64-linux-android34 -std=c++17 -fno-exceptions -fno-rtti -fPIE -pie -O2 \
+            -static-libstdc++ -Wl,--pack-dyn-relocs=none -Wl,--export-dynamic \
+            -ldl -o out/afw_apk_launcher test/afw_apk_launcher.cpp
+          echo "--- afw_apk_launcher DT_NEEDED (must use only system libc/libm/libdl)"
+          "$TC/llvm-readelf" -dW out/afw_apk_launcher | grep NEEDED
+          mkdir -p out/fw_cls out/sample_cls out/sample_dex
+          javac --release 8 -Xlint:-options -d out/fw_cls $(find framework/java -name '*.java')
+          "$D8" --min-api 24 --output out/afw-framework.jar $(find out/fw_cls -name '*.class')
+          "$TC/clang++" --target=x86_64-linux-android24 -shared -fPIC -O2 -fno-exceptions -fno-rtti -nostdlib++ \
+            -Wl,--pack-dyn-relocs=none -Wl,-soname,libsample_jni.so \
+            -lm -o out/libsample_jni.so test/sample_apk/jni/sample_jni.cpp
+          javac --release 8 -Xlint:-options -cp out/fw_cls -d out/sample_cls $(find test/sample_apk/src -name '*.java')
+          "$D8" --min-api 24 --output out/sample_dex $(find out/sample_cls -name '*.class')
+          python3 tools/build_sample_apk.py build --dex out/sample_dex/classes.dex --lib out/libsample_jni.so --out out/sample_music_app.apk
           echo "--- G2a/G2b/G3 Gate DT_NEEDED (must dynamically link libc++_shared.so across all DSOs and PIEs)"
           for f in out/libcxx_thrower.so out/libcxx_catcher.so out/libdlopen_cxx.so out/cxx_gate_exe out/libg2b_dlopen_tls.so out/g2b_gate_exe out/g3_art_gate_exe; do
             echo "$f:"
@@ -185,6 +201,9 @@ jobs:
             out/g2b_gate_exe
             out/g3_art_gate_exe
             out/g3_java_test.jar
+            out/afw_apk_launcher
+            out/afw-framework.jar
+            out/sample_music_app.apk
 
   # Gate G1 experiment: static scan of the real bionic libc.so.
   # The extracted Android files are NOT uploaded (licensing): only the report.
@@ -421,6 +440,8 @@ jobs:
              -o out/loader_lock_test tools/loader_lock_test.c src/platform.c
           cc -g -O1 -DAFW_TEST -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined -Wall -Wextra -pthread \
              -o out/dtv_bridge_test tools/dtv_bridge_test.c src/tls_static.c src/tls_layout.c src/tls_patch.c src/callback_bridge.c src/funcs.c src/platform.c
+          cc -g -O1 -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined -Wall -Wextra \
+             -o out/win_host_test tools/win_host_test.c src/win_host.c
       - name: "Attestation checks (PR #7 + cross-block must_hold_table): queue self-test, variants 1-15 & stale"
         run: |
           set -euo pipefail
@@ -468,6 +489,7 @@ jobs:
           out/tls_layout_test
           out/loader_lock_test
           out/dtv_bridge_test
+          out/win_host_test
           out/afw-asan out/libhello.so
           out/afw-asan out/libsyscall_test.so
           out/afw-asan out/libredzone_test.so
@@ -558,8 +580,8 @@ jobs:
           clang-cl /nologo /O2 /W3 /DAFW_TEST /D_CRT_SECURE_NO_WARNINGS -Wno-unused-function -Iout\zydis-amalg ^
               /Fe:out\afw-loader-test.exe /Foout\testobj\ ^
               src\main.c src\elf_loader.c src\bionic_shim.c src\platform.c src\tls_patch.c src\crash.c ^
-              src\patch.c src\attest.c src\sha256.c src\syscall.c src\thread.c src\fd.c src\filemap.c src\funcs.c src\vma.c src\tls_layout.c src\tls_static.c src\loader_api.c src\callback_bridge.c src\exec.c out\Zydis.obj ^
-              /link dbghelp.lib
+              src\patch.c src\attest.c src\sha256.c src\syscall.c src\thread.c src\fd.c src\filemap.c src\funcs.c src\vma.c src\tls_layout.c src\tls_static.c src\loader_api.c src\callback_bridge.c src\exec.c src\win_host.c out\Zydis.obj ^
+              /link dbghelp.lib user32.lib gdi32.lib winmm.lib /STACK:8388608,8388608
           if errorlevel 1 exit /b 1
           out\afw-loader-test.exe out\libhello.so --finish-fail-late=tls:out\libtls_test.so
           if errorlevel 1 exit /b 1
@@ -775,6 +797,34 @@ jobs:
           if not "%rc%"=="0" exit /b 1
           findstr /c:"G3 ART GATE PASSED" out\g3-art-gate.txt >nul || exit /b 1
           exit /b 0
+      - name: "G4 Host Unit Tests: Win32 host bridge (framebuffer, 32-bit BMP, click injection, audio stats)"
+        shell: cmd
+        run: |
+          if not exist out\whobj mkdir out\whobj
+          clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Fe:out\win_host_test.exe /Foout\whobj\ tools\win_host_test.c src\win_host.c /link user32.lib gdi32.lib winmm.lib
+          if errorlevel 1 exit /b 1
+          out\win_host_test.exe
+      - name: "G4/G5 Gate: turnkey --apk sample_music_app.apk (AXML, native JNI, AssetManager, SharedPreferences, Canvas, touch click, AudioTrack, BMP) (required)"
+        timeout-minutes: 3
+        shell: cmd
+        run: |
+          if exist out\.afw_data rmdir /s /q out\.afw_data
+          if exist out\sample_screen.bmp del /f /q out\sample_screen.bmp
+          out\afw-loader.exe --apk out\sample_music_app.apk --runtime-dir=out --headless --inject-click=210,400 --screenshot=out\sample_screen.bmp --auto-exit=900 --watchdog=60 > out\g4-apk-gate.txt 2>&1
+          set rc=%errorlevel%
+          type out\g4-apk-gate.txt
+          echo g4_apk_gate exit code %rc%
+          if not "%rc%"=="0" exit /b 1
+          findstr /c:"[afw] APK package:  com.afw.sample" out\g4-apk-gate.txt >nul || (echo missing package & exit /b 1)
+          findstr /c:"[afw] APK activity: com.afw.sample.PlayerActivity" out\g4-apk-gate.txt >nul || (echo missing activity & exit /b 1)
+          findstr /c:"[afw] extracted native lib:" out\g4-apk-gate.txt >nul || (echo missing native lib extraction & exit /b 1)
+          findstr /c:"[SAMPLE_APK] BOOT dsp=AFW-Native-DSP-1.0 asset=\"AFW-Asset-Ready\"" out\g4-apk-gate.txt >nul || (echo missing native JNI or asset check & exit /b 1)
+          findstr /c:"[SAMPLE_APK] BUTTON_CLICKED taps=1 note=E4" out\g4-apk-gate.txt >nul || (echo injected click did not fire OnClickListener & exit /b 1)
+          findstr /c:"[SAMPLE_APK] SUMMARY dsp=AFW-Native-DSP-1.0 asset=AFW-Asset-Ready taps=1 saved_taps=1" out\g4-apk-gate.txt >nul || (echo summary or SharedPreferences mismatch & exit /b 1)
+          findstr /c:"[afw] clean shutdown" out\g4-apk-gate.txt >nul || (echo missing clean shutdown & exit /b 1)
+          python -I tools\build_sample_apk.py verify-bmp out\sample_screen.bmp
+          if errorlevel 1 exit /b 1
+          exit /b 0
       - name: "G2-1 Probe (Items 2-5): Windows stack / NT_TIB / VEH / ExitThread probe (informational)"
         continue-on-error: true
         timeout-minutes: 2
@@ -799,7 +849,16 @@ jobs:
         shell: cmd
         run: |
           mkdir pkg
+          mkdir pkg\tools
           copy out\afw-loader.exe pkg\
+          copy out\afw_apk_launcher pkg\
+          copy out\afw-framework.jar pkg\
+          copy out\sample_music_app.apk pkg\
+          copy tools\setup_runtime.bat pkg\
+          copy tools\run_apk.bat pkg\
+          copy tools\fetch_bionic.py pkg\tools\
+          copy tools\ext4_get.py pkg\tools\
+          copy README.md pkg\
           copy out\libhello.so pkg\
           copy tools\run-test.bat pkg\
           copy out\fsbase_probe.exe pkg\
@@ -807,7 +866,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: afw-windows
-          path: pkg/*
+          path: pkg/**
 
   # 3. Publish a download link: Releases -> nightly
   release:
@@ -828,4 +887,4 @@ jobs:
           gh release create nightly android-for-windows-nightly.zip \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
             --title "Nightly build (${GITHUB_SHA::7})" \
-            --notes "Unzip and double-click run-test.bat"
+            --notes "Unzip, run setup_runtime.bat once, then double-click run_apk.bat (or drag any .apk onto it)"

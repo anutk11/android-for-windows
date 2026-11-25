@@ -109,8 +109,19 @@ int afw_describe_address(uintptr_t addr, char *out, size_t outsz) {
     return 0;
 }
 
+static const char *translate_drv_path(const char *path, char *buf, size_t bufsz) {
+    if (path && strncmp(path, "/__afw_drv__/", 13) == 0 &&
+        ((path[13] >= 'A' && path[13] <= 'Z') || (path[13] >= 'a' && path[13] <= 'z')) &&
+        (path[14] == '/' || path[14] == '\0')) {
+        snprintf(buf, bufsz, "%c:%s", path[13], path[14] ? path + 14 : "/");
+        return buf;
+    }
+    return path;
+}
+
 static unsigned char *read_file(const char *path, size_t *out_size) {
-    FILE *f = fopen(path, "rb");
+    char pbuf[1200];
+    FILE *f = fopen(translate_drv_path(path, pbuf, sizeof pbuf), "rb");
     unsigned char *buf;
     long n;
     if (!f) return NULL;
@@ -1418,10 +1429,12 @@ void *afw_global_sym(const char *name) {
 int afw_find_lib(const char *name, char *out, size_t outsz) {
     char dir[1024];
     if (strchr(name, '/') || strchr(name, '\\')) {
-        FILE *t = fopen(name, "rb");
+        char pbuf[1200];
+        const char *real = translate_drv_path(name, pbuf, sizeof pbuf);
+        FILE *t = fopen(real, "rb");
         if (!t) return 0;
         fclose(t);
-        snprintf(out, outsz, "%s", name);
+        snprintf(out, outsz, "%s", real);
         return 1;
     }
     /* AFW_LIB_PATH, then the directory of the first library loaded */
@@ -1452,13 +1465,19 @@ static int already_loaded(const char *name) {
 }
 
 /* Find name in the search path: the directories in AFW_LIB_PATH (';' or ':'
- * separated), then dir. */
+ * separated, preserving Windows drive letters like C:\), then dir. */
 static int find_lib(const char *name, const char *dir, char *out, size_t outsz) {
     const char *env = getenv("AFW_LIB_PATH");
     char d[1024];
     FILE *t;
     while (env && *env) {
-        size_t l = strcspn(env, ";:");
+        size_t l = 0;
+        while (env[l]) {
+            if (env[l] == ';') break;
+            if (env[l] == ':' && !(l == 1 && ((env[0] >= 'A' && env[0] <= 'Z') || (env[0] >= 'a' && env[0] <= 'z'))))
+                break;
+            l++;
+        }
         if (l && l < sizeof d) {
             memcpy(d, env, l); d[l] = 0;
             snprintf(out, outsz, "%s/%s", d, name);

@@ -23,6 +23,7 @@
  * android_dlextinfo flags, symbol names in dladdr.
  */
 #include "loader_api.h"
+#include "bionic_shim.h"
 #include "elf_loader.h"
 #include "tls_static.h"
 #include "callback_bridge.h"
@@ -146,6 +147,8 @@ SYSV void *afw_l_dlsym(void *handle, const char *sym, const void *caller) {
         p = next_sym(sym, caller);
     } else if (handle == NULL || handle == &g_main_handle) {
         p = afw_global_sym(sym);      /* RTLD_DEFAULT: every library in load order */
+        if (!p && strncmp(sym, "__afw_host_", 11) == 0)
+            p = afw_shim_lookup(sym);
     } else if (!afw_is_loaded(handle)) {
         afw_dlopen_unlock();
         set_err("dlsym failed: invalid handle %p", handle);

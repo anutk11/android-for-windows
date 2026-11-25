@@ -1038,10 +1038,12 @@ static int64_t dispatch_ex(int64_t nr, int64_t *a, const afw_clone_regs *regs, u
     case 72:  return afw_fd_fcntl(a[0], a[1], a[2]);
     case 74:  case 75: return 0; /* fsync, fdatasync */
     case 79:  return sys_getcwd((char *)(uintptr_t)a[0], (uint64_t)a[1]);
+    case 82:  return (a[0] && a[1]) ? afw_os_rename((const char *)(uintptr_t)a[0], (const char *)(uintptr_t)a[1]) : -LNX_EFAULT;
     case 83:  return a[0] ? afw_os_mkdir((const char *)(uintptr_t)a[0], (uint32_t)a[1]) : -LNX_EFAULT;
     case 87:  return afw_fd_unlinkat(-100, (const char *)(uintptr_t)a[0], 0);
     case 89:  return sys_readlinkat(-100, (const char *)(uintptr_t)a[0],
                                     (char *)(uintptr_t)a[1], a[2]);
+    case 90:  case 91: return 0; /* chmod, fchmod */
     case 95:  return (int64_t)afw_os_atomic_xchg_i32(&g_umask, (int32_t)(a[0] & 0777));
     case 96:  return sys_gettimeofday((int64_t *)(uintptr_t)a[0], (void *)(uintptr_t)a[1]);
     case 97:  return sys_prlimit64(0, a[0], NULL, (void *)(uintptr_t)a[1]);
@@ -1105,12 +1107,17 @@ static int64_t dispatch_ex(int64_t nr, int64_t *a, const afw_clone_regs *regs, u
         return afw_os_mkdir((const char *)(uintptr_t)a[1], (uint32_t)a[2]);
     case 262: return afw_fd_newfstatat(a[0], (const char *)(uintptr_t)a[1], (void *)(uintptr_t)a[2], a[3]);
     case 263: return afw_fd_unlinkat(a[0], (const char *)(uintptr_t)a[1], a[2]);
+    case 264: /* renameat */
+        return (a[1] && a[3]) ? afw_os_rename((const char *)(uintptr_t)a[1], (const char *)(uintptr_t)a[3]) : -LNX_EFAULT;
     case 267: return sys_readlinkat(a[0], (const char *)(uintptr_t)a[1],
                                     (char *)(uintptr_t)a[2], a[3]);
+    case 268: return 0; /* fchmodat */
     case 269: return afw_fd_faccessat(a[0], (const char *)(uintptr_t)a[1], a[2], 0);
     case 302: return sys_prlimit64(a[0], a[1], (const void *)(uintptr_t)a[2],
                                    (void *)(uintptr_t)a[3]);
     case 309: return sys_getcpu((uint32_t *)(uintptr_t)a[0], (uint32_t *)(uintptr_t)a[1]);
+    case 316: /* renameat2 */
+        return (a[1] && a[3]) ? afw_os_rename((const char *)(uintptr_t)a[1], (const char *)(uintptr_t)a[3]) : -LNX_EFAULT;
     case 318: return sys_getrandom((void *)(uintptr_t)a[0], (uint64_t)a[1], a[2]);
     case 439: return afw_fd_faccessat(a[0], (const char *)(uintptr_t)a[1], a[2], a[3]);
     /* one app user, as AT_UID/AT_GID say (bionic_shim.c): uid 10000 */

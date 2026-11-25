@@ -9,6 +9,7 @@
 #include "tls_static.h"
 #include "loader_api.h"
 #include "callback_bridge.h"
+#include "win_host.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -294,6 +295,16 @@ static const shim_entry g_shims[] = {
     S("__loader_android_dlwarning", afw_l_android_dlwarning),
     S("__loader_android_handle_signal", afw_l_android_handle_signal),
     S("__loader_cfi_fail", afw_l_cfi_fail),
+    /* Win32 GUI, framebuffer, input, and audio host bridge (Gates G4/G5) */
+    S("__afw_host_window_create", afw_host_window_create),
+    S("__afw_host_present", afw_host_present),
+    S("__afw_host_poll_event", afw_host_poll_event),
+    S("__afw_host_get_size", afw_host_get_size),
+    S("__afw_host_audio_open", afw_host_audio_open),
+    S("__afw_host_audio_write", afw_host_audio_write),
+    S("__afw_host_audio_close", afw_host_audio_close),
+    S("__afw_host_sleep_ms", afw_host_sleep_ms),
+    S("__afw_host_get_stats", afw_host_get_stats),
 };
 #undef S
 
