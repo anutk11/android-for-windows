@@ -421,6 +421,8 @@ jobs:
              -o out/dtv_bridge_test tools/dtv_bridge_test.c src/tls_static.c src/tls_layout.c src/tls_patch.c src/callback_bridge.c src/funcs.c src/platform.c
           cc -g -O1 -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined -Wall -Wextra \
              -o out/apk_test tools/apk_test.c src/apk.c src/axml.c
+          cc -g -O1 -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined -Wall -Wextra -pthread \
+             -o out/dex_gles_test tools/dex_gles_test.c src/apk.c src/axml.c src/win_gui.c src/android_native.c src/gles_bridge.c src/dex_vm.c src/jni_bridge.c src/platform.c -lm
       - name: "Attestation checks (PR #7 + cross-block must_hold_table): queue self-test, variants 1-15 & stale"
         run: |
           set -euo pipefail
@@ -473,6 +475,7 @@ jobs:
           python3 tools/make_apk.py -o out/apk_t/s1.apk --package com.afw.testapp --activity android.app.NativeActivity --native-lib demo_native --version-code 42 --version-name 2.5 --lib out/apk_t/libdemo_native.so --asset hello.txt=out/apk_t/hello.txt --asset large.txt=out/apk_t/large.txt
           python3 tools/make_apk.py -o out/apk_t/s2.apk --package com.afw.dexapp --activity .MainActivity --utf8-manifest --dex out/apk_t/classes.dex
           out/apk_test out/apk_t/s1.apk out/apk_t/s2.apk
+          out/dex_gles_test out/dex_jni_demo.apk
           out/afw-asan out/libhello.so
           out/afw-asan out/libsyscall_test.so
           out/afw-asan out/libredzone_test.so
@@ -689,6 +692,22 @@ jobs:
           clang-cl /nologo /O2 /W3 /DAFW_TEST /D_CRT_SECURE_NO_WARNINGS /Fe:out\dtv_bridge_test.exe /Foout\dtvobj\ tools\dtv_bridge_test.c src\tls_static.c src\tls_layout.c src\tls_patch.c src\callback_bridge.c src\funcs.c src\platform.c
           if errorlevel 1 exit /b 1
           out\dtv_bridge_test.exe
+      - name: "APK/DEX/JNI/GLES Host Unit Tests on Windows (apk_test + dex_gles_test)"
+        shell: cmd
+        run: |
+          if not exist out\apkobj mkdir out\apkobj
+          clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Fe:out\apk_test.exe /Foout\apkobj\ tools\apk_test.c src\apk.c src\axml.c
+          if errorlevel 1 exit /b 1
+          if not exist out\apk_t mkdir out\apk_t
+          python -c "open('out/apk_t/hello.txt','wb').write(b'Hello from compressed APK asset!\n'); open('out/apk_t/large.txt','wb').write((''.join(f'AFW-DEFLATE-BLOCK-{i:04d}\n' for i in range(1740))[:40000]).encode()); open('out/apk_t/libdemo_native.so','wb').write(b'\x7fELFfake'); open('out/apk_t/classes.dex','wb').write(b'dex\n035\x00'+b'\x00'*104)"
+          python tools\make_apk.py -o out\apk_t\s1.apk --package com.afw.testapp --activity android.app.NativeActivity --native-lib demo_native --version-code 42 --version-name 2.5 --lib out\apk_t\libdemo_native.so --asset hello.txt=out\apk_t\hello.txt --asset large.txt=out\apk_t\large.txt
+          python tools\make_apk.py -o out\apk_t\s2.apk --package com.afw.dexapp --activity .MainActivity --utf8-manifest --dex out\apk_t\classes.dex
+          out\apk_test.exe out\apk_t\s1.apk out\apk_t\s2.apk
+          if errorlevel 1 exit /b 1
+          if not exist out\dgobj mkdir out\dgobj
+          clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Fe:out\dex_gles_test.exe /Foout\dgobj\ tools\dex_gles_test.c src\apk.c src\axml.c src\win_gui.c src\android_native.c src\gles_bridge.c src\dex_vm.c src\jni_bridge.c src\platform.c /link user32.lib gdi32.lib
+          if errorlevel 1 exit /b 1
+          out\dex_gles_test.exe out\dex_jni_demo.apk
       - name: "C++ exceptions: every landing pad found, nothing unproven (static)"
         shell: cmd
         run: out\afw-loader.exe out\libcxx_exception_test.so --patch-report --strict --min-landing-pads=1
@@ -829,6 +848,7 @@ jobs:
           copy tools\run-dex-apk.bat pkg\
           copy tools\run-fsbase-probe.bat pkg\
           copy out\fsbase_probe.exe pkg\
+          copy docs\APK-RUNNER.md pkg\
       - uses: actions/upload-artifact@v4
         with:
           name: afw-windows

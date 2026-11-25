@@ -41,22 +41,30 @@ typedef struct {
     int         verbose;
     afw_lib     libs[16];
     afw_lib     deps[16][32];
+    char        paths[16][1024];
     int         nlibs;
 } dex_lib_ctx;
 
+/* Loaded Android DSOs remain registered in elf_loader's global g_libs[] until
+ * process exit (same lifetime model as main.c), so keep their afw_lib structs
+ * and path strings in static storage rather than on the stack or freed heap. */
+static afw_lib     g_native_lib;
+static afw_lib     g_native_deps[32];
+static char        g_native_path[1024];
+static dex_lib_ctx g_dex_lctx;
+
 static int dex_load_library_cb(const char *libname, void *ud) {
     dex_lib_ctx *ctx = (dex_lib_ctx *)ud;
-    char path[1024];
     int ndeps = 0, slot;
     void *onload;
 
     if (!ctx || !libname || ctx->nlibs >= 16) return -1;
-    snprintf(path, sizeof path, "%s/lib%s.so", ctx->lib_dir, libname);
     slot = ctx->nlibs;
-    printf("[apk] System.loadLibrary(\"%s\") -> %s\n", libname, path);
+    snprintf(ctx->paths[slot], sizeof ctx->paths[slot], "%s/lib%s.so", ctx->lib_dir, libname);
+    printf("[apk] System.loadLibrary(\"%s\") -> %s\n", libname, ctx->paths[slot]);
     fflush(stdout);
-    if (afw_load_with_deps(path, &ctx->libs[slot], ctx->deps[slot], 32, &ndeps, ctx->verbose) != 0) {
-        fprintf(stderr, "[apk] error: failed to load native library %s\n", path);
+    if (afw_load_with_deps(ctx->paths[slot], &ctx->libs[slot], ctx->deps[slot], 32, &ndeps, ctx->verbose) != 0) {
+        fprintf(stderr, "[apk] error: failed to load native library %s\n", ctx->paths[slot]);
         return -1;
     }
     ctx->nlibs++;
@@ -72,9 +80,6 @@ static int dex_load_library_cb(const char *libname, void *ud) {
 
 static int run_native_activity(const afw_apk *apk, const char *lib_dir,
                                afw_gui_surface *surface, const afw_apk_run_opts *opts) {
-    char so_path[1024];
-    afw_lib lib;
-    afw_lib *deps;
     int ndeps = 0;
     typedef SYSV void (*on_create_fn)(void *activity, void *saved_state, size_t saved_sz);
     on_create_fn on_create;
@@ -83,22 +88,20 @@ static int run_native_activity(const afw_apk *apk, const char *lib_dir,
     void *win, *iq;
     int ticks = 0;
 
-    snprintf(so_path, sizeof so_path, "%s/lib%s.so", lib_dir, apk->manifest.native_lib_name);
-    printf("[apk] Mode: NativeActivity (lib=%s)\n", so_path);
+    snprintf(g_native_path, sizeof g_native_path, "%s/lib%s.so", lib_dir, apk->manifest.native_lib_name);
+    printf("[apk] Mode: NativeActivity (lib=%s)\n", g_native_path);
     fflush(stdout);
 
-    deps = (afw_lib *)calloc(32, sizeof *deps);
-    if (!deps) return 1;
-    if (afw_load_with_deps(so_path, &lib, deps, 32, &ndeps, opts->verbose) != 0) {
-        fprintf(stderr, "[apk] error: failed to load NativeActivity library %s\n", so_path);
-        free(deps);
+    memset(&g_native_lib, 0, sizeof g_native_lib);
+    memset(g_native_deps, 0, sizeof g_native_deps);
+    if (afw_load_with_deps(g_native_path, &g_native_lib, g_native_deps, 32, &ndeps, opts->verbose) != 0) {
+        fprintf(stderr, "[apk] error: failed to load NativeActivity library %s\n", g_native_path);
         return 1;
     }
 
-    on_create = (on_create_fn)afw_sym(&lib, "ANativeActivity_onCreate");
+    on_create = (on_create_fn)afw_sym(&g_native_lib, "ANativeActivity_onCreate");
     if (!on_create) {
-        fprintf(stderr, "[apk] error: %s does not export ANativeActivity_onCreate\n", so_path);
-        free(deps);
+        fprintf(stderr, "[apk] error: %s does not export ANativeActivity_onCreate\n", g_native_path);
         return 1;
     }
 
@@ -141,7 +144,6 @@ static int run_native_activity(const afw_apk *apk, const char *lib_dir,
 
     afw_gles_shutdown();
     afw_android_native_unbind();
-    free(deps);
     return (opts->max_frames > 0 && surface->frames_presented < (uint64_t)opts->max_frames) ? 1 : 0;
 }
 
@@ -149,7 +151,6 @@ static int run_dex_activity(const afw_apk *apk, const char *lib_dir,
                             afw_gui_surface *surface, const afw_apk_run_opts *opts) {
     unsigned char *dex_buf = NULL;
     size_t dex_sz = 0;
-    dex_lib_ctx *lctx;
     afw_dex_vm *vm;
     int rc;
 
@@ -160,19 +161,17 @@ static int run_dex_activity(const afw_apk *apk, const char *lib_dir,
         return 1;
     }
 
-    lctx = (dex_lib_ctx *)calloc(1, sizeof *lctx);
-    if (!lctx) { free(dex_buf); return 1; }
-    lctx->lib_dir = lib_dir;
-    lctx->verbose = opts->verbose;
+    memset(&g_dex_lctx, 0, sizeof g_dex_lctx);
+    g_dex_lctx.lib_dir = lib_dir;
+    g_dex_lctx.verbose = opts->verbose;
 
-    vm = afw_dex_vm_create(dex_buf, dex_sz, apk, surface, dex_load_library_cb, lctx);
+    vm = afw_dex_vm_create(dex_buf, dex_sz, apk, surface, dex_load_library_cb, &g_dex_lctx);
     free(dex_buf);
     if (!vm) {
         fprintf(stderr, "[apk] error: failed to parse classes.dex\n");
-        free(lctx);
         return 1;
     }
-    lctx->vm = vm;
+    g_dex_lctx.vm = vm;
 
     afw_android_native_bind(apk, surface, lib_dir,
                             afw_dex_vm_get_javavm(vm), afw_dex_vm_get_jnienv(vm));
@@ -181,7 +180,6 @@ static int run_dex_activity(const afw_apk *apk, const char *lib_dir,
 
     afw_android_native_unbind();
     afw_dex_vm_destroy(vm);
-    free(lctx);
     return rc == 0 ? 0 : 1;
 }
 

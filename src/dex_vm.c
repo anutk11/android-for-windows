@@ -467,6 +467,27 @@ static int try_builtin_method(afw_dex_vm *vm, const char *cd, const char *mn, co
             if (ret_out) *ret_out = ret;
             return 1;
         }
+        if (strcmp(mn, "trim") == 0) {
+            const char *s = afw_dex_get_string(vm, (uint32_t)args[0]);
+            if (!s) s = "";
+            while (*s && (unsigned char)*s <= ' ') s++;
+            {
+                size_t len = strlen(s);
+                while (len > 0 && (unsigned char)s[len - 1] <= ' ') len--;
+                char *cp = (char *)malloc(len + 1);
+                if (cp) { memcpy(cp, s, len); cp[len] = '\0'; }
+                ret = afw_dex_new_string(vm, cp ? cp : "");
+                free(cp);
+            }
+            if (ret_out) *ret_out = ret;
+            return 1;
+        }
+        if (strcmp(mn, "contains") == 0) {
+            const char *a = afw_dex_get_string(vm, (uint32_t)args[0]);
+            const char *b = afw_dex_get_string(vm, (uint32_t)args[1]);
+            if (ret_out) *ret_out = (a && b && strstr(a, b) != NULL) ? 1 : 0;
+            return 1;
+        }
         return 0;
     }
     if (strcmp(cd, "Ljava/lang/StringBuilder;") == 0) {
@@ -683,6 +704,8 @@ static int try_builtin_method(afw_dex_vm *vm, const char *cd, const char *mn, co
             if (vm->apk && rel) {
                 snprintf(full, sizeof full, "assets/%s", rel);
                 if (afw_apk_read_file(vm->apk, full, &abuf, &asz) == 0) {
+                    while (asz > 0 && (abuf[asz - 1] == '\n' || abuf[asz - 1] == '\r'))
+                        abuf[--asz] = '\0';
                     ret = afw_dex_new_string(vm, (const char *)abuf);
                     free(abuf);
                     if (ret_out) *ret_out = ret;

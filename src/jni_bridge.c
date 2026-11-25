@@ -130,6 +130,59 @@ static SYSV void *jni_GetStaticMethodID(void *env, void *cls, const char *name, 
     return jni_GetMethodID(env, cls, name, sig);
 }
 
+typedef struct {
+    uint32_t gp_offset;
+    uint32_t fp_offset;
+    void    *overflow_arg_area;
+    void    *reg_save_area;
+} afw_sysv_va_list_tag;
+
+/* Unpack x86-64 System V ABI va_list (struct __va_list_tag *) into Dalvik args */
+static int unpack_sysv_valist(const char *shorty, const afw_sysv_va_list_tag *va_in,
+                              uint64_t *out, int max_args) {
+    afw_sysv_va_list_tag ap;
+    int n = 0;
+    const char *p;
+    if (!shorty || !shorty[0] || !va_in) return 0;
+    ap = *va_in;
+    for (p = shorty + 1; *p && n < max_args; p++) {
+        if (*p == 'F' || *p == 'D') {
+            double d = 0.0;
+            if (ap.fp_offset <= 160 && ap.reg_save_area) {
+                memcpy(&d, (const unsigned char *)ap.reg_save_area + ap.fp_offset, 8);
+                ap.fp_offset += 16;
+            } else if (ap.overflow_arg_area) {
+                memcpy(&d, ap.overflow_arg_area, 8);
+                ap.overflow_arg_area = (unsigned char *)ap.overflow_arg_area + 8;
+            }
+            if (*p == 'F') {
+                float f = (float)d;
+                uint32_t b = 0;
+                memcpy(&b, &f, 4);
+                out[n++] = (uint64_t)b;
+            } else {
+                uint64_t b = 0;
+                memcpy(&b, &d, 8);
+                out[n++] = b;
+            }
+        } else {
+            uint64_t v = 0;
+            if (ap.gp_offset <= 40 && ap.reg_save_area) {
+                memcpy(&v, (const unsigned char *)ap.reg_save_area + ap.gp_offset, 8);
+                ap.gp_offset += 8;
+            } else if (ap.overflow_arg_area) {
+                memcpy(&v, ap.overflow_arg_area, 8);
+                ap.overflow_arg_area = (unsigned char *)ap.overflow_arg_area + 8;
+            }
+            if (*p == 'L' || *p == '[' || *p == 'J')
+                out[n++] = v;
+            else
+                out[n++] = (uint64_t)(uint32_t)v;
+        }
+    }
+    return n;
+}
+
 /* Unpack SysV variadic args arriving in (rcx, r8, r9, stack...) + (xmm0..xmm2) */
 static int unpack_sysv_args(const char *shorty, const uint64_t *iargs, int niargs,
                             const double *fargs, int nfargs, uint64_t *out, int max_args) {
@@ -179,10 +232,10 @@ static int unpack_jval_args(const char *shorty, const afw_jvalue *jv, uint64_t *
     return n;
 }
 
-static SYSV int32_t jni_CallIntMethod(void *env, void *obj, void *mid_p,
-                                      uint64_t a0, uint64_t a1, uint64_t a2,
-                                      double f0, double f1, double f2,
-                                      uint64_t a3, uint64_t a4) {
+static uint64_t call_inst_sysv(void *env, void *obj, void *mid_p,
+                               uint64_t a0, uint64_t a1, uint64_t a2,
+                               double f0, double f1, double f2,
+                               uint64_t a3, uint64_t a4) {
     afw_jni_state *st = from_env(env);
     int mid = (int)(uintptr_t)mid_p - 1;
     const char *shorty = afw_dex_method_shorty(st->vm, mid);
@@ -194,10 +247,23 @@ static SYSV int32_t jni_CallIntMethod(void *env, void *obj, void *mid_p,
     args[n++] = (uint64_t)(uintptr_t)obj;
     n += unpack_sysv_args(shorty, iargs, 5, fargs, 3, args + 1, 15);
     (void)afw_dex_invoke_method_id(st->vm, mid, args, n, &ret);
-    return (int32_t)ret;
+    return ret;
 }
 
-static SYSV int32_t jni_CallIntMethodA(void *env, void *obj, void *mid_p, const afw_jvalue *jv) {
+static uint64_t call_inst_v(void *env, void *obj, void *mid_p, const afw_sysv_va_list_tag *va) {
+    afw_jni_state *st = from_env(env);
+    int mid = (int)(uintptr_t)mid_p - 1;
+    const char *shorty = afw_dex_method_shorty(st->vm, mid);
+    uint64_t args[16];
+    int n = 0;
+    uint64_t ret = 0;
+    args[n++] = (uint64_t)(uintptr_t)obj;
+    n += unpack_sysv_valist(shorty, va, args + 1, 15);
+    (void)afw_dex_invoke_method_id(st->vm, mid, args, n, &ret);
+    return ret;
+}
+
+static uint64_t call_inst_a(void *env, void *obj, void *mid_p, const afw_jvalue *jv) {
     afw_jni_state *st = from_env(env);
     int mid = (int)(uintptr_t)mid_p - 1;
     const char *shorty = afw_dex_method_shorty(st->vm, mid);
@@ -207,101 +273,228 @@ static SYSV int32_t jni_CallIntMethodA(void *env, void *obj, void *mid_p, const 
     args[n++] = (uint64_t)(uintptr_t)obj;
     n += unpack_jval_args(shorty, jv, args + 1, 15);
     (void)afw_dex_invoke_method_id(st->vm, mid, args, n, &ret);
-    return (int32_t)ret;
+    return ret;
+}
+
+static uint64_t call_static_sysv(void *env, void *mid_p,
+                                 uint64_t a0, uint64_t a1, uint64_t a2,
+                                 double f0, double f1, double f2,
+                                 uint64_t a3, uint64_t a4) {
+    afw_jni_state *st = from_env(env);
+    int mid = (int)(uintptr_t)mid_p - 1;
+    const char *shorty = afw_dex_method_shorty(st->vm, mid);
+    uint64_t iargs[5] = { a0, a1, a2, a3, a4 };
+    double   fargs[3] = { f0, f1, f2 };
+    uint64_t args[16];
+    int n;
+    uint64_t ret = 0;
+    n = unpack_sysv_args(shorty, iargs, 5, fargs, 3, args, 16);
+    (void)afw_dex_invoke_method_id(st->vm, mid, args, n, &ret);
+    return ret;
+}
+
+static uint64_t call_static_v(void *env, void *mid_p, const afw_sysv_va_list_tag *va) {
+    afw_jni_state *st = from_env(env);
+    int mid = (int)(uintptr_t)mid_p - 1;
+    const char *shorty = afw_dex_method_shorty(st->vm, mid);
+    uint64_t args[16];
+    int n;
+    uint64_t ret = 0;
+    n = unpack_sysv_valist(shorty, va, args, 16);
+    (void)afw_dex_invoke_method_id(st->vm, mid, args, n, &ret);
+    return ret;
+}
+
+static uint64_t call_static_a(void *env, void *mid_p, const afw_jvalue *jv) {
+    afw_jni_state *st = from_env(env);
+    int mid = (int)(uintptr_t)mid_p - 1;
+    const char *shorty = afw_dex_method_shorty(st->vm, mid);
+    uint64_t args[16];
+    int n;
+    uint64_t ret = 0;
+    n = unpack_jval_args(shorty, jv, args, 16);
+    (void)afw_dex_invoke_method_id(st->vm, mid, args, n, &ret);
+    return ret;
+}
+
+static SYSV void *jni_NewObject(void *env, void *cls, void *mid_p,
+                                uint64_t a0, uint64_t a1, uint64_t a2,
+                                double f0, double f1, double f2,
+                                uint64_t a3, uint64_t a4) {
+    void *obj = jni_AllocObject(env, cls);
+    if (obj) (void)call_inst_sysv(env, obj, mid_p, a0, a1, a2, f0, f1, f2, a3, a4);
+    return obj;
+}
+static SYSV void *jni_NewObjectV(void *env, void *cls, void *mid_p, const afw_sysv_va_list_tag *va) {
+    void *obj = jni_AllocObject(env, cls);
+    if (obj) (void)call_inst_v(env, obj, mid_p, va);
+    return obj;
+}
+static SYSV void *jni_NewObjectA(void *env, void *cls, void *mid_p, const afw_jvalue *jv) {
+    void *obj = jni_AllocObject(env, cls);
+    if (obj) (void)call_inst_a(env, obj, mid_p, jv);
+    return obj;
 }
 
 static SYSV void *jni_CallObjectMethod(void *env, void *obj, void *mid_p,
                                        uint64_t a0, uint64_t a1, uint64_t a2,
                                        double f0, double f1, double f2,
                                        uint64_t a3, uint64_t a4) {
-    afw_jni_state *st = from_env(env);
-    int mid = (int)(uintptr_t)mid_p - 1;
-    const char *shorty = afw_dex_method_shorty(st->vm, mid);
-    uint64_t iargs[5] = { a0, a1, a2, a3, a4 };
-    double   fargs[3] = { f0, f1, f2 };
-    uint64_t args[16];
-    int n = 0;
-    uint64_t ret = 0;
-    args[n++] = (uint64_t)(uintptr_t)obj;
-    n += unpack_sysv_args(shorty, iargs, 5, fargs, 3, args + 1, 15);
-    (void)afw_dex_invoke_method_id(st->vm, mid, args, n, &ret);
-    return (void *)(uintptr_t)ret;
+    return (void *)(uintptr_t)call_inst_sysv(env, obj, mid_p, a0, a1, a2, f0, f1, f2, a3, a4);
+}
+static SYSV void *jni_CallObjectMethodV(void *env, void *obj, void *mid_p, const afw_sysv_va_list_tag *va) {
+    return (void *)(uintptr_t)call_inst_v(env, obj, mid_p, va);
+}
+static SYSV void *jni_CallObjectMethodA(void *env, void *obj, void *mid_p, const afw_jvalue *jv) {
+    return (void *)(uintptr_t)call_inst_a(env, obj, mid_p, jv);
 }
 
-static SYSV void *jni_CallObjectMethodA(void *env, void *obj, void *mid_p, const afw_jvalue *jv) {
-    afw_jni_state *st = from_env(env);
-    int mid = (int)(uintptr_t)mid_p - 1;
-    const char *shorty = afw_dex_method_shorty(st->vm, mid);
-    uint64_t args[16];
-    int n = 0;
-    uint64_t ret = 0;
-    args[n++] = (uint64_t)(uintptr_t)obj;
-    n += unpack_jval_args(shorty, jv, args + 1, 15);
-    (void)afw_dex_invoke_method_id(st->vm, mid, args, n, &ret);
-    return (void *)(uintptr_t)ret;
+static SYSV uint8_t jni_CallBooleanMethod(void *env, void *obj, void *mid_p,
+                                          uint64_t a0, uint64_t a1, uint64_t a2,
+                                          double f0, double f1, double f2,
+                                          uint64_t a3, uint64_t a4) {
+    return call_inst_sysv(env, obj, mid_p, a0, a1, a2, f0, f1, f2, a3, a4) ? 1 : 0;
+}
+static SYSV uint8_t jni_CallBooleanMethodV(void *env, void *obj, void *mid_p, const afw_sysv_va_list_tag *va) {
+    return call_inst_v(env, obj, mid_p, va) ? 1 : 0;
+}
+static SYSV uint8_t jni_CallBooleanMethodA(void *env, void *obj, void *mid_p, const afw_jvalue *jv) {
+    return call_inst_a(env, obj, mid_p, jv) ? 1 : 0;
+}
+
+static SYSV int32_t jni_CallIntMethod(void *env, void *obj, void *mid_p,
+                                      uint64_t a0, uint64_t a1, uint64_t a2,
+                                      double f0, double f1, double f2,
+                                      uint64_t a3, uint64_t a4) {
+    return (int32_t)call_inst_sysv(env, obj, mid_p, a0, a1, a2, f0, f1, f2, a3, a4);
+}
+static SYSV int32_t jni_CallIntMethodV(void *env, void *obj, void *mid_p, const afw_sysv_va_list_tag *va) {
+    return (int32_t)call_inst_v(env, obj, mid_p, va);
+}
+static SYSV int32_t jni_CallIntMethodA(void *env, void *obj, void *mid_p, const afw_jvalue *jv) {
+    return (int32_t)call_inst_a(env, obj, mid_p, jv);
+}
+
+static SYSV int64_t jni_CallLongMethod(void *env, void *obj, void *mid_p,
+                                       uint64_t a0, uint64_t a1, uint64_t a2,
+                                       double f0, double f1, double f2,
+                                       uint64_t a3, uint64_t a4) {
+    return (int64_t)call_inst_sysv(env, obj, mid_p, a0, a1, a2, f0, f1, f2, a3, a4);
+}
+static SYSV int64_t jni_CallLongMethodV(void *env, void *obj, void *mid_p, const afw_sysv_va_list_tag *va) {
+    return (int64_t)call_inst_v(env, obj, mid_p, va);
+}
+static SYSV int64_t jni_CallLongMethodA(void *env, void *obj, void *mid_p, const afw_jvalue *jv) {
+    return (int64_t)call_inst_a(env, obj, mid_p, jv);
+}
+
+static SYSV float jni_CallFloatMethod(void *env, void *obj, void *mid_p,
+                                      uint64_t a0, uint64_t a1, uint64_t a2,
+                                      double f0, double f1, double f2,
+                                      uint64_t a3, uint64_t a4) {
+    uint32_t b = (uint32_t)call_inst_sysv(env, obj, mid_p, a0, a1, a2, f0, f1, f2, a3, a4);
+    float f = 0.0f; memcpy(&f, &b, 4); return f;
+}
+static SYSV float jni_CallFloatMethodV(void *env, void *obj, void *mid_p, const afw_sysv_va_list_tag *va) {
+    uint32_t b = (uint32_t)call_inst_v(env, obj, mid_p, va);
+    float f = 0.0f; memcpy(&f, &b, 4); return f;
+}
+static SYSV float jni_CallFloatMethodA(void *env, void *obj, void *mid_p, const afw_jvalue *jv) {
+    uint32_t b = (uint32_t)call_inst_a(env, obj, mid_p, jv);
+    float f = 0.0f; memcpy(&f, &b, 4); return f;
+}
+
+static SYSV double jni_CallDoubleMethod(void *env, void *obj, void *mid_p,
+                                        uint64_t a0, uint64_t a1, uint64_t a2,
+                                        double f0, double f1, double f2,
+                                        uint64_t a3, uint64_t a4) {
+    uint64_t b = call_inst_sysv(env, obj, mid_p, a0, a1, a2, f0, f1, f2, a3, a4);
+    double d = 0.0; memcpy(&d, &b, 8); return d;
+}
+static SYSV double jni_CallDoubleMethodV(void *env, void *obj, void *mid_p, const afw_sysv_va_list_tag *va) {
+    uint64_t b = call_inst_v(env, obj, mid_p, va);
+    double d = 0.0; memcpy(&d, &b, 8); return d;
+}
+static SYSV double jni_CallDoubleMethodA(void *env, void *obj, void *mid_p, const afw_jvalue *jv) {
+    uint64_t b = call_inst_a(env, obj, mid_p, jv);
+    double d = 0.0; memcpy(&d, &b, 8); return d;
 }
 
 static SYSV void jni_CallVoidMethod(void *env, void *obj, void *mid_p,
                                     uint64_t a0, uint64_t a1, uint64_t a2,
                                     double f0, double f1, double f2,
                                     uint64_t a3, uint64_t a4) {
-    afw_jni_state *st = from_env(env);
-    int mid = (int)(uintptr_t)mid_p - 1;
-    const char *shorty = afw_dex_method_shorty(st->vm, mid);
-    uint64_t iargs[5] = { a0, a1, a2, a3, a4 };
-    double   fargs[3] = { f0, f1, f2 };
-    uint64_t args[16];
-    int n = 0;
-    args[n++] = (uint64_t)(uintptr_t)obj;
-    n += unpack_sysv_args(shorty, iargs, 5, fargs, 3, args + 1, 15);
-    (void)afw_dex_invoke_method_id(st->vm, mid, args, n, NULL);
+    (void)call_inst_sysv(env, obj, mid_p, a0, a1, a2, f0, f1, f2, a3, a4);
 }
-
+static SYSV void jni_CallVoidMethodV(void *env, void *obj, void *mid_p, const afw_sysv_va_list_tag *va) {
+    (void)call_inst_v(env, obj, mid_p, va);
+}
 static SYSV void jni_CallVoidMethodA(void *env, void *obj, void *mid_p, const afw_jvalue *jv) {
-    afw_jni_state *st = from_env(env);
-    int mid = (int)(uintptr_t)mid_p - 1;
-    const char *shorty = afw_dex_method_shorty(st->vm, mid);
-    uint64_t args[16];
-    int n = 0;
-    args[n++] = (uint64_t)(uintptr_t)obj;
-    n += unpack_jval_args(shorty, jv, args + 1, 15);
-    (void)afw_dex_invoke_method_id(st->vm, mid, args, n, NULL);
-}
-
-static SYSV int32_t jni_CallStaticIntMethod(void *env, void *cls, void *mid_p,
-                                            uint64_t a0, uint64_t a1, uint64_t a2,
-                                            double f0, double f1, double f2,
-                                            uint64_t a3, uint64_t a4) {
-    afw_jni_state *st = from_env(env);
-    int mid = (int)(uintptr_t)mid_p - 1;
-    const char *shorty = afw_dex_method_shorty(st->vm, mid);
-    uint64_t iargs[5] = { a0, a1, a2, a3, a4 };
-    double   fargs[3] = { f0, f1, f2 };
-    uint64_t args[16];
-    int n;
-    uint64_t ret = 0;
-    (void)cls;
-    n = unpack_sysv_args(shorty, iargs, 5, fargs, 3, args, 16);
-    (void)afw_dex_invoke_method_id(st->vm, mid, args, n, &ret);
-    return (int32_t)ret;
+    (void)call_inst_a(env, obj, mid_p, jv);
 }
 
 static SYSV void *jni_CallStaticObjectMethod(void *env, void *cls, void *mid_p,
                                              uint64_t a0, uint64_t a1, uint64_t a2,
                                              double f0, double f1, double f2,
                                              uint64_t a3, uint64_t a4) {
-    afw_jni_state *st = from_env(env);
-    int mid = (int)(uintptr_t)mid_p - 1;
-    const char *shorty = afw_dex_method_shorty(st->vm, mid);
-    uint64_t iargs[5] = { a0, a1, a2, a3, a4 };
-    double   fargs[3] = { f0, f1, f2 };
-    uint64_t args[16];
-    int n;
-    uint64_t ret = 0;
     (void)cls;
-    n = unpack_sysv_args(shorty, iargs, 5, fargs, 3, args, 16);
-    (void)afw_dex_invoke_method_id(st->vm, mid, args, n, &ret);
-    return (void *)(uintptr_t)ret;
+    return (void *)(uintptr_t)call_static_sysv(env, mid_p, a0, a1, a2, f0, f1, f2, a3, a4);
+}
+static SYSV void *jni_CallStaticObjectMethodV(void *env, void *cls, void *mid_p, const afw_sysv_va_list_tag *va) {
+    (void)cls;
+    return (void *)(uintptr_t)call_static_v(env, mid_p, va);
+}
+static SYSV void *jni_CallStaticObjectMethodA(void *env, void *cls, void *mid_p, const afw_jvalue *jv) {
+    (void)cls;
+    return (void *)(uintptr_t)call_static_a(env, mid_p, jv);
+}
+
+static SYSV int32_t jni_CallStaticIntMethod(void *env, void *cls, void *mid_p,
+                                            uint64_t a0, uint64_t a1, uint64_t a2,
+                                            double f0, double f1, double f2,
+                                            uint64_t a3, uint64_t a4) {
+    (void)cls;
+    return (int32_t)call_static_sysv(env, mid_p, a0, a1, a2, f0, f1, f2, a3, a4);
+}
+static SYSV int32_t jni_CallStaticIntMethodV(void *env, void *cls, void *mid_p, const afw_sysv_va_list_tag *va) {
+    (void)cls;
+    return (int32_t)call_static_v(env, mid_p, va);
+}
+static SYSV int32_t jni_CallStaticIntMethodA(void *env, void *cls, void *mid_p, const afw_jvalue *jv) {
+    (void)cls;
+    return (int32_t)call_static_a(env, mid_p, jv);
+}
+
+static SYSV int64_t jni_CallStaticLongMethod(void *env, void *cls, void *mid_p,
+                                             uint64_t a0, uint64_t a1, uint64_t a2,
+                                             double f0, double f1, double f2,
+                                             uint64_t a3, uint64_t a4) {
+    (void)cls;
+    return (int64_t)call_static_sysv(env, mid_p, a0, a1, a2, f0, f1, f2, a3, a4);
+}
+static SYSV int64_t jni_CallStaticLongMethodV(void *env, void *cls, void *mid_p, const afw_sysv_va_list_tag *va) {
+    (void)cls;
+    return (int64_t)call_static_v(env, mid_p, va);
+}
+static SYSV int64_t jni_CallStaticLongMethodA(void *env, void *cls, void *mid_p, const afw_jvalue *jv) {
+    (void)cls;
+    return (int64_t)call_static_a(env, mid_p, jv);
+}
+
+static SYSV void jni_CallStaticVoidMethod(void *env, void *cls, void *mid_p,
+                                          uint64_t a0, uint64_t a1, uint64_t a2,
+                                          double f0, double f1, double f2,
+                                          uint64_t a3, uint64_t a4) {
+    (void)cls;
+    (void)call_static_sysv(env, mid_p, a0, a1, a2, f0, f1, f2, a3, a4);
+}
+static SYSV void jni_CallStaticVoidMethodV(void *env, void *cls, void *mid_p, const afw_sysv_va_list_tag *va) {
+    (void)cls;
+    (void)call_static_v(env, mid_p, va);
+}
+static SYSV void jni_CallStaticVoidMethodA(void *env, void *cls, void *mid_p, const afw_jvalue *jv) {
+    (void)cls;
+    (void)call_static_a(env, mid_p, jv);
 }
 
 static SYSV void *jni_GetFieldID(void *env, void *cls, const char *name, const char *sig) {
@@ -430,13 +623,31 @@ static void init_jni_vtable(void) {
     g_jni_vtable[22]  = (const void *)jni_DeleteGlobalRef;
     g_jni_vtable[23]  = (const void *)jni_DeleteLocalRef;
     g_jni_vtable[27]  = (const void *)jni_AllocObject;
+    g_jni_vtable[28]  = (const void *)jni_NewObject;
+    g_jni_vtable[29]  = (const void *)jni_NewObjectV;
+    g_jni_vtable[30]  = (const void *)jni_NewObjectA;
     g_jni_vtable[31]  = (const void *)jni_GetObjectClass;
     g_jni_vtable[33]  = (const void *)jni_GetMethodID;
     g_jni_vtable[34]  = (const void *)jni_CallObjectMethod;
+    g_jni_vtable[35]  = (const void *)jni_CallObjectMethodV;
     g_jni_vtable[36]  = (const void *)jni_CallObjectMethodA;
+    g_jni_vtable[37]  = (const void *)jni_CallBooleanMethod;
+    g_jni_vtable[38]  = (const void *)jni_CallBooleanMethodV;
+    g_jni_vtable[39]  = (const void *)jni_CallBooleanMethodA;
     g_jni_vtable[49]  = (const void *)jni_CallIntMethod;
+    g_jni_vtable[50]  = (const void *)jni_CallIntMethodV;
     g_jni_vtable[51]  = (const void *)jni_CallIntMethodA;
+    g_jni_vtable[52]  = (const void *)jni_CallLongMethod;
+    g_jni_vtable[53]  = (const void *)jni_CallLongMethodV;
+    g_jni_vtable[54]  = (const void *)jni_CallLongMethodA;
+    g_jni_vtable[55]  = (const void *)jni_CallFloatMethod;
+    g_jni_vtable[56]  = (const void *)jni_CallFloatMethodV;
+    g_jni_vtable[57]  = (const void *)jni_CallFloatMethodA;
+    g_jni_vtable[58]  = (const void *)jni_CallDoubleMethod;
+    g_jni_vtable[59]  = (const void *)jni_CallDoubleMethodV;
+    g_jni_vtable[60]  = (const void *)jni_CallDoubleMethodA;
     g_jni_vtable[61]  = (const void *)jni_CallVoidMethod;
+    g_jni_vtable[62]  = (const void *)jni_CallVoidMethodV;
     g_jni_vtable[63]  = (const void *)jni_CallVoidMethodA;
     g_jni_vtable[94]  = (const void *)jni_GetFieldID;
     g_jni_vtable[95]  = (const void *)jni_GetObjectField;
@@ -445,7 +656,17 @@ static void init_jni_vtable(void) {
     g_jni_vtable[109] = (const void *)jni_SetIntField;
     g_jni_vtable[113] = (const void *)jni_GetStaticMethodID;
     g_jni_vtable[114] = (const void *)jni_CallStaticObjectMethod;
+    g_jni_vtable[115] = (const void *)jni_CallStaticObjectMethodV;
+    g_jni_vtable[116] = (const void *)jni_CallStaticObjectMethodA;
     g_jni_vtable[129] = (const void *)jni_CallStaticIntMethod;
+    g_jni_vtable[130] = (const void *)jni_CallStaticIntMethodV;
+    g_jni_vtable[131] = (const void *)jni_CallStaticIntMethodA;
+    g_jni_vtable[132] = (const void *)jni_CallStaticLongMethod;
+    g_jni_vtable[133] = (const void *)jni_CallStaticLongMethodV;
+    g_jni_vtable[134] = (const void *)jni_CallStaticLongMethodA;
+    g_jni_vtable[141] = (const void *)jni_CallStaticVoidMethod;
+    g_jni_vtable[142] = (const void *)jni_CallStaticVoidMethodV;
+    g_jni_vtable[143] = (const void *)jni_CallStaticVoidMethodA;
     g_jni_vtable[167] = (const void *)jni_NewStringUTF;
     g_jni_vtable[168] = (const void *)jni_GetStringUTFLength;
     g_jni_vtable[169] = (const void *)jni_GetStringUTFChars;
