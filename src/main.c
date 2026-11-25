@@ -713,6 +713,51 @@ static int run_ie_tests(const afw_lib *lib) {
     return g_failed ? 1 : 0;
 }
 
+typedef int (SYSV *art_gs_worker_fn)(uint64_t);
+static art_gs_worker_fn g_art_gs_fn;
+#if defined(_WIN32)
+static DWORD WINAPI art_gs_thread(LPVOID p) {
+    int *out = (int *)p;
+    if (afw_tls_thread_init() != 0) { *out = -1; return 0; }
+    *out = g_art_gs_fn(0xCAFEBABE00000042ULL);
+    return 0;
+}
+#endif
+
+static int run_art_gs_tests(const afw_lib *lib) {
+    static const char *names[10] = {
+        "SYS_arch_prctl ARCH_SET_GS / ARCH_GET_GS",
+        "movq read (gs:0x0, gs:0xe0) & write (gs:0xb0)",
+        "movl read & write (gs:0x28)",
+        "movw write & movzwl read (gs:0x8)",
+        "cmpl directly on gs:0x28 (EFLAGS preserved)",
+        "cmpq directly on gs:0xe0 (EFLAGS preserved)",
+        "testl directly on gs:0x28 (EFLAGS preserved)",
+        "pushq gs:0xe0 (zero stack clobber)",
+        "call *gs:0x228 (all regs & return PC preserved)",
+        "gs:[reg] register-based read"
+    };
+    int bits, k;
+    g_art_gs_fn = (art_gs_worker_fn)afw_sym(lib, "afw_art_gs_worker");
+    printf("\n=== G3 ART %%gs: emulation tests (--art-gs, %d/%d trampolined) ===\n",
+           lib->patch.gs_trampolined, lib->patch.gs_feasible);
+    check("all gs: sites were trampolined with 0 unsupported",
+          lib->patch.gs_feasible >= 12 && lib->patch.gs_trampolined == lib->patch.gs_feasible &&
+          lib->patch.gs_unsupported == 0);
+    bits = g_art_gs_fn ? g_art_gs_fn(0x1122334455667788ULL) : 0;
+    for (k = 0; k < 10; k++) check(names[k], (bits >> k) & 1);
+#if defined(_WIN32)
+    {
+        int t_bits = 0;
+        HANDLE t = CreateThread(NULL, 0, art_gs_thread, &t_bits, 0, NULL);
+        if (t) { WaitForSingleObject(t, INFINITE); CloseHandle(t); }
+        check("second thread runs all 10 gs: checks with independent ARCH_SET_GS base", t_bits == 0x3FF);
+    }
+#endif
+    printf("%s\n", g_failed ? "G3 ART GS TESTS FAILED" : "G3 ART GS TESTS PASSED");
+    return g_failed ? 1 : 0;
+}
+
 static int run_redzone_tests(const afw_lib *lib) {
     getpid_fn safe = (getpid_fn)afw_sym(lib, "afw_rz_safe");
     printf("\n=== G1 negative test: red zone ===\n");
@@ -823,6 +868,7 @@ int main(int argc, char **argv) {
             if (strcmp(argv[a], "--strict") == 0) strict = 1;
             else if (strcmp(argv[a], "--allow-unproven") == 0) afw_load_allow_unproven = 1;
             else if (strcmp(argv[a], "--attest-dump") == 0) afw_attest_dump = 1;
+            else if (strcmp(argv[a], "--art-gs") == 0) afw_load_enable_art_gs = 1;
 #ifdef AFW_TEST
             else if (strncmp(argv[a], "--attest-tamper=", 16) == 0) afw_attest_set_tamper(argv[a] + 16);
             else if (strncmp(argv[a], "--attest-add=", 13) == 0) {
@@ -859,6 +905,7 @@ int main(int argc, char **argv) {
     }
     if (afw_check_security() != 0) return 1;
     if (afw_tls_init() != 0) return 1;
+    afw_syscall_set_gs_ops(afw_tls_set_art_gs, afw_tls_get_art_gs);
 
     /* test: a library that must FAIL to load leaves nothing behind - not in
      * the library list, and its TLS module does not block the next library */
@@ -1048,8 +1095,9 @@ int main(int argc, char **argv) {
     printf("  syscall sites patched: %d + %d moved (refused: %d branch, %d red zone, %d unknown)\n",
            lib.patch.sys_patched, lib.patch.sys_patched_moved, lib.patch.sys_refused_branch,
            lib.patch.sys_refused_redzone, lib.patch.sys_refused_unknown);
-    printf("  fs: accesses patched:  %d (fs:[reg]: %d real, %d data)\n", lib.patch.fs_patched,
-           lib.patch.fs_reg_in_func, lib.patch.fs_reg_outside);
+    printf("  fs: accesses patched:  %d (fs:[reg]: %d real, %d data); gs: %d/%d trampolined (unsupported %d)\n",
+           lib.patch.fs_patched, lib.patch.fs_reg_in_func, lib.patch.fs_reg_outside,
+           lib.patch.gs_trampolined, lib.patch.gs_feasible, lib.patch.gs_unsupported);
 
     printf("  C++ landing pads followed: %d (exception tables not decodable: %d)\n",
            lib.patch.landing_pads, lib.patch.lsda_failures);
@@ -1070,11 +1118,12 @@ int main(int argc, char **argv) {
     }
     if (afw_load_patch_only && !afw_gate_ok(&lib))
             printf("GATE reasons: unproven %d, lsda failures %d, syscall untouched %d, syscall outside %d, "
-                   "fs unsupported %d, fs outside %d, gs unsupported %d, gs outside %d, fs:[reg] %d/%d\n",
+                   "fs unsupported %d, fs outside %d, gs unsupported %d, gs outside %d, fs:[reg] %d/%d, gs: %d/%d\n",
                    lib.patch.unproven, lib.patch.lsda_failures, lib.patch.sys_untouched,
                    lib.patch.sys_outside_functions, lib.patch.fs_unsupported, lib.patch.fs_outside_functions,
                    lib.patch.gs_unsupported, lib.patch.gs_outside_functions,
-                   lib.patch.fs_reg_trampolined, lib.patch.fs_reg_feasible);
+                   lib.patch.fs_reg_trampolined, lib.patch.fs_reg_feasible,
+                   lib.patch.gs_trampolined, lib.patch.gs_feasible);
     if (afw_load_patch_only && strict) {
         int bad = lib.patch.unproven || lib.patch.lsda_failures ||
                   lib.patch.landing_pads < min_pads;
@@ -1087,11 +1136,11 @@ int main(int argc, char **argv) {
         int total = lib.patch.sys_patched + lib.patch.sys_patched_moved + lib.patch.sys_refused_branch +
                     lib.patch.sys_refused_redzone + lib.patch.sys_refused_unknown;
         printf("\nPATCH REPORT %s: %d syscall sites: %d patched (A), %d patched (B), refused %d "
-               "(branch %d, red zone %d, unknown %d); fs:[disp32] %d reachable, %d patched\n",
+               "(branch %d, red zone %d, unknown %d); fs:[disp32] %d reachable, %d patched; gs: %d feasible, %d unsupported\n",
                lib.soname ? lib.soname : argv[1], total, lib.patch.sys_patched, lib.patch.sys_patched_moved,
                total - lib.patch.sys_patched - lib.patch.sys_patched_moved, lib.patch.sys_refused_branch,
                lib.patch.sys_refused_redzone, lib.patch.sys_refused_unknown, lib.patch.fs_disp_seen,
-               lib.patch.fs_patched);
+               lib.patch.fs_patched, lib.patch.gs_feasible, lib.patch.gs_unsupported);
         {
             int q;
             printf("fs:[disp32] by kind (offset, instruction, access, count):\n");
@@ -1108,6 +1157,7 @@ int main(int argc, char **argv) {
     if (afw_sym(&lib, "afw_rz_safe")) rc |= run_redzone_tests(&lib);
     if (afw_sym(&lib, "afw_tls_worker")) rc |= run_tls_tests(&lib);
     if (afw_sym(&lib, "afw_ie_read_b")) rc |= run_ie_tests(&lib);
+    if (afw_sym(&lib, "afw_art_gs_worker")) rc |= run_art_gs_tests(&lib);
     if (afw_sym(&lib, "afw_deps_check")) {
         typedef int (SYSV *dfn)(void);
         printf("\nDependency test (--with-deps):\n");

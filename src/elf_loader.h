@@ -92,6 +92,7 @@ extern int afw_load_patch_only;
  * flag overrides that, for diagnosis only. */
 extern int afw_load_allow_unproven;
 extern int afw_attest_dump;   /* print ATTEST-DETAIL evidence while loading */
+extern int afw_load_enable_art_gs; /* rewrite ART %gs: accesses via Windows TEB slots (Gate G3) */
 /* How many libraries are registered (tests: a failed load must not count). */
 int afw_loaded_count(void);
 /* How many failed libraries are quarantined (past point of no return: TLS

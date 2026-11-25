@@ -32,6 +32,7 @@ uintptr_t *afw_tls_block(void) { return t_block; }
 #define TEB_TLS_SLOTS 0x1480
 
 static DWORD g_slot[BIONIC_TLS_SLOTS];
+static DWORD g_art_gs_slots[3]; /* 0: art %gs base, 1: scratch1, 2: scratch2 */
 static volatile LONG g_patches;
 static int g_ready;
 
@@ -40,6 +41,16 @@ long afw_tls_patch_count(void) { return g_patches; }
 int afw_tls_teb_offset(int slot) {
     if (!g_ready || slot < 0 || slot >= BIONIC_TLS_SLOTS) return -1;
     return TEB_TLS_SLOTS + 8 * (int)g_slot[slot];
+}
+
+int afw_tls_art_gs_base_off(void)     { return g_ready ? TEB_TLS_SLOTS + 8 * (int)g_art_gs_slots[0] : -1; }
+int afw_tls_art_gs_scratch1_off(void) { return g_ready ? TEB_TLS_SLOTS + 8 * (int)g_art_gs_slots[1] : -1; }
+int afw_tls_art_gs_scratch2_off(void) { return g_ready ? TEB_TLS_SLOTS + 8 * (int)g_art_gs_slots[2] : -1; }
+void afw_tls_set_art_gs(uintptr_t addr) {
+    if (g_ready) TlsSetValue(g_art_gs_slots[0], (void *)addr);
+}
+uintptr_t afw_tls_get_art_gs(void) {
+    return g_ready ? (uintptr_t)TlsGetValue(g_art_gs_slots[0]) : 0;
 }
 
 /* Find the fs: prefix and disp32 of an "fs:[disp32]" instruction. */
@@ -147,6 +158,18 @@ int afw_tls_init(void) {
             }
             g_slot[i] = idx; nslots = i + 1;
         }
+        {
+            static int ngs;
+            for (i = ngs; i < 3; i++) {
+                DWORD idx = TlsAlloc();
+                if (idx == TLS_OUT_OF_INDEXES || idx >= 64) {
+                    if (idx != TLS_OUT_OF_INDEXES) TlsFree(idx);
+                    fprintf(stderr, "[tls] not enough Windows TLS slots for ART gs:\n");
+                    return -1;
+                }
+                g_art_gs_slots[i] = idx; ngs = i + 1;
+            }
+        }
         if (g_fls == FLS_OUT_OF_INDEXES) g_fls = FlsAlloc(fls_release);
         if (g_fls == FLS_OUT_OF_INDEXES) { fprintf(stderr, "[tls] no FLS index\n"); return -1; }
         if (!g_veh) g_veh = AddVectoredExceptionHandler(1, fs_handler);
@@ -220,6 +243,12 @@ static uintptr_t thread_id(void) { return (uintptr_t)GetCurrentThreadId(); }
 /* Linux: fs: already works natively; nothing to patch. */
 long afw_tls_patch_count(void) { return 0; }
 int afw_tls_teb_offset(int slot) { (void)slot; return -1; }
+static _Thread_local uintptr_t t_art_gs;
+int afw_tls_art_gs_base_off(void)     { return -1; }
+int afw_tls_art_gs_scratch1_off(void) { return -1; }
+int afw_tls_art_gs_scratch2_off(void) { return -1; }
+void afw_tls_set_art_gs(uintptr_t addr) { t_art_gs = addr; }
+uintptr_t afw_tls_get_art_gs(void)      { return t_art_gs; }
 #include <pthread.h>
 /* Same rule as FLS on Windows: the key frees a thread's block at exit. */
 static pthread_key_t g_key;

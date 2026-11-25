@@ -1375,7 +1375,7 @@ static int has_gs_operand(const ZydisDecodedInstruction *ins, const ZydisDecoded
 }
 
 /* Which original instruction a trampoline stands for (crash reports). */
-#define AFW_MAX_STUB_NOTES 4096
+#define AFW_MAX_STUB_NOTES 8192
 static struct { const unsigned char *lo, *hi, *site; } g_notes[AFW_MAX_STUB_NOTES];
 static int g_nnotes;
 static void afw_stub_note(const unsigned char *stub, size_t len, const unsigned char *site) {
@@ -1392,7 +1392,7 @@ const void *afw_stub_origin(const void *pc) {
 }
 
 /* An instruction that may be copied into a trampoline: no branch, no r11,
- * no fs:, no syscall. rip-relative memory operands are allowed (disp32 is
+ * no fs:/gs:, no syscall. rip-relative memory operands are allowed (disp32 is
  * re-based by copy_insn). */
 static int tramp_movable(ZydisDecoder *dec, const unsigned char *q, const unsigned char *end, int *len) {
     ZydisDecodedInstruction n;
@@ -1400,7 +1400,8 @@ static int tramp_movable(ZydisDecoder *dec, const unsigned char *q, const unsign
     int k;
     if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, q, (ZyanUSize)(end - q), &n, nops))) return 0;
     *len = n.length;
-    if (transfers_control(&n) || uses_r11(&n, nops) || has_fs_operand(&n, nops) || n.mnemonic == ZYDIS_MNEMONIC_SYSCALL)
+    if (transfers_control(&n) || uses_r11(&n, nops) || has_fs_operand(&n, nops) || has_gs_operand(&n, nops) ||
+        n.mnemonic == ZYDIS_MNEMONIC_SYSCALL)
         return 0;
     if (n.attributes & ZYDIS_ATTRIB_IS_RELATIVE) {
         for (k = 0; k < n.operand_count; k++)
@@ -1552,6 +1553,302 @@ static int fs_reg_stub(ZydisDecoder *dec, const fsite *f, int32_t teb, unsigned 
     return o;
 }
 
+/* ---- ART %gs: trampoline rewriter (Gate G3) ---------------------------- */
+static ZydisRegister pick_gs_scratch(const ZydisDecodedInstruction *ins, const ZydisDecodedOperand *ops) {
+    static const ZydisRegister cands[] = {
+        ZYDIS_REGISTER_R11, ZYDIS_REGISTER_R10, ZYDIS_REGISTER_RAX,
+        ZYDIS_REGISTER_RCX, ZYDIS_REGISTER_RDX, ZYDIS_REGISTER_R8, ZYDIS_REGISTER_R9
+    };
+    uint16_t used = 0;
+    int k, b;
+    for (k = 0; k < ins->operand_count; k++) {
+        if (ops[k].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            b = gpr_bit(ops[k].reg.value);
+            if (b >= 0) used |= (uint16_t)(1u << b);
+        } else if (ops[k].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            b = gpr_bit(ops[k].mem.base);
+            if (b >= 0) used |= (uint16_t)(1u << b);
+            b = gpr_bit(ops[k].mem.index);
+            if (b >= 0) used |= (uint16_t)(1u << b);
+        }
+    }
+    for (k = 0; k < (int)(sizeof cands / sizeof cands[0]); k++) {
+        b = gpr_bit(cands[k]);
+        if (b >= 0 && !(used & (uint16_t)(1u << b))) return cands[k];
+    }
+    return ZYDIS_REGISTER_NONE;
+}
+
+static int enc_mov_reg_gs(ZydisRegister reg, int32_t teb_off, unsigned char *out, size_t room) {
+    ZydisEncoderRequest req;
+    ZyanUSize len = room;
+    memset(&req, 0, sizeof req);
+    req.mnemonic = ZYDIS_MNEMONIC_MOV;
+    req.machine_mode = ZYDIS_MACHINE_MODE_LONG_64;
+    req.prefixes = ZYDIS_ATTRIB_HAS_SEGMENT_GS;
+    req.operand_count = 2;
+    req.operands[0].type = ZYDIS_OPERAND_TYPE_REGISTER;
+    req.operands[0].reg.value = reg;
+    req.operands[1].type = ZYDIS_OPERAND_TYPE_MEMORY;
+    req.operands[1].mem.base = ZYDIS_REGISTER_NONE;
+    req.operands[1].mem.index = ZYDIS_REGISTER_NONE;
+    req.operands[1].mem.displacement = teb_off;
+    req.operands[1].mem.size = 8;
+    if (!ZYAN_SUCCESS(ZydisEncoderEncodeInstruction(&req, out, &len))) return -1;
+    return (int)len;
+}
+
+static int enc_mov_gs_reg(int32_t teb_off, ZydisRegister reg, unsigned char *out, size_t room) {
+    ZydisEncoderRequest req;
+    ZyanUSize len = room;
+    memset(&req, 0, sizeof req);
+    req.mnemonic = ZYDIS_MNEMONIC_MOV;
+    req.machine_mode = ZYDIS_MACHINE_MODE_LONG_64;
+    req.prefixes = ZYDIS_ATTRIB_HAS_SEGMENT_GS;
+    req.operand_count = 2;
+    req.operands[0].type = ZYDIS_OPERAND_TYPE_MEMORY;
+    req.operands[0].mem.base = ZYDIS_REGISTER_NONE;
+    req.operands[0].mem.index = ZYDIS_REGISTER_NONE;
+    req.operands[0].mem.displacement = teb_off;
+    req.operands[0].mem.size = 8;
+    req.operands[1].type = ZYDIS_OPERAND_TYPE_REGISTER;
+    req.operands[1].reg.value = reg;
+    if (!ZYAN_SUCCESS(ZydisEncoderEncodeInstruction(&req, out, &len))) return -1;
+    return (int)len;
+}
+
+static int gs_site(ZydisDecoder *dec, unsigned char *p, unsigned char *fstart, unsigned char *end,
+                   unsigned char *const prev[3], const ZydisDecodedInstruction *ins,
+                   const ZydisDecodedOperand *ops, int pred_first, fsite *f, const char **why) {
+    int k, total = ins->length, cnt = 0, len;
+    unsigned char *q = p + ins->length, *start = p;
+    int is_call_jmp;
+
+    for (k = 0; k < ins->operand_count_visible; k++)
+        if (ops[k].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[k].mem.segment == ZYDIS_REGISTER_GS) break;
+    if (k == ins->operand_count_visible) { *why = "no gs: memory operand"; return 0; }
+    if (ins->address_width != 64) { *why = "32-bit address size"; return 0; }
+    if (ins->mnemonic == ZYDIS_MNEMONIC_LEA) { *why = "lea ignores gs:"; return 0; }
+    if (ins->attributes & ZYDIS_ATTRIB_IS_RELATIVE) { *why = "rip-relative gs: instruction"; return 0; }
+
+    is_call_jmp = (ins->mnemonic == ZYDIS_MNEMONIC_CALL || ins->mnemonic == ZYDIS_MNEMONIC_JMP);
+    if (transfers_control(ins)) {
+        if (!is_call_jmp) { *why = "unsupported control transfer with gs:"; return 0; }
+        if (ops[k].size != 64 || ops[k].mem.base != ZYDIS_REGISTER_NONE || ops[k].mem.index != ZYDIS_REGISTER_NONE) {
+            *why = "call/jmp through gs: must be 64-bit disp-only";
+            return 0;
+        }
+        if (ins->length < 5) { *why = "call/jmp gs: shorter than 5 bytes"; return 0; }
+        f->start = p; f->pre_len = 0; f->ins_len = ins->length; f->total = ins->length; f->ends_ret = 1;
+        return 1;
+    }
+
+    if (ops[k].mem.index != ZYDIS_REGISTER_NONE) {
+        *why = "gs:[base+index]: unsupported index form";
+        return 0;
+    }
+    if (ops[k].mem.base != ZYDIS_REGISTER_NONE &&
+        (ops[k].mem.base == ZYDIS_REGISTER_RIP ||
+         ZydisRegisterGetWidth(ZYDIS_MACHINE_MODE_LONG_64, ops[k].mem.base) != 64)) {
+        *why = "gs: base register is not a 64-bit GPR";
+        return 0;
+    }
+    if (pick_gs_scratch(ins, ops) == ZYDIS_REGISTER_NONE) {
+        *why = "no free scratch register for gs: trampoline";
+        return 0;
+    }
+
+    f->ends_ret = 0;
+    {
+        int pass;
+        for (pass = 0; pass < 2; pass++) {
+            if ((pass == 0) == !pred_first) {
+                while (total < 5 && cnt < 3 && q < end && !f->ends_ret) {
+                    if (*q == 0xC3) { total += 1; f->ends_ret = 1; break; }
+                    if (!tramp_movable(dec, q, end, &len)) break;
+                    total += len; q += len; cnt++;
+                }
+            } else {
+                for (k = 0; total < 5 && k < 3 && prev[k] && prev[k] >= fstart; k++) {
+                    if (prev[k] >= start) continue;
+                    if (!tramp_movable(dec, prev[k], start, &len) || prev[k] + len != start) break;
+                    total += len; start = prev[k];
+                }
+            }
+        }
+    }
+    if (total < 5) { *why = "fewer than 5 movable bytes around gs: site"; return 0; }
+    f->start = start; f->pre_len = (int)(p - start); f->ins_len = ins->length; f->total = total;
+    return 1;
+}
+
+/* Build zero-stack, zero-EFLAGS trampoline for one ART %gs: instruction.
+ * Uses Windows TEB slots teb_base (ART gs base), teb_s1, teb_s2 (scratch).
+ * When dry_run != 0 (Linux measurement), validates encoding/roundtrip without
+ * requiring rel32 proximity between stack buffer and code segment. */
+static int gs_stub(ZydisDecoder *dec, const fsite *f,
+                   int32_t teb_base, int32_t teb_s1, int32_t teb_s2,
+                   unsigned char *stub, size_t room, int dry_run) {
+    ZydisDecodedInstruction ins;
+    ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+    const unsigned char *core = f->start + f->pre_len, *q;
+    int k, m, o = 0, el;
+    int64_t rel;
+
+    if (room < 160) return -1;
+    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, core, (ZyanUSize)f->ins_len, &ins, ops))) return -1;
+    for (m = 0; m < ins.operand_count_visible; m++)
+        if (ops[m].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[m].mem.segment == ZYDIS_REGISTER_GS) break;
+    if (m == ins.operand_count_visible) return -1;
+
+    /* Case B: indirect CALL or JMP through gs:[disp32] */
+    if (ins.mnemonic == ZYDIS_MNEMONIC_CALL || ins.mnemonic == ZYDIS_MNEMONIC_JMP) {
+        int64_t disp64 = ops[m].mem.disp.value;
+        ZydisEncoderRequest req;
+        ZyanUSize elen;
+        if (disp64 > INT32_MAX || disp64 < INT32_MIN) return -1;
+        /* 1. mov gs:[teb_s1], r11 */
+        el = enc_mov_gs_reg(teb_s1, ZYDIS_REGISTER_R11, stub + o, room - (size_t)o);
+        if (el < 0) return -1;
+        o += el;
+        /* 2. mov r11, gs:[teb_base] */
+        el = enc_mov_reg_gs(ZYDIS_REGISTER_R11, teb_base, stub + o, room - (size_t)o);
+        if (el < 0) return -1;
+        o += el;
+        /* 3. mov r11, qword ptr [r11 + disp32] */
+        memset(&req, 0, sizeof req);
+        req.mnemonic = ZYDIS_MNEMONIC_MOV;
+        req.machine_mode = ZYDIS_MACHINE_MODE_LONG_64;
+        req.operand_count = 2;
+        req.operands[0].type = ZYDIS_OPERAND_TYPE_REGISTER;
+        req.operands[0].reg.value = ZYDIS_REGISTER_R11;
+        req.operands[1].type = ZYDIS_OPERAND_TYPE_MEMORY;
+        req.operands[1].mem.base = ZYDIS_REGISTER_R11;
+        req.operands[1].mem.displacement = disp64;
+        req.operands[1].mem.size = 8;
+        elen = room - (size_t)o;
+        if (!ZYAN_SUCCESS(ZydisEncoderEncodeInstruction(&req, stub + o, &elen))) return -1;
+        o += (int)elen;
+        /* 4. mov gs:[teb_s2], r11 */
+        el = enc_mov_gs_reg(teb_s2, ZYDIS_REGISTER_R11, stub + o, room - (size_t)o);
+        if (el < 0) return -1;
+        o += el;
+        /* 5. If CALL: push exact return address (core + f->ins_len) without touching EFLAGS */
+        if (ins.mnemonic == ZYDIS_MNEMONIC_CALL) {
+            int32_t ret_rel32;
+            rel = dry_run ? 0 : (int64_t)((core + f->ins_len) - (stub + o + 7));
+            if (rel > INT32_MAX || rel < INT32_MIN) return -1;
+            ret_rel32 = (int32_t)rel;
+            stub[o++] = 0x4C; stub[o++] = 0x8D; stub[o++] = 0x1D; /* lea r11, [rip + rel32] */
+            memcpy(stub + o, &ret_rel32, 4); o += 4;
+            stub[o++] = 0x41; stub[o++] = 0x53;                   /* push r11 */
+        }
+        /* 6. mov r11, gs:[teb_s1] */
+        el = enc_mov_reg_gs(ZYDIS_REGISTER_R11, teb_s1, stub + o, room - (size_t)o);
+        if (el < 0) return -1;
+        o += el;
+        /* 7. jmp qword ptr gs:[teb_s2] */
+        if (room - (size_t)o < 8) return -1;
+        stub[o++] = 0x65; stub[o++] = 0xFF; stub[o++] = 0x24; stub[o++] = 0x25;
+        memcpy(stub + o, &teb_s2, 4); o += 4;
+        return o;
+    }
+
+    /* Case A: non-branch %gs: memory instruction */
+    {
+        ZydisRegister scratch = pick_gs_scratch(&ins, ops);
+        ZydisEncoderRequest req;
+        unsigned char enc[ZYDIS_MAX_INSTRUCTION_LENGTH];
+        ZyanUSize elen = sizeof enc;
+        ZydisRegister orig_base = ops[m].mem.base;
+
+        if (scratch == ZYDIS_REGISTER_NONE) return -1;
+        if (!ZYAN_SUCCESS(ZydisEncoderDecodedInstructionToEncoderRequest(&ins, ops, ins.operand_count_visible, &req)))
+            return -1;
+        if (orig_base == ZYDIS_REGISTER_NONE) {
+            req.operands[m].mem.base = scratch;
+            req.operands[m].mem.index = ZYDIS_REGISTER_NONE;
+            req.operands[m].mem.scale = 0;
+        } else if (orig_base == ZYDIS_REGISTER_RSP) {
+            req.operands[m].mem.base = ZYDIS_REGISTER_RSP;
+            req.operands[m].mem.index = scratch;
+            req.operands[m].mem.scale = 1;
+        } else {
+            req.operands[m].mem.base = scratch;
+            req.operands[m].mem.index = orig_base;
+            req.operands[m].mem.scale = 1;
+        }
+        req.prefixes &= ~(ZydisInstructionAttributes)ZYDIS_ATTRIB_HAS_SEGMENT_GS;
+        if (!ZYAN_SUCCESS(ZydisEncoderEncodeInstruction(&req, enc, &elen))) return -1;
+
+        /* Round-trip decode verification */
+        {
+            ZydisDecodedInstruction e;
+            ZydisDecodedOperand eops[ZYDIS_MAX_OPERAND_COUNT];
+            int m2;
+            if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, enc, elen, &e, eops)) ||
+                e.mnemonic != ins.mnemonic ||
+                (e.attributes & ZYDIS_ATTRIB_HAS_SEGMENT_GS) ||
+                e.operand_count_visible != ins.operand_count_visible)
+                return -1;
+            for (m2 = 0; m2 < e.operand_count_visible; m2++)
+                if (eops[m2].type == ZYDIS_OPERAND_TYPE_MEMORY) break;
+            if (m2 != m || eops[m2].mem.segment == ZYDIS_REGISTER_GS ||
+                eops[m2].size != ops[m].size ||
+                eops[m2].mem.disp.value != ops[m].mem.disp.value)
+                return -1;
+            if (orig_base == ZYDIS_REGISTER_NONE) {
+                if (eops[m2].mem.base != scratch || eops[m2].mem.index != ZYDIS_REGISTER_NONE) return -1;
+            } else if (orig_base == ZYDIS_REGISTER_RSP) {
+                if (eops[m2].mem.base != ZYDIS_REGISTER_RSP || eops[m2].mem.index != scratch || eops[m2].mem.scale != 1)
+                    return -1;
+            } else {
+                if (eops[m2].mem.base != scratch || eops[m2].mem.index != orig_base || eops[m2].mem.scale != 1)
+                    return -1;
+            }
+        }
+
+        /* Moved predecessors */
+        for (q = f->start; q < core;) {
+            ZydisDecodedInstruction n;
+            ZydisDecodedOperand nops[ZYDIS_MAX_OPERAND_COUNT];
+            if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, q, (ZyanUSize)(core - q), &n, nops))) return -1;
+            if (!dry_run && copy_insn(dec, stub + o, q)) return -1;
+            o += n.length; q += n.length;
+        }
+        /* Save scratch, load ART gs base, execute access, restore scratch (zero stack/EFLAGS) */
+        el = enc_mov_gs_reg(teb_s1, scratch, stub + o, room - (size_t)o);
+        if (el < 0) return -1;
+        o += el;
+        el = enc_mov_reg_gs(scratch, teb_base, stub + o, room - (size_t)o);
+        if (el < 0) return -1;
+        o += el;
+        if (room - (size_t)o < (size_t)elen + 48) return -1;
+        memcpy(stub + o, enc, elen); o += (int)elen;
+        el = enc_mov_reg_gs(scratch, teb_s1, stub + o, room - (size_t)o);
+        if (el < 0) return -1;
+        o += el;
+        /* Moved successors */
+        for (q = core + f->ins_len; q < f->start + f->total;) {
+            ZydisDecodedInstruction n;
+            ZydisDecodedOperand nops[ZYDIS_MAX_OPERAND_COUNT];
+            if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, q, (ZyanUSize)(f->start + f->total - q), &n, nops)))
+                return -1;
+            if (!dry_run && copy_insn(dec, stub + o, q)) return -1;
+            o += n.length; q += n.length;
+        }
+        if (!f->ends_ret) {
+            int32_t r32;
+            rel = dry_run ? 0 : (int64_t)((f->start + f->total) - (stub + o + 5));
+            if (rel > INT32_MAX || rel < INT32_MIN) return -1;
+            r32 = (int32_t)rel;
+            stub[o++] = 0xE9; memcpy(stub + o, &r32, 4); o += 4;
+        }
+        (void)k;
+        return o;
+    }
+}
+
 int afw_patch_code(const afw_code_range *ranges, int nranges,
                    unsigned char *stub_area, size_t stub_size,
                    const afw_patch_ctx *c, afw_patch_report *rep, int verbose) {
@@ -1564,6 +1861,8 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
     size_t nsites = 0, capsites = 0, i;
     fsite2 *fsites = NULL;
     size_t nfsites = 0, capfsites = 0;
+    fsite2 *gsites = NULL;
+    size_t ngsites = 0, capgsites = 0;
     unsigned char *stub_for[AFW_MAX_SYSCALL] = {0};
     size_t stub_used = 0;
     uint64_t entry = (uint64_t)(uintptr_t)afw_syscall_entry;
@@ -1722,10 +2021,38 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                 }
             }
             if (has_gs_operand(&ins, ops)) {
-                if (rep->gs_unsupported++ < 3) {
-                    describe(c, p, where, sizeof where);
-                    fprintf(stderr, "  [patch] gs: access at %s: not supported (gs is the TEB on Windows); "
-                                    "blocks loading\n", where);
+                if (c && c->enable_art_gs) {
+                    uint64_t gs_, ge_;
+                    int inside = c->bounds && c->bounds(c->ctx, ip, &gs_, &ge_);
+                    const char *why = "";
+                    unsigned char *prev[3] = {h[0].p, h[1].p, h[2].p};
+                    fsite2 g2;
+                    g2.nopt = 0;
+                    if (inside) {
+                        if (gs_site(&dec, p, ranges[r].addr, end, prev, &ins, ops, 0, &g2.opt[0], &why))
+                            g2.nopt++;
+                        if (gs_site(&dec, p, ranges[r].addr, end, prev, &ins, ops, 1, &g2.opt[g2.nopt], &why) &&
+                            (g2.nopt == 0 || g2.opt[1].start != g2.opt[0].start || g2.opt[1].total != g2.opt[0].total))
+                            g2.nopt++;
+                    } else {
+                        why = "outside any known function";
+                    }
+                    if (g2.nopt) {
+                        rep->gs_feasible++;
+                        VEC_PUSH(gsites, ngsites, capgsites, g2);
+                    } else {
+                        if (rep->gs_unsupported++ < 10) {
+                            describe(c, p, where, sizeof where);
+                            fprintf(stderr, "  [patch] gs: access at %s: REFUSED (%s); blocks loading\n", where, why);
+                            dump_ins(p, &ins, ops);
+                        }
+                    }
+                } else {
+                    if (rep->gs_unsupported++ < 3) {
+                        describe(c, p, where, sizeof where);
+                        fprintf(stderr, "  [patch] gs: access at %s: not supported (gs is the TEB on Windows); "
+                                        "blocks loading\n", where);
+                    }
                 }
             }
             for (k = 0; k < ins.operand_count_visible; k++) {
@@ -2021,9 +2348,108 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
             rep->stubs++;
             rep->fs_reg_trampolined++;
         }
+        /* Pass 2c: ART %gs: trampolines (Gate G3, opt-in via enable_art_gs).
+         * Plan non-overlapping layouts, verify encoding on all platforms (dry-run
+         * on Linux), and write real TEB-backed trampolines on Windows. */
+        if (ngsites > 0) {
+            int *gpick = (int *)malloc(ngsites * sizeof *gpick);
+            int32_t teb_base = afw_tls_art_gs_base_off();
+            int32_t teb_s1   = afw_tls_art_gs_scratch1_off();
+            int32_t teb_s2   = afw_tls_art_gs_scratch2_off();
+            int win_emit = (teb_base >= 0 && teb_s1 >= 0 && teb_s2 >= 0);
+            if (!gpick) fatal = 1;
+            for (i = 0; i < ngsites && !fatal; i++) {
+                int o, ok = -1;
+                gpick[i] = -1;
+                for (o = 0; o < gsites[i].nopt && ok < 0; o++) {
+                    const fsite *f = &gsites[i].opt[o];
+                    uint64_t lo = (uint64_t)(uintptr_t)f->start, hi = lo + (uint64_t)f->total;
+                    int clash = target_inside(targets, ntargets, lo, hi);
+                    for (j = 0; j < nsites && !clash; j++)
+                        clash = lo < (uint64_t)(uintptr_t)(sites[j].start + sites[j].len) &&
+                                (uint64_t)(uintptr_t)sites[j].start < hi;
+                    for (j = 0; j < nfsites && !clash; j++)
+                        if (pick[j] >= 0) {
+                            const fsite *fs = &fsites[j].opt[pick[j]];
+                            clash = lo < (uint64_t)(uintptr_t)(fs->start + fs->total) &&
+                                    (uint64_t)(uintptr_t)fs->start < hi;
+                        }
+                    if (!clash && i > 0 && gpick[i - 1] >= 0) {
+                        const fsite *prev_g = &gsites[i - 1].opt[gpick[i - 1]];
+                        clash = lo < (uint64_t)(uintptr_t)(prev_g->start + prev_g->total) &&
+                                (uint64_t)(uintptr_t)prev_g->start < hi;
+                        if (clash && gsites[i - 1].nopt == 2) {
+                            const fsite *g2 = &gsites[i - 1].opt[1 - gpick[i - 1]];
+                            uint64_t l2 = (uint64_t)(uintptr_t)g2->start, h2 = l2 + (uint64_t)g2->total;
+                            int c2 = target_inside(targets, ntargets, l2, h2) || (lo < h2 && l2 < hi);
+                            for (j = 0; j < nsites && !c2; j++)
+                                c2 = l2 < (uint64_t)(uintptr_t)(sites[j].start + sites[j].len) &&
+                                     (uint64_t)(uintptr_t)sites[j].start < h2;
+                            if (!c2 && i > 1 && gpick[i - 2] >= 0) {
+                                const fsite *g3 = &gsites[i - 2].opt[gpick[i - 2]];
+                                c2 = l2 < (uint64_t)(uintptr_t)(g3->start + g3->total) &&
+                                     (uint64_t)(uintptr_t)g3->start < h2;
+                            }
+                            if (!c2) { gpick[i - 1] = 1 - gpick[i - 1]; clash = 0; }
+                        }
+                    }
+                    if (!clash) ok = o;
+                }
+                gpick[i] = ok;
+                if (ok < 0) {
+                    rep->gs_feasible--;
+                    if (rep->gs_unsupported++ < 10) {
+                        describe(c, gsites[i].opt[0].start + gsites[i].opt[0].pre_len, where, sizeof where);
+                        fprintf(stderr, "  [patch] gs: at %s: REFUSED (branch target inside or overlap)\n", where);
+                    }
+                }
+            }
+            for (i = 0; i < ngsites && !fatal; i++) {
+                fsite *f;
+                int len, k;
+                int64_t rel;
+                if (gpick[i] < 0) continue;
+                f = &gsites[i].opt[gpick[i]];
+                if (!win_emit) {
+                    unsigned char dry[192];
+                    len = gs_stub(&dec, f, 0x1480, 0x1488, 0x1490, dry, sizeof dry, 1);
+                    if (len < 0) {
+                        rep->gs_feasible--;
+                        if (rep->gs_unsupported++ < 10) {
+                            describe(c, f->start + f->pre_len, where, sizeof where);
+                            fprintf(stderr, "  [patch] gs: at %s: REFUSED (dry-run encode/verify failed)\n", where);
+                        }
+                    }
+                    continue;
+                }
+                if (stub_used + 160 > stub_size) {
+                    fprintf(stderr, "  [patch] FATAL: stub area full (%zu bytes) during gs: patching\n", stub_size);
+                    fatal = 1; break;
+                }
+                len = gs_stub(&dec, f, teb_base, teb_s1, teb_s2, stub_area + stub_used, stub_size - stub_used, 0);
+                if (len < 0) {
+                    rep->gs_feasible--;
+                    if (rep->gs_unsupported++ < 10) {
+                        describe(c, f->start + f->pre_len, where, sizeof where);
+                        fprintf(stderr, "  [patch] gs: at %s: REFUSED (could not build/verify trampoline)\n", where);
+                    }
+                    continue;
+                }
+                rel = (int64_t)((intptr_t)(stub_area + stub_used) - (intptr_t)(f->start + 5));
+                if (rel > INT32_MAX || rel < INT32_MIN) { fatal = 1; break; }
+                f->start[0] = 0xE9; { int32_t r32 = (int32_t)rel; memcpy(f->start + 1, &r32, 4); }
+                for (k = 5; k < f->total; k++) f->start[k] = 0xCC;
+                afw_stub_note(stub_area + stub_used, (size_t)len, f->start + f->pre_len);
+                stub_used += ((size_t)len + 15) & ~(size_t)15;
+                rep->stubs++;
+                rep->gs_trampolined++;
+            }
+            free(gpick);
+        }
         free(pick);
     }
     free(fsites);
+    free(gsites);
 
     /* Audit: a plain linear sweep of the executable segments finds every
      * byte pattern that LOOKS like a syscall or an fs: access. Each one must
@@ -2045,7 +2471,13 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                         else if (ranges[m].addr + ranges[m].size <= p) lo = m + 1;
                         else { in = 1; break; }
                     }
-                    if (!in) rep->gs_outside_functions++;
+                    if (!in) {
+                        if (rep->gs_outside_functions++ < 5 && verbose) {
+                            describe(c, p, where, sizeof where);
+                            fprintf(stderr, "  [audit] WARNING: gs: bytes at %s, outside .eh_frame\n", where);
+                            dump_ins(p, &ins, ops);
+                        }
+                    }
                 }
                 if (is_sys || is_fs) {
                     int lo = 0, hi = nranges, found = -1;
@@ -2061,7 +2493,13 @@ int afw_patch_code(const afw_code_range *ranges, int nranges,
                             describe(c, p, where, sizeof where);
                             fprintf(stderr, "  [audit] WARNING: syscall bytes at %s, outside every .eh_frame function "
                                             "(data, or code without unwind info): not touched\n", where);
-                        } else rep->fs_outside_functions++;
+                        } else {
+                            if (rep->fs_outside_functions++ < 5 && verbose) {
+                                describe(c, p, where, sizeof where);
+                                fprintf(stderr, "  [audit] WARNING: fs: bytes at %s, outside .eh_frame\n", where);
+                                dump_ins(p, &ins, ops);
+                            }
+                        }
                     } else if (maps0[found] && maps[found] && maps[found][p - ranges[found].addr] == 1 &&
                                maps0[found][p - ranges[found].addr] != 1) {
                         /* reached only because of an attestation: handled, but say so every time (reviewer 2) */

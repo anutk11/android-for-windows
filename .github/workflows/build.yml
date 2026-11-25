@@ -2,7 +2,7 @@ name: build
 
 on:
   push:
-    branches: [main]
+    branches: [main, g3-art-runtime]
   pull_request:
   workflow_dispatch:
 
@@ -35,6 +35,8 @@ jobs:
             -Wl,--pack-dyn-relocs=none -o out/libfs_gate_test.so test/fs_gate_test.c
           "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 -nostdlib \
             -Wl,--pack-dyn-relocs=none -o out/libgs_gate_test.so test/gs_gate_test.c
+          "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 -nostdlib \
+            -Wl,--pack-dyn-relocs=none -o out/libart_gs_test.so test/art_gs_test.c
           "$TC/clang" --target=x86_64-linux-android29 -shared -fPIC -O2 \
             -Wl,--pack-dyn-relocs=none -o out/libtls_ie_test.so test/tls_ie_test.c
           for v in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
@@ -309,6 +311,26 @@ jobs:
           out/afw-loader out/artprobe/art/libart.so --patch-report 2>&1 \
             | grep -E "^(Library|Needs|Code|Patched|GATE|TLS)|unproven|UNPROVEN [0-9]|refused" | head -30 | tee -a out/art-gs-scan.txt
           rm -rf out/artprobe                  # extracted files are never uploaded (rule 5)
+      - name: "G3-0 Measure: libart.so + full transitive dependency closure with --art-gs (no binaries uploaded)"
+        continue-on-error: true
+        run: |
+          python3 -I tools/fetch_bionic.py out/artfull --art-full > out/art-deps-scan.txt 2>&1 || true
+          echo "=== Bootclasspath JARs & ICU data ===" >> out/art-deps-scan.txt
+          ls -la out/artfull/art/javalib out/artfull/art/icu >> out/art-deps-scan.txt 2>&1 || true
+          echo "=== libart.so with --patch-report --art-gs ===" >> out/art-deps-scan.txt
+          out/afw-loader out/artfull/art/lib64/libart.so --patch-report --art-gs 2>&1 | tee /tmp/libart-gs.txt | grep -E "^(Library|Needs|Code|Patched|GATE|ATTEST|PATCH REPORT|  \[patch\]|  \[audit\]|  fs:|  syscall)" | head -120 >> out/art-deps-scan.txt
+          echo "=== libart.so UNPROVEN summary ===" >> out/art-deps-scan.txt
+          grep -E "\[audit\] UNPROVEN:" /tmp/libart-gs.txt | head -40 >> out/art-deps-scan.txt || true
+          echo "=== Every transitive .so with --patch-report --art-gs ===" >> out/art-deps-scan.txt
+          for f in out/artfull/art/lib64/*.so; do
+            bn=$(basename "$f")
+            echo "--- $bn ---" >> out/art-deps-scan.txt
+            out/afw-loader "$f" --patch-report --art-gs 2>&1 | grep -E "^(Needs|GATE|PATCH REPORT|  \[patch\]|  \[audit\] WARNING|  imports)" | head -15 >> out/art-deps-scan.txt || true
+          done
+          echo "=== Transitive symbol resolution check (AFW_LIB_PATH=out/artfull:out/artfull/art/lib64) ===" >> out/art-deps-scan.txt
+          AFW_LIB_PATH="out/artfull:out/artfull/art/lib64" out/afw-loader out/artfull/art/lib64/libart.so --with-deps --patch-report --art-gs 2>&1 | grep -E "(missing|unresolved|error:|GATE|Loaded|== dependency|PATCH REPORT)" | head -120 >> out/art-deps-scan.txt || true
+          rm -rf out/artfull /tmp/libart-gs.txt
+          tail -n 60 out/art-deps-scan.txt
       - name: "G2-1 / G2-4a Measure: bionic pthread/clone/StaticTlsLayout ABI oracle"
         continue-on-error: true
         run: |
@@ -685,6 +707,9 @@ jobs:
           out\afw-loader.exe out\libgs_gate_test.so > out\gsgate.txt 2>&1
           if %errorlevel% equ 0 (type out\gsgate.txt & echo gs: gate did not refuse & exit /b 1)
           findstr /c:"3 unsupported gs: accesses" out\gsgate.txt
+      - name: "G3-1: ART %gs: emulation (--art-gs: ARCH_SET_GS, all gs: forms, 2 threads on Windows)"
+        shell: cmd
+        run: out\afw-loader.exe out\libart_gs_test.so --art-gs
       - name: "Negative test: red zone sites must be refused"
         shell: cmd
         run: out\afw-loader.exe out\libredzone_test.so

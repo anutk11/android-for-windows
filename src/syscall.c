@@ -533,6 +533,24 @@ static long atomic_inc_long(long *p) {
 #endif
 }
 
+static void (*g_set_gs_cb)(uintptr_t);
+static uintptr_t (*g_get_gs_cb)(void);
+static _Thread_local uintptr_t t_fallback_gs;
+
+void afw_syscall_set_gs_ops(void (*set_gs)(uintptr_t), uintptr_t (*get_gs)(void)) {
+    g_set_gs_cb = set_gs;
+    g_get_gs_cb = get_gs;
+}
+
+static void sys_set_art_gs(uintptr_t addr) {
+    if (g_set_gs_cb) g_set_gs_cb(addr);
+    else t_fallback_gs = addr;
+}
+
+static uintptr_t sys_get_art_gs(void) {
+    return g_get_gs_cb ? g_get_gs_cb() : t_fallback_gs;
+}
+
 static int64_t dispatch_ex(int64_t nr, int64_t *a, const afw_clone_regs *regs, uintptr_t cur_sp) {
     if (nr >= 0 && nr < AFW_MAX_SYSCALL) (void)atomic_inc_long(&afw_syscall_counts[nr]);
     if (afw_syscall_probe_log) probe_log_syscall(nr, a);
@@ -576,6 +594,18 @@ static int64_t dispatch_ex(int64_t nr, int64_t *a, const afw_clone_regs *regs, u
     case 12:  return -12;  /* brk: no heap break; bionic and Scudo use mmap */
     case 157: /* prctl */
         if (a[0] == 0x53564d41) return 0;  /* PR_SET_VMA (naming an area): accepted */
+        return -22;
+    case 158: /* arch_prctl(code, addr) */
+        if (a[0] == 0x1001) { /* ARCH_SET_GS */
+            sys_set_art_gs((uintptr_t)a[1]);
+            return 0;
+        }
+        if (a[0] == 0x1004) { /* ARCH_GET_GS */
+            uintptr_t *out = (uintptr_t *)(uintptr_t)a[1];
+            if (!out) return -14; /* EFAULT */
+            *out = sys_get_art_gs();
+            return 0;
+        }
         return -22;
     case 60:  /* exit: ends only the calling thread */
         if (afw_thread_is_cloned())

@@ -32,6 +32,7 @@ typedef SYSV void (*init_fn)(void);
 int afw_load_patch_only;
 int afw_load_allow_unproven;
 int afw_attest_dump;
+int afw_load_enable_art_gs;
 
 int afw_gate_ok(const afw_lib *lib) {
     const afw_patch_report *r = &lib->patch;
@@ -39,9 +40,10 @@ int afw_gate_ok(const afw_lib *lib) {
            !r->fs_unsupported &&
            !r->gs_unsupported && !r->gs_outside_functions &&   /* gs: is the TEB on Windows (issue #15) */
            !r->fs_outside_functions &&   /* fs: look-alikes outside .eh_frame (reviewer 4); measured 0 in bionic */
-           /* every fs:[reg] must really be rewritten (Windows); measurement mode
+           /* every fs:[reg] and ART gs: must really be rewritten (Windows); measurement mode
             * reports what Windows would do */
-           (afw_load_patch_only || r->fs_reg_trampolined == r->fs_reg_feasible);
+           (afw_load_patch_only || r->fs_reg_trampolined == r->fs_reg_feasible) &&
+           (afw_load_patch_only || r->gs_trampolined == r->gs_feasible);
 }
 
 #define MAX_LIBS AFW_MAX_LIBS
@@ -939,6 +941,7 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
         pc.attest = afw_attest_for(lib->sha256, lib->attest_buf, (int)(sizeof lib->attest_buf / sizeof lib->attest_buf[0]), &pc.nattest);
         pc.readonly = patch_readonly;
         pc.attest_dump = afw_attest_dump;
+        pc.enable_art_gs = afw_load_enable_art_gs;
         lib->load_prot = pageprot; lib->load_npages = npages;
         if (pc.nattest < 0) {
             fprintf(stderr, "error: attestation table for %s cannot be read; refusing to run it\n", path);
