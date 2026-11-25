@@ -333,8 +333,9 @@ jobs:
             echo "--- RVA $rva ---" >> out/art-deps-scan.txt
             "$TC/llvm-objdump" -d --start-address=$lo --stop-address=$hi out/artfull/art/lib64/libart.so >> out/art-deps-scan.txt 2>&1 || true
           done
-          echo "=== Disassemble libart.so around Runtime::Init crash 0x800867 ==="
-          "$TC/llvm-objdump" -d --demangle --start-address=0x800740 --stop-address=0x8008a0 out/artfull/art/lib64/libart.so 2>&1 || true
+          echo "=== Disassemble art::Thread::Attach and art::Thread::Init ==="
+          "$TC/llvm-objdump" -d --demangle --start-address=0x856b70 --stop-address=0x856e80 out/artfull/art/lib64/libart.so 2>&1 || true
+          "$TC/llvm-objdump" -d --demangle --disassemble-symbols='_ZN3art6Thread4InitEPNS_10ThreadListEPNS_9JavaVMExtEPNS_9JNIEnvExtE' out/artfull/art/lib64/libart.so 2>&1 | head -n 160 || true
           echo "=== libart.so --patch-report --art-gs summary ===" >> out/art-deps-scan.txt
           out/afw-loader out/artfull/art/lib64/libart.so --patch-report --art-gs 2>&1 | grep -E "^(GATE|PATCH REPORT|  fs:|  \[patch\]|  \[audit\] WARNING)" >> out/art-deps-scan.txt || true
           echo "=== Transitive symbol resolution check (AFW_LIB_PATH=out/artfull:out/artfull/art/lib64) ===" >> out/art-deps-scan.txt

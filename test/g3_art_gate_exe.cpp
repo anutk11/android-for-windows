@@ -11,6 +11,7 @@
  */
 #include <dlfcn.h>
 #include <jni.h>
+#include <pthread.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -46,6 +47,19 @@ int main(int argc, char **argv) {
 
     std::printf("=== G3 ART Gate: booting real Android 14 libart.so ===\n");
     std::printf("  art_dir:  %s\n  test_jar: %s\n", art_dir.c_str(), test_jar.c_str());
+
+    {
+        pthread_attr_t attr;
+        int grc = pthread_getattr_np(pthread_self(), &attr);
+        void *sb = nullptr; size_t ss = 0, gs = 0;
+        if (grc == 0) {
+            pthread_attr_getstack(&attr, &sb, &ss);
+            pthread_attr_getguardsize(&attr, &gs);
+            pthread_attr_destroy(&attr);
+        }
+        std::printf("[G3] main pthread_getattr_np rc=%d sp=%p stack_base=%p stack_size=0x%zx guard=0x%zx\n",
+                    grc, static_cast<void *>(&attr), sb, ss, gs);
+    }
 
     /* Redirect Android liblog output to stderr so all ART LOG()/CHECK() messages are visible. */
     void *h_log = dlopen("liblog.so", RTLD_NOW);
