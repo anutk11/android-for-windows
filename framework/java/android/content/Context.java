@@ -19,6 +19,7 @@ public abstract class Context {
     public abstract AssetManager getAssets();
     public abstract PackageManager getPackageManager();
     public abstract ApplicationInfo getApplicationInfo();
+    public abstract ContentResolver getContentResolver();
     public abstract File getFilesDir();
     public abstract File getCacheDir();
     public abstract File getExternalFilesDir(String type);

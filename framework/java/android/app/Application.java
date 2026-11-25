@@ -22,6 +22,7 @@ public class Application extends ContextWrapper {
     private Resources mResources;
     private AssetManager mAssets;
     private final PackageManager mPm = new PackageManager();
+    private final android.content.ContentResolver mContentResolver = new android.content.ContentResolver();
     private final AudioManager mAudioManager = new AudioManager();
     private final WindowManager mWindowManager = new WindowManager() {
         private final Display mDisplay = new Display();
@@ -48,6 +49,7 @@ public class Application extends ContextWrapper {
     @Override public AssetManager getAssets() { return mAssets; }
     @Override public PackageManager getPackageManager() { return mPm; }
     @Override public ApplicationInfo getApplicationInfo() { return mPm.getApplicationInfo(mPackageName, 0); }
+    @Override public android.content.ContentResolver getContentResolver() { return mContentResolver; }
 
     @Override public File getFilesDir() {
         File f = new File(mDataDir, "files");

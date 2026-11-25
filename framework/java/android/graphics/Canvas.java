@@ -264,9 +264,15 @@ public class Canvas {
         float dx = x + mTx;
         if (p.getTextAlign() == Paint.Align.CENTER) dx -= p.measureText(text) * 0.5f;
         else if (p.getTextAlign() == Paint.Align.RIGHT) dx -= p.measureText(text);
+        boolean bold = p.getTypeface() != null && p.getTypeface().isBold();
+        try {
+            if (com.afw.AfwHost.drawTextTtf(mPixels, mW, mH, mClipL, mClipT, mClipR, mClipB,
+                                            text, dx, y + mTy, p.getTextSize(), p.getColor(), bold) == 0) {
+                return;
+            }
+        } catch (Throwable ignored) {}
         AfwFont.drawText(mPixels, mW, mH, mClipL, mClipT, mClipR, mClipB,
-                         text, dx, y + mTy, p.getTextSize(), p.getColor(),
-                         p.getTypeface() != null && p.getTypeface().isBold());
+                         text, dx, y + mTy, p.getTextSize(), p.getColor(), bold);
     }
 
     public void drawBitmap(Bitmap bmp, float left, float top, Paint p) {

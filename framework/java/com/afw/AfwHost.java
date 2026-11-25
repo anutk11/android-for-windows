@@ -28,4 +28,12 @@ public final class AfwHost {
     public static native void sleepMs(int ms);
     public static native int getFrames();
     public static native long getAudioBytes();
+    public static native int[] decodeImage(byte[] encodedBytes, int[] outWH);
+    public static native short[] decodeMedia(String filePath, int[] outRateChannels);
+    public static native int drawTextTtf(int[] fb, int fbW, int fbH,
+                                         int cl, int ct, int cr, int cb,
+                                         String text, float x, float baselineY,
+                                         float pxSize, int argb, boolean bold);
+    public static native float measureTextTtf(String text, float pxSize, boolean bold);
+    public static native String getUserDir(String kind);
 }

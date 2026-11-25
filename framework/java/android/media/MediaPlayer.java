@@ -1,29 +1,81 @@
 package android.media;
 
+import android.content.Context;
+import android.net.Uri;
+import com.afw.AfwHost;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 
-/** Lightweight MediaPlayer supporting uncompressed WAV/PCM playback via AudioTrack. */
+/**
+ * MediaPlayer backed by Windows Media Foundation (MP3, AAC, M4A, FLAC, OGG, WAV, WMA, MP4)
+ * with pure-Java WAV fallback, playing through WinMM-backed AudioTrack.
+ */
 public class MediaPlayer {
     public interface OnCompletionListener { void onCompletion(MediaPlayer mp); }
+    public interface OnPreparedListener { void onPrepared(MediaPlayer mp); }
 
+    private String mPath;
     private byte[] mPcmData;
     private int mSampleRate = 44100;
-    private int mChannels = 1;
+    private int mChannels = 2;
+    private int mPositionBytes = 0;
     private boolean mLooping = false;
     private volatile boolean mPlaying = false;
     private AudioTrack mTrack;
     private Thread mThread;
     private OnCompletionListener mCompletionListener;
+    private OnPreparedListener mPreparedListener;
 
     public void setLooping(boolean looping) { mLooping = looping; }
     public boolean isLooping() { return mLooping; }
     public boolean isPlaying() { return mPlaying; }
     public void setOnCompletionListener(OnCompletionListener l) { mCompletionListener = l; }
+    public void setOnPreparedListener(OnPreparedListener l) { mPreparedListener = l; }
+
+    public int getDuration() {
+        if (mPcmData == null || mSampleRate <= 0 || mChannels <= 0) return 0;
+        long bytesPerSec = (long) mSampleRate * mChannels * 2L;
+        return (int) ((mPcmData.length * 1000L) / bytesPerSec);
+    }
+
+    public int getCurrentPosition() {
+        if (mSampleRate <= 0 || mChannels <= 0) return 0;
+        long bytesPerSec = (long) mSampleRate * mChannels * 2L;
+        return (int) ((mPositionBytes * 1000L) / bytesPerSec);
+    }
+
+    public void seekTo(int msec) {
+        if (mPcmData == null) return;
+        long bytesPerSec = (long) mSampleRate * mChannels * 2L;
+        int target = (int) Math.max(0, Math.min(mPcmData.length, (msec * bytesPerSec) / 1000L));
+        mPositionBytes = target & ~3;
+    }
+
+    public void setDataSource(Context context, Uri uri) throws IOException {
+        if (uri == null) throw new IOException("Null URI");
+        setDataSource(uri.getPath());
+    }
 
     public void setDataSource(String path) throws IOException {
+        mPath = path;
+        mPositionBytes = 0;
+        // 1. Try Windows Media Foundation (decodes MP3, AAC, M4A, FLAC, OGG, WAV, MP4 natively)
+        int[] meta = new int[2];
+        short[] decoded = AfwHost.decodeMedia(path, meta);
+        if (decoded != null && decoded.length > 0) {
+            mSampleRate = meta[0] > 0 ? meta[0] : 44100;
+            mChannels   = meta[1] > 0 ? meta[1] : 2;
+            mPcmData = new byte[decoded.length * 2];
+            for (int i = 0; i < decoded.length; i++) {
+                short s = decoded[i];
+                mPcmData[i * 2]     = (byte) (s & 0xFF);
+                mPcmData[i * 2 + 1] = (byte) ((s >> 8) & 0xFF);
+            }
+            return;
+        }
+        // 2. Fallback: raw WAV/RIFF parser
         File f = new File(path);
         byte[] all = new byte[(int) f.length()];
         try (InputStream in = new FileInputStream(f)) {
@@ -54,7 +106,11 @@ public class MediaPlayer {
         mPcmData = all;
     }
 
-    public void prepare() {}
+    public void prepare() {
+        if (mPreparedListener != null) mPreparedListener.onPrepared(this);
+    }
+
+    public void prepareAsync() { prepare(); }
 
     public void start() {
         if (mPlaying || mPcmData == null) return;
@@ -67,12 +123,12 @@ public class MediaPlayer {
         mThread = new Thread(new Runnable() {
             @Override public void run() {
                 do {
-                    int off = 0;
-                    while (mPlaying && off < mPcmData.length) {
-                        int chunk = Math.min(4096, mPcmData.length - off);
-                        mTrack.write(mPcmData, off, chunk);
-                        off += chunk;
+                    while (mPlaying && mPositionBytes < mPcmData.length) {
+                        int chunk = Math.min(4096, mPcmData.length - mPositionBytes);
+                        mTrack.write(mPcmData, mPositionBytes, chunk);
+                        mPositionBytes += chunk;
                     }
+                    if (mLooping && mPlaying) mPositionBytes = 0;
                 } while (mPlaying && mLooping);
                 mPlaying = false;
                 if (mCompletionListener != null) mCompletionListener.onCompletion(MediaPlayer.this);
@@ -82,7 +138,8 @@ public class MediaPlayer {
     }
 
     public void pause() { mPlaying = false; }
-    public void stop() { mPlaying = false; }
+    public void stop() { mPlaying = false; mPositionBytes = 0; }
+    public void reset() { stop(); mPcmData = null; mPath = null; }
 
     public void release() {
         mPlaying = false;

@@ -20,6 +20,7 @@ public class ContextWrapper extends Context {
     @Override public AssetManager getAssets() { return mBase != null ? mBase.getAssets() : null; }
     @Override public PackageManager getPackageManager() { return mBase != null ? mBase.getPackageManager() : new PackageManager(); }
     @Override public ApplicationInfo getApplicationInfo() { return mBase != null ? mBase.getApplicationInfo() : new ApplicationInfo(); }
+    @Override public ContentResolver getContentResolver() { return mBase != null ? mBase.getContentResolver() : new ContentResolver(); }
     @Override public File getFilesDir() { return mBase != null ? mBase.getFilesDir() : new File("."); }
     @Override public File getCacheDir() { return mBase != null ? mBase.getCacheDir() : new File("."); }
     @Override public File getExternalFilesDir(String type) { return mBase != null ? mBase.getExternalFilesDir(type) : getFilesDir(); }

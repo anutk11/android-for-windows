@@ -20,12 +20,25 @@
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00
 #endif
+#ifndef COBJMACROS
+#define COBJMACROS
+#endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <mmsystem.h>
+#include <objbase.h>
+#include <wincodec.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "mfplat.lib")
+#pragma comment(lib, "mfreadwrite.lib")
+#pragma comment(lib, "mfuuid.lib")
 #else
 #include <time.h>
 #include <unistd.h>
@@ -490,4 +503,342 @@ SYSV void afw_host_sleep_ms(int32_t ms) {
 SYSV void afw_host_get_stats(int32_t *frames_out, int64_t *audio_bytes_out) {
     if (frames_out)      *frames_out      = g_frames;
     if (audio_bytes_out) *audio_bytes_out = g_audio_bytes;
+}
+
+SYSV void afw_host_free_buf(void *ptr) {
+    free(ptr);
+}
+
+#if defined(_WIN32)
+static void ensure_com_init(void) {
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    (void)hr; /* S_OK, S_FALSE, or RPC_E_CHANGED_MODE are all usable */
+}
+
+static int utf8_path_to_wide_win(const char *path, wchar_t *out, int cap) {
+    char tmp[1024];
+    int n, i;
+    if (!path || !out || cap <= 0) return 0;
+    if (strncmp(path, "/__afw_drv__/", 13) == 0 &&
+        ((path[13] >= 'A' && path[13] <= 'Z') || (path[13] >= 'a' && path[13] <= 'z')) &&
+        (path[14] == '/' || path[14] == '\0')) {
+        snprintf(tmp, sizeof tmp, "%c:%s", path[13], path[14] ? path + 14 : "/");
+        path = tmp;
+    }
+    n = MultiByteToWideChar(CP_UTF8, 0, path, -1, out, cap);
+    if (n <= 0) return 0;
+    for (i = 0; out[i]; i++) if (out[i] == L'/') out[i] = L'\\';
+    return n;
+}
+#endif
+
+SYSV uint32_t *afw_host_decode_image_alloc(const uint8_t *data, int32_t len,
+                                           int32_t *out_w, int32_t *out_h) {
+    if (out_w) *out_w = 0;
+    if (out_h) *out_h = 0;
+    if (!data || len <= 0) return NULL;
+#if defined(_WIN32)
+    ensure_com_init();
+    {
+        IWICImagingFactory *factory = NULL;
+        IWICStream *stream = NULL;
+        IWICBitmapDecoder *decoder = NULL;
+        IWICBitmapFrameDecode *frame = NULL;
+        IWICFormatConverter *conv = NULL;
+        UINT w = 0, h = 0;
+        uint32_t *pixels = NULL;
+        HRESULT hr;
+
+        hr = CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+                              &IID_IWICImagingFactory, (void **)&factory);
+        if (FAILED(hr) || !factory) goto wic_done;
+        hr = IWICImagingFactory_CreateStream(factory, &stream);
+        if (FAILED(hr) || !stream) goto wic_done;
+        hr = IWICStream_InitializeFromMemory(stream, (BYTE *)(uintptr_t)data, (DWORD)len);
+        if (FAILED(hr)) goto wic_done;
+        hr = IWICImagingFactory_CreateDecoderFromStream(factory, (IStream *)stream, NULL,
+                                                        WICDecodeMetadataCacheOnDemand, &decoder);
+        if (FAILED(hr) || !decoder) goto wic_done;
+        hr = IWICBitmapDecoder_GetFrame(decoder, 0, &frame);
+        if (FAILED(hr) || !frame) goto wic_done;
+        hr = IWICImagingFactory_CreateFormatConverter(factory, &conv);
+        if (FAILED(hr) || !conv) goto wic_done;
+        hr = IWICFormatConverter_Initialize(conv, (IWICBitmapSource *)frame,
+                                            &GUID_WICPixelFormat32bppBGRA,
+                                            WICBitmapDitherTypeNone, NULL, 0.0,
+                                            WICBitmapPaletteTypeCustom);
+        if (FAILED(hr)) goto wic_done;
+        hr = IWICFormatConverter_GetSize(conv, &w, &h);
+        if (FAILED(hr) || w == 0 || h == 0 || (uint64_t)w * (uint64_t)h > 16777216ULL)
+            goto wic_done;
+        pixels = (uint32_t *)malloc((size_t)w * (size_t)h * 4u);
+        if (!pixels) goto wic_done;
+        hr = IWICFormatConverter_CopyPixels(conv, NULL, w * 4u, w * h * 4u, (BYTE *)pixels);
+        if (FAILED(hr)) {
+            free(pixels);
+            pixels = NULL;
+        } else {
+            if (out_w) *out_w = (int32_t)w;
+            if (out_h) *out_h = (int32_t)h;
+        }
+    wic_done:
+        if (conv)    IWICFormatConverter_Release(conv);
+        if (frame)   IWICBitmapFrameDecode_Release(frame);
+        if (decoder) IWICBitmapDecoder_Release(decoder);
+        if (stream)  IWICStream_Release(stream);
+        if (factory) IWICImagingFactory_Release(factory);
+        return pixels;
+    }
+#else
+    return NULL;
+#endif
+}
+
+SYSV int16_t *afw_host_media_decode_alloc(const char *path, int32_t *out_samples,
+                                          int32_t *out_rate, int32_t *out_channels) {
+    if (out_samples)  *out_samples  = 0;
+    if (out_rate)     *out_rate     = 44100;
+    if (out_channels) *out_channels = 2;
+    if (!path || !path[0]) return NULL;
+#if defined(_WIN32)
+    ensure_com_init();
+    {
+        static int mf_started = 0;
+        wchar_t wpath[1024];
+        IMFSourceReader *reader = NULL;
+        IMFMediaType *req = NULL, *actual = NULL;
+        UINT32 rate = 44100, ch = 2;
+        uint8_t *buf = NULL;
+        size_t used = 0, cap = 0;
+        const size_t max_bytes = 32u * 1024u * 1024u;
+        HRESULT hr;
+
+        if (!mf_started) {
+            if (SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET)))
+                mf_started = 1;
+            else
+                return NULL;
+        }
+        if (!utf8_path_to_wide_win(path, wpath, (int)(sizeof wpath / sizeof wpath[0])))
+            return NULL;
+
+        hr = MFCreateSourceReaderFromURL(wpath, NULL, &reader);
+        if (FAILED(hr) || !reader) goto mf_done;
+        hr = MFCreateMediaType(&req);
+        if (FAILED(hr) || !req) goto mf_done;
+        IMFMediaType_SetGUID(req, &MF_MT_MAJOR_TYPE, &MFMediaType_Audio);
+        IMFMediaType_SetGUID(req, &MF_MT_SUBTYPE, &MFAudioFormat_PCM);
+        IMFMediaType_SetUINT32(req, &MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        hr = IMFSourceReader_SetCurrentMediaType(reader, (DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, NULL, req);
+        if (FAILED(hr)) goto mf_done;
+        hr = IMFSourceReader_GetCurrentMediaType(reader, (DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, &actual);
+        if (SUCCEEDED(hr) && actual) {
+            (void)IMFMediaType_GetUINT32(actual, &MF_MT_AUDIO_SAMPLES_PER_SECOND, &rate);
+            (void)IMFMediaType_GetUINT32(actual, &MF_MT_AUDIO_NUM_CHANNELS, &ch);
+        }
+
+        for (;;) {
+            DWORD flags = 0;
+            IMFSample *sample = NULL;
+            IMFMediaBuffer *mb = NULL;
+            BYTE *ptr = NULL;
+            DWORD cur = 0;
+            hr = IMFSourceReader_ReadSample(reader, (DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM,
+                                            0, NULL, &flags, NULL, &sample);
+            if (FAILED(hr) || (flags & MF_SOURCE_READERF_ENDOFSTREAM)) {
+                if (sample) IMFSample_Release(sample);
+                break;
+            }
+            if (!sample) continue;
+            if (SUCCEEDED(IMFSample_ConvertToContiguousBuffer(sample, &mb)) && mb) {
+                if (SUCCEEDED(IMFMediaBuffer_Lock(mb, &ptr, NULL, &cur)) && ptr && cur > 0) {
+                    if (used + cur > max_bytes) cur = (DWORD)(max_bytes - used);
+                    if (used + cur > cap) {
+                        size_t ncap = cap ? cap * 2u : 65536u;
+                        while (ncap < used + cur) ncap *= 2u;
+                        uint8_t *nb = (uint8_t *)realloc(buf, ncap);
+                        if (nb) { buf = nb; cap = ncap; }
+                        else cur = 0;
+                    }
+                    if (cur > 0) {
+                        memcpy(buf + used, ptr, cur);
+                        used += cur;
+                    }
+                    IMFMediaBuffer_Unlock(mb);
+                }
+                IMFMediaBuffer_Release(mb);
+            }
+            IMFSample_Release(sample);
+            if (used >= max_bytes) break;
+        }
+    mf_done:
+        if (actual) IMFMediaType_Release(actual);
+        if (req)    IMFMediaType_Release(req);
+        if (reader) IMFSourceReader_Release(reader);
+        if (!buf || used < 2) { free(buf); return NULL; }
+        if (out_samples)  *out_samples  = (int32_t)(used / 2u);
+        if (out_rate)     *out_rate     = (int32_t)rate;
+        if (out_channels) *out_channels = (int32_t)ch;
+        return (int16_t *)buf;
+    }
+#else
+    return NULL;
+#endif
+}
+
+SYSV float afw_host_measure_text_ttf(const char *utf8_text, float px_size, int32_t bold) {
+    if (!utf8_text || !utf8_text[0]) return 0.0f;
+#if defined(_WIN32)
+    {
+        wchar_t wbuf[512];
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8_text, -1, wbuf, 512);
+        HDC hdc;
+        HFONT font, oldf;
+        SIZE sz = { 0, 0 };
+        int h = (int)(px_size + 0.5f);
+        if (wlen <= 1) return 0.0f;
+        if (h < 8) h = 8;
+        hdc = CreateCompatibleDC(NULL);
+        if (!hdc) return -1.0f;
+        font = CreateFontW(-h, 0, 0, 0, bold ? FW_BOLD : FW_NORMAL, FALSE, FALSE, FALSE,
+                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                           ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        oldf = (HFONT)SelectObject(hdc, font);
+        GetTextExtentPoint32W(hdc, wbuf, wlen - 1, &sz);
+        SelectObject(hdc, oldf);
+        DeleteObject(font);
+        DeleteDC(hdc);
+        return (float)sz.cx;
+    }
+#else
+    (void)px_size; (void)bold;
+    return -1.0f;
+#endif
+}
+
+SYSV int32_t afw_host_draw_text_ttf(uint32_t *fb, int32_t fb_w, int32_t fb_h,
+                                    const int32_t clip[4], const char *utf8_text,
+                                    float x, float baseline_y, float px_size,
+                                    uint32_t argb, int32_t bold) {
+    if (!fb || !utf8_text || !utf8_text[0] || fb_w <= 0 || fb_h <= 0) return -1;
+#if defined(_WIN32)
+    {
+        wchar_t wbuf[512];
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8_text, -1, wbuf, 512);
+        HDC hdc;
+        HFONT font, oldf;
+        TEXTMETRICW tm;
+        SIZE sz = { 0, 0 };
+        BITMAPINFO bmi;
+        HBITMAP dib, oldb;
+        uint32_t *bits = NULL;
+        int tw, th, dst_x, dst_y, cl, ct, cr, cb, yy, xx;
+        int h = (int)(px_size + 0.5f);
+        uint32_t src_a = (argb >> 24) & 0xFFu;
+        uint32_t src_r = (argb >> 16) & 0xFFu;
+        uint32_t src_g = (argb >> 8)  & 0xFFu;
+        uint32_t src_b = argb & 0xFFu;
+        if (wlen <= 1 || src_a == 0) return 0;
+        if (h < 8) h = 8;
+
+        hdc = CreateCompatibleDC(NULL);
+        if (!hdc) return -1;
+        font = CreateFontW(-h, 0, 0, 0, bold ? FW_BOLD : FW_NORMAL, FALSE, FALSE, FALSE,
+                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                           ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        oldf = (HFONT)SelectObject(hdc, font);
+        GetTextMetricsW(hdc, &tm);
+        GetTextExtentPoint32W(hdc, wbuf, wlen - 1, &sz);
+        tw = sz.cx + 4;
+        th = sz.cy + 4;
+        if (tw <= 0 || th <= 0 || tw > 4096 || th > 512) {
+            SelectObject(hdc, oldf); DeleteObject(font); DeleteDC(hdc);
+            return -1;
+        }
+
+        memset(&bmi, 0, sizeof bmi);
+        bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth       = tw;
+        bmi.bmiHeader.biHeight      = -th;
+        bmi.bmiHeader.biPlanes      = 1;
+        bmi.bmiHeader.biBitCount    = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        dib = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, (void **)&bits, NULL, 0);
+        if (!dib || !bits) {
+            SelectObject(hdc, oldf); DeleteObject(font); DeleteDC(hdc);
+            return -1;
+        }
+        oldb = (HBITMAP)SelectObject(hdc, dib);
+        memset(bits, 0, (size_t)tw * (size_t)th * 4u);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, RGB(255, 255, 255));
+        ExtTextOutW(hdc, 0, 0, 0, NULL, wbuf, (UINT)(wlen - 1), NULL);
+        GdiFlush();
+
+        dst_x = (int)(x + 0.5f);
+        dst_y = (int)(baseline_y + 0.5f) - tm.tmAscent;
+        cl = clip ? clip[0] : 0;
+        ct = clip ? clip[1] : 0;
+        cr = clip ? clip[2] : fb_w;
+        cb = clip ? clip[3] : fb_h;
+        if (cl < 0) cl = 0;
+        if (ct < 0) ct = 0;
+        if (cr > fb_w) cr = fb_w;
+        if (cb > fb_h) cb = fb_h;
+
+        for (yy = 0; yy < th; yy++) {
+            int py = dst_y + yy;
+            if (py < ct || py >= cb) continue;
+            for (xx = 0; xx < tw; xx++) {
+                int px = dst_x + xx;
+                uint32_t cov;
+                if (px < cl || px >= cr) continue;
+                cov = (bits[yy * tw + xx] >> 8) & 0xFFu; /* green channel = white coverage */
+                if (cov == 0) continue;
+                {
+                    uint32_t a = (cov * src_a) / 255u;
+                    uint32_t ia = 255u - a;
+                    uint32_t dst = fb[py * fb_w + px];
+                    uint32_t r = (src_r * a + ((dst >> 16) & 0xFFu) * ia) / 255u;
+                    uint32_t g = (src_g * a + ((dst >> 8)  & 0xFFu) * ia) / 255u;
+                    uint32_t b = (src_b * a + (dst & 0xFFu) * ia) / 255u;
+                    fb[py * fb_w + px] = 0xFF000000u | (r << 16) | (g << 8) | b;
+                }
+            }
+        }
+        SelectObject(hdc, oldb);
+        SelectObject(hdc, oldf);
+        DeleteObject(dib);
+        DeleteObject(font);
+        DeleteDC(hdc);
+        return 0;
+    }
+#else
+    (void)clip; (void)x; (void)baseline_y; (void)px_size; (void)argb; (void)bold;
+    return -1;
+#endif
+}
+
+SYSV int32_t afw_host_get_user_dir(const char *kind, char *buf, int32_t bufsz) {
+    if (!buf || bufsz <= 1) return -1;
+    buf[0] = '\0';
+#if defined(_WIN32)
+    {
+        const char *home = getenv("USERPROFILE");
+        int i;
+        if (!home || !home[0]) return -1;
+        if (kind && kind[0]) snprintf(buf, (size_t)bufsz, "%s/%s", home, kind);
+        else snprintf(buf, (size_t)bufsz, "%s", home);
+        for (i = 0; buf[i]; i++) if (buf[i] == '\\') buf[i] = '/';
+        return (int32_t)strlen(buf);
+    }
+#else
+    {
+        const char *home = getenv("HOME");
+        if (!home || !home[0]) return -1;
+        if (kind && kind[0]) snprintf(buf, (size_t)bufsz, "%s/%s", home, kind);
+        else snprintf(buf, (size_t)bufsz, "%s", home);
+        return (int32_t)strlen(buf);
+    }
+#endif
 }

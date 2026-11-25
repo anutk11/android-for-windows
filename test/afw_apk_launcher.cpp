@@ -34,6 +34,13 @@ typedef int32_t (*fn_audio_write)(int32_t, const void *, int32_t);
 typedef int32_t (*fn_audio_close)(int32_t);
 typedef void    (*fn_sleep_ms)(int32_t);
 typedef void    (*fn_get_stats)(int32_t *, int64_t *);
+typedef uint32_t *(*fn_decode_image)(const uint8_t *, int32_t, int32_t *, int32_t *);
+typedef int16_t  *(*fn_decode_media)(const char *, int32_t *, int32_t *, int32_t *);
+typedef void      (*fn_free_buf)(void *);
+typedef int32_t   (*fn_draw_text_ttf)(uint32_t *, int32_t, int32_t, const int32_t *, const char *,
+                                      float, float, float, uint32_t, int32_t);
+typedef float     (*fn_measure_text_ttf)(const char *, float, int32_t);
+typedef int32_t   (*fn_get_user_dir)(const char *, char *, int32_t);
 
 static fn_window_create g_win_create = nullptr;
 static fn_present       g_present    = nullptr;
@@ -44,6 +51,12 @@ static fn_audio_write   g_audio_write = nullptr;
 static fn_audio_close   g_audio_close = nullptr;
 static fn_sleep_ms      g_sleep_ms   = nullptr;
 static fn_get_stats     g_get_stats  = nullptr;
+static fn_decode_image  g_decode_image = nullptr;
+static fn_decode_media  g_decode_media = nullptr;
+static fn_free_buf      g_free_buf     = nullptr;
+static fn_draw_text_ttf g_draw_text_ttf = nullptr;
+static fn_measure_text_ttf g_measure_text_ttf = nullptr;
+static fn_get_user_dir  g_get_user_dir = nullptr;
 
 static bool resolve_host_shims() {
     g_win_create  = reinterpret_cast<fn_window_create>(dlsym(RTLD_DEFAULT, "__afw_host_window_create"));
@@ -55,6 +68,12 @@ static bool resolve_host_shims() {
     g_audio_close = reinterpret_cast<fn_audio_close>(dlsym(RTLD_DEFAULT, "__afw_host_audio_close"));
     g_sleep_ms    = reinterpret_cast<fn_sleep_ms>(dlsym(RTLD_DEFAULT, "__afw_host_sleep_ms"));
     g_get_stats   = reinterpret_cast<fn_get_stats>(dlsym(RTLD_DEFAULT, "__afw_host_get_stats"));
+    g_decode_image = reinterpret_cast<fn_decode_image>(dlsym(RTLD_DEFAULT, "__afw_host_decode_image_alloc"));
+    g_decode_media = reinterpret_cast<fn_decode_media>(dlsym(RTLD_DEFAULT, "__afw_host_media_decode_alloc"));
+    g_free_buf     = reinterpret_cast<fn_free_buf>(dlsym(RTLD_DEFAULT, "__afw_host_free_buf"));
+    g_draw_text_ttf = reinterpret_cast<fn_draw_text_ttf>(dlsym(RTLD_DEFAULT, "__afw_host_draw_text_ttf"));
+    g_measure_text_ttf = reinterpret_cast<fn_measure_text_ttf>(dlsym(RTLD_DEFAULT, "__afw_host_measure_text_ttf"));
+    g_get_user_dir = reinterpret_cast<fn_get_user_dir>(dlsym(RTLD_DEFAULT, "__afw_host_get_user_dir"));
     return g_win_create && g_present && g_poll_event && g_get_size &&
            g_audio_open && g_audio_write && g_audio_close && g_sleep_ms && g_get_stats;
 }
@@ -134,6 +153,79 @@ static jlong JNICALL jni_get_audio_bytes(JNIEnv *, jclass) {
     int32_t f = 0; int64_t ab = 0;
     g_get_stats(&f, &ab);
     return ab;
+}
+
+static jintArray JNICALL jni_decode_image(JNIEnv *env, jclass, jbyteArray jdata, jintArray jwh) {
+    if (!g_decode_image || !g_free_buf || !jdata) return nullptr;
+    jsize len = env->GetArrayLength(jdata);
+    if (len <= 0) return nullptr;
+    jbyte *ptr = env->GetByteArrayElements(jdata, nullptr);
+    if (!ptr) return nullptr;
+    int32_t w = 0, h = 0;
+    uint32_t *px = g_decode_image(reinterpret_cast<const uint8_t *>(ptr), len, &w, &h);
+    env->ReleaseByteArrayElements(jdata, ptr, JNI_ABORT);
+    if (!px || w <= 0 || h <= 0) { if (px) g_free_buf(px); return nullptr; }
+    if (jwh && env->GetArrayLength(jwh) >= 2) {
+        jint wh[2] = { w, h };
+        env->SetIntArrayRegion(jwh, 0, 2, wh);
+    }
+    jintArray out = env->NewIntArray(w * h);
+    if (out) env->SetIntArrayRegion(out, 0, w * h, reinterpret_cast<const jint *>(px));
+    g_free_buf(px);
+    return out;
+}
+
+static jshortArray JNICALL jni_decode_media(JNIEnv *env, jclass, jstring jpath, jintArray jmeta) {
+    if (!g_decode_media || !g_free_buf || !jpath) return nullptr;
+    const char *path = env->GetStringUTFChars(jpath, nullptr);
+    if (!path) return nullptr;
+    int32_t samples = 0, rate = 44100, ch = 2;
+    int16_t *pcm = g_decode_media(path, &samples, &rate, &ch);
+    env->ReleaseStringUTFChars(jpath, path);
+    if (!pcm || samples <= 0) { if (pcm) g_free_buf(pcm); return nullptr; }
+    if (jmeta && env->GetArrayLength(jmeta) >= 2) {
+        jint meta[2] = { rate, ch };
+        env->SetIntArrayRegion(jmeta, 0, 2, meta);
+    }
+    jshortArray out = env->NewShortArray(samples);
+    if (out) env->SetShortArrayRegion(out, 0, samples, pcm);
+    g_free_buf(pcm);
+    return out;
+}
+
+static jint JNICALL jni_draw_text_ttf(JNIEnv *env, jclass, jintArray jfb, jint w, jint h,
+                                      jint cl, jint ct, jint cr, jint cb,
+                                      jstring jtext, jfloat x, jfloat by, jfloat sz,
+                                      jint argb, jboolean bold) {
+    if (!g_draw_text_ttf || !jfb || !jtext) return -1;
+    const char *utf = env->GetStringUTFChars(jtext, nullptr);
+    if (!utf) return -1;
+    jint *fb = env->GetIntArrayElements(jfb, nullptr);
+    if (!fb) { env->ReleaseStringUTFChars(jtext, utf); return -1; }
+    int32_t clip[4] = { cl, ct, cr, cb };
+    int32_t rc = g_draw_text_ttf(reinterpret_cast<uint32_t *>(fb), w, h, clip, utf,
+                                 x, by, sz, static_cast<uint32_t>(argb), bold ? 1 : 0);
+    env->ReleaseIntArrayElements(jfb, fb, 0);
+    env->ReleaseStringUTFChars(jtext, utf);
+    return rc;
+}
+
+static jfloat JNICALL jni_measure_text_ttf(JNIEnv *env, jclass, jstring jtext, jfloat sz, jboolean bold) {
+    if (!g_measure_text_ttf || !jtext) return -1.0f;
+    const char *utf = env->GetStringUTFChars(jtext, nullptr);
+    if (!utf) return -1.0f;
+    float w = g_measure_text_ttf(utf, sz, bold ? 1 : 0);
+    env->ReleaseStringUTFChars(jtext, utf);
+    return w;
+}
+
+static jstring JNICALL jni_get_user_dir(JNIEnv *env, jclass, jstring jkind) {
+    if (!g_get_user_dir) return nullptr;
+    const char *kind = jkind ? env->GetStringUTFChars(jkind, nullptr) : "";
+    char buf[1024] = {0};
+    int32_t n = g_get_user_dir(kind ? kind : "", buf, static_cast<int32_t>(sizeof buf));
+    if (jkind && kind) env->ReleaseStringUTFChars(jkind, kind);
+    return n > 0 ? env->NewStringUTF(buf) : nullptr;
 }
 
 /* Convert backslashes and escape Windows drive letters ("C:/..." -> "/__afw_drv__/C/...")
@@ -291,9 +383,14 @@ int main(int argc, char **argv) {
         { const_cast<char *>("audioOpen"),     const_cast<char *>("(III)I"),                  reinterpret_cast<void *>(jni_audio_open) },
         { const_cast<char *>("audioWrite"),    const_cast<char *>("(I[BII)I"),                reinterpret_cast<void *>(jni_audio_write) },
         { const_cast<char *>("audioClose"),    const_cast<char *>("(I)I"),                    reinterpret_cast<void *>(jni_audio_close) },
-        { const_cast<char *>("sleepMs"),       const_cast<char *>("(I)V"),                    reinterpret_cast<void *>(jni_sleep_ms) },
-        { const_cast<char *>("getFrames"),     const_cast<char *>("()I"),                     reinterpret_cast<void *>(jni_get_frames) },
-        { const_cast<char *>("getAudioBytes"), const_cast<char *>("()J"),                     reinterpret_cast<void *>(jni_get_audio_bytes) },
+        { const_cast<char *>("sleepMs"),        const_cast<char *>("(I)V"),                                      reinterpret_cast<void *>(jni_sleep_ms) },
+        { const_cast<char *>("getFrames"),      const_cast<char *>("()I"),                                       reinterpret_cast<void *>(jni_get_frames) },
+        { const_cast<char *>("getAudioBytes"),  const_cast<char *>("()J"),                                       reinterpret_cast<void *>(jni_get_audio_bytes) },
+        { const_cast<char *>("decodeImage"),    const_cast<char *>("([B[I)[I"),                                  reinterpret_cast<void *>(jni_decode_image) },
+        { const_cast<char *>("decodeMedia"),    const_cast<char *>("(Ljava/lang/String;[I)[S"),                  reinterpret_cast<void *>(jni_decode_media) },
+        { const_cast<char *>("drawTextTtf"),    const_cast<char *>("([IIIIIIILjava/lang/String;FFFIZ)I"),        reinterpret_cast<void *>(jni_draw_text_ttf) },
+        { const_cast<char *>("measureTextTtf"), const_cast<char *>("(Ljava/lang/String;FZ)F"),                   reinterpret_cast<void *>(jni_measure_text_ttf) },
+        { const_cast<char *>("getUserDir"),     const_cast<char *>("(Ljava/lang/String;)Ljava/lang/String;"),    reinterpret_cast<void *>(jni_get_user_dir) },
     };
     if (env->RegisterNatives(host_cls, host_methods,
                              static_cast<jint>(sizeof(host_methods) / sizeof(host_methods[0]))) != 0) {

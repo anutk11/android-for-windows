@@ -1,18 +1,24 @@
 package com.afw.sample;
 
-import android.app.Activity;
+import android.content.ContentValues;
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.database.Cursor;
+import android.database.sqlite.SQLiteDatabase;
+import android.database.sqlite.SQLiteOpenHelper;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
-import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Typeface;
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioTrack;
+import android.media.MediaPlayer;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.MediaStore;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
@@ -21,22 +27,31 @@ import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.SeekBar;
 import android.widget.TextView;
+import androidx.appcompat.app.AppCompatActivity;
 
 import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 
 /**
- * Interactive Music Synthesizer & Oscilloscope Visualizer APK.
+ * Interactive Music Synthesizer & Visualizer APK (AppCompatActivity).
  * Exercises the full native Android-for-Windows stack inside real Android 14 libart.so:
- *   - Binary AXML AndroidManifest.xml launch
+ *   - Binary AXML AndroidManifest.xml launch & AndroidX AppCompatActivity
  *   - Native JNI library (lib/x86_64/libsample_jni.so) via System.loadLibrary()
- *   - APK AssetManager (assets/info.txt)
- *   - Persistent SharedPreferences
+ *   - Real Winsock2 TCP/HTTP networking inside Java (ServerSocket + Socket)
+ *   - Windows Imaging Component (WIC) PNG decoding via BitmapFactory.decodeStream()
+ *   - Windows Media Foundation audio decoding via MediaPlayer
+ *   - Win32 TrueType Unicode & Hebrew font rendering on Canvas
+ *   - SQLiteDatabase + ContentResolver/MediaStore + AssetManager + SharedPreferences
  *   - Real-time AudioTrack PCM audio streaming to Windows WinMM waveOut
- *   - Custom Canvas rendering + interactive LinearLayout / Button / SeekBar touch UI
  */
-public class PlayerActivity extends Activity {
+public class PlayerActivity extends AppCompatActivity {
     private static final String TAG = "SampleMusicApp";
     private static final String[] NOTE_NAMES = { "C4", "E4", "G4", "A4", "C5" };
     private static final double[] NOTE_FREQS = { 261.63, 329.63, 392.00, 440.00, 523.25 };
@@ -58,12 +73,26 @@ public class PlayerActivity extends Activity {
     private int mTapCount = 0;
     private String mDspVersion = "unknown";
     private String mAssetInfo = "none";
+    private Bitmap mCoverBmp;
+    private String mNetStatus = "pending";
+    private int mMfDurationMs = 0;
+    private int mDbRows = 0;
+    private int mMediaStoreCount = 0;
+
     private TextView mStatusText;
     private Button mNextNoteBtn;
     private Button mPlayPauseBtn;
     private AudioTrack mTrack;
     private Thread mAudioThread;
     private Handler mMainHandler;
+
+    private static final class SynthDb extends SQLiteOpenHelper {
+        SynthDb(Context ctx) { super(ctx, "synth.db", null, 1); }
+        @Override public void onCreate(SQLiteDatabase db) {
+            db.execSQL("CREATE TABLE tracks (_id INTEGER PRIMARY KEY, name TEXT)");
+        }
+        @Override public void onUpgrade(SQLiteDatabase db, int o, int n) {}
+    }
 
     private static final class WaveformView extends View {
         private final PlayerActivity mHost;
@@ -84,12 +113,10 @@ public class PlayerActivity extends Activity {
             int w = getWidth(), h = getHeight();
             if (w <= 0 || h <= 0) return;
 
-            // Card background
             mBgPaint.setStyle(Paint.Style.FILL);
             mBgPaint.setColor(0xFF1A1E2E);
             canvas.drawRoundRect(0, 0, w, h, 14f, 14f, mBgPaint);
 
-            // Subtle grid
             mGridPaint.setColor(0xFF283046);
             mGridPaint.setStrokeWidth(1f);
             float midY = h * 0.5f;
@@ -97,7 +124,6 @@ public class PlayerActivity extends Activity {
             canvas.drawLine(12, h * 0.25f, w - 12, h * 0.25f, mGridPaint);
             canvas.drawLine(12, h * 0.75f, w - 12, h * 0.75f, mGridPaint);
 
-            // Spectrum bars
             short[] samples = mHost.mLastWave;
             int bars = 24;
             float barW = (w - 32f) / bars;
@@ -111,7 +137,6 @@ public class PlayerActivity extends Activity {
                 canvas.drawRoundRect(bx + 2, midY - bh, bx + barW - 2, midY + bh, 3f, 3f, mBarPaint);
             }
 
-            // Oscilloscope curve
             mWavePaint.setColor(mHost.mPlaying ? 0xFF38BDF8 : 0xFF94A3B8);
             mWavePaint.setStrokeWidth(3f);
             int pts = Math.min(128, samples.length);
@@ -124,9 +149,69 @@ public class PlayerActivity extends Activity {
                 prevX = x; prevY = y;
             }
 
+            if (mHost.mCoverBmp != null) {
+                canvas.drawBitmap(mHost.mCoverBmp, w - 44f, 10f, null);
+            }
+
             mLabelPaint.setColor(0xFF94A3B8);
-            mLabelPaint.setTextSize(12f);
+            mLabelPaint.setTextSize(13f);
             canvas.drawText(mHost.mPlaying ? "LIVE PCM SYNTH (44.1 kHz)" : "PAUSED", 16f, 22f, mLabelPaint);
+        }
+    }
+
+    private String runLoopbackHttpSelfTest() {
+        try (final ServerSocket ss = new ServerSocket(0, 4, InetAddress.getByName("127.0.0.1"))) {
+            final int port = ss.getLocalPort();
+            Thread srv = new Thread(new Runnable() {
+                @Override public void run() {
+                    try (Socket cli = ss.accept();
+                         BufferedReader in = new BufferedReader(new InputStreamReader(cli.getInputStream()));
+                         OutputStream out = cli.getOutputStream()) {
+                        String req = in.readLine();
+                        String body = (req != null && req.contains("/ping")) ? "AFW-HTTP-OK" : "BAD";
+                        String resp = "HTTP/1.1 200 OK\r\nContent-Length: " + body.length() + "\r\n\r\n" + body;
+                        out.write(resp.getBytes("UTF-8"));
+                        out.flush();
+                    } catch (Throwable ignored) {}
+                }
+            }, "AFW-HttpTestSrv");
+            srv.start();
+            try (Socket s = new Socket("127.0.0.1", port)) {
+                OutputStream out = s.getOutputStream();
+                out.write("GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n".getBytes("UTF-8"));
+                out.flush();
+                BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream()));
+                String line, last = "";
+                while ((line = in.readLine()) != null) {
+                    if (!line.isEmpty()) last = line;
+                }
+                srv.join(1000);
+                return last;
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "Loopback HTTP test failed", t);
+            return "ERR:" + t.getClass().getSimpleName();
+        }
+    }
+
+    private int testMediaFoundationDecode() {
+        try {
+            File tmp = new File(getCacheDir(), "chime.wav");
+            try (InputStream in = getAssets().open("chime.wav");
+                 FileOutputStream fos = new FileOutputStream(tmp)) {
+                byte[] buf = new byte[4096];
+                int n;
+                while ((n = in.read(buf)) > 0) fos.write(buf, 0, n);
+            }
+            MediaPlayer mp = new MediaPlayer();
+            mp.setDataSource(tmp.getPath());
+            mp.prepare();
+            int dur = mp.getDuration();
+            mp.release();
+            return dur;
+        } catch (Throwable t) {
+            Log.e(TAG, "MediaPlayer decode failed", t);
+            return -1;
         }
     }
 
@@ -136,7 +221,7 @@ public class PlayerActivity extends Activity {
         mMainHandler = new Handler(Looper.getMainLooper());
         mDspVersion = nativeDspVersion();
 
-        // Read APK asset assets/info.txt
+        // 1. AssetManager text + WIC PNG decode
         try (InputStream in = getAssets().open("info.txt");
              BufferedReader br = new BufferedReader(new InputStreamReader(in))) {
             String line = br.readLine();
@@ -144,24 +229,56 @@ public class PlayerActivity extends Activity {
         } catch (Throwable t) {
             Log.e(TAG, "Failed reading assets/info.txt", t);
         }
+        try (InputStream in = getAssets().open("cover.png")) {
+            mCoverBmp = BitmapFactory.decodeStream(in);
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed decoding assets/cover.png", t);
+        }
+
+        // 2. Real Winsock2 TCP/HTTP loopback inside ART
+        mNetStatus = runLoopbackHttpSelfTest();
+
+        // 3. Real Media Foundation audio decode via MediaPlayer
+        mMfDurationMs = testMediaFoundationDecode();
+
+        // 4. SQLiteDatabase + ContentResolver/MediaStore
+        SynthDb helper = new SynthDb(this);
+        SQLiteDatabase db = helper.getWritableDatabase();
+        ContentValues cv = new ContentValues();
+        cv.put("name", "AFW Demo Track");
+        db.insert("tracks", null, cv);
+        try (Cursor c = db.query("tracks", null, null, null, null, null, null)) {
+            mDbRows = c.getCount();
+        }
+        try (Cursor mc = getContentResolver().query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, null, null, null, null)) {
+            mMediaStoreCount = mc != null ? mc.getCount() : 0;
+        }
 
         SharedPreferences prefs = getSharedPreferences("synth_prefs", Context.MODE_PRIVATE);
         mNoteIdx = prefs.getInt("note_idx", 0) % NOTE_NAMES.length;
         int prevLaunches = prefs.getInt("launch_count", 0);
         prefs.edit().putInt("launch_count", prevLaunches + 1).apply();
 
-        Log.i(TAG, "[SAMPLE_APK] BOOT dsp=" + mDspVersion + " asset=\"" + mAssetInfo +
-                   "\" launches=" + (prevLaunches + 1));
+        int pngW = mCoverBmp != null ? mCoverBmp.getWidth() : 0;
+        int pngH = mCoverBmp != null ? mCoverBmp.getHeight() : 0;
+        Log.i(TAG, "[SAMPLE_APK] BOOT dsp=" + mDspVersion +
+                   " asset=\"" + mAssetInfo + "\"" +
+                   " png=" + pngW + "x" + pngH +
+                   " http=" + mNetStatus +
+                   " mf_ms=" + mMfDurationMs +
+                   " db_rows=" + mDbRows +
+                   " music_files=" + mMediaStoreCount +
+                   " launches=" + (prevLaunches + 1));
 
-        // Build modern dark-themed Android View hierarchy
+        // Build modern dark-themed Android View hierarchy (with Hebrew + English TrueType title)
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(0xFF0F172A);
         root.setPadding(20, 20, 20, 20);
 
         TextView title = new TextView(this);
-        title.setText("AFW Music Synth");
-        title.setTextSize(24f);
+        title.setText("AFW Music Synth | \u05E0\u05D2\u05DF \u05DE\u05D5\u05D6\u05D9\u05E7\u05D4");
+        title.setTextSize(22f);
         title.setTextColor(0xFFF8FAFC);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         title.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -169,7 +286,7 @@ public class PlayerActivity extends Activity {
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         TextView sub = new TextView(this);
-        sub.setText(mDspVersion + " | " + mAssetInfo);
+        sub.setText(mDspVersion + " | HTTP:" + mNetStatus + " | PNG:" + pngW + "x" + pngH);
         sub.setTextSize(12f);
         sub.setTextColor(0xFF94A3B8);
         sub.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -194,7 +311,6 @@ public class PlayerActivity extends Activity {
         stLp.setMargins(0, 0, 0, 16);
         root.addView(mStatusText, stLp);
 
-        // Primary full-width action button (positioned around y=340..400 for easy tapping & CI click)
         mNextNoteBtn = new Button(this);
         mNextNoteBtn.setId(1001);
         mNextNoteBtn.setText("Next Note (C4 -> E4)");
@@ -256,7 +372,7 @@ public class PlayerActivity extends Activity {
         root.addView(volBar, sbLp);
 
         TextView footer = new TextView(this);
-        footer.setText("Android 14 ART | Zero VM | Native Win32");
+        footer.setText("Android 14 ART | Winsock2 | MediaFoundation | WIC | Zero VM");
         footer.setTextSize(12f);
         footer.setTextColor(0xFF64748B);
         footer.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -322,6 +438,9 @@ public class PlayerActivity extends Activity {
                    " asset=" + mAssetInfo +
                    " taps=" + mTapCount +
                    " saved_taps=" + savedTaps +
+                   " http=" + mNetStatus +
+                   " mf_ms=" + mMfDurationMs +
+                   " db_rows=" + mDbRows +
                    " pcm_samples=" + mPcmSamplesWritten);
         super.onDestroy();
     }

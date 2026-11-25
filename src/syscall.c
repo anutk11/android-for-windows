@@ -988,6 +988,11 @@ static long atomic_inc_long(long *p) {
 static void (*g_abort_cb)(uintptr_t sp);
 void afw_syscall_set_abort_cb(void (*on_abort)(uintptr_t sp)) { g_abort_cb = on_abort; }
 
+static int (*g_net_cb)(int64_t nr, const int64_t *args, int64_t *ret_out);
+void afw_syscall_set_net_cb(int (*net_cb)(int64_t nr, const int64_t *args, int64_t *ret_out)) {
+    g_net_cb = net_cb;
+}
+
 static void (*g_set_gs_cb)(uintptr_t);
 static uintptr_t (*g_get_gs_cb)(void);
 static _Thread_local uintptr_t t_fallback_gs;
@@ -1009,6 +1014,10 @@ static uintptr_t sys_get_art_gs(void) {
 static int64_t dispatch_ex(int64_t nr, int64_t *a, const afw_clone_regs *regs, uintptr_t cur_sp) {
     if (nr >= 0 && nr < AFW_MAX_SYSCALL) (void)atomic_inc_long(&afw_syscall_counts[nr]);
     if (afw_syscall_probe_log) probe_log_syscall(nr, a);
+    if (g_net_cb) {
+        int64_t net_ret = 0;
+        if (g_net_cb(nr, a, &net_ret)) return net_ret;
+    }
     switch (nr) {
     case 0:   return afw_fd_read(a[0], (void *)(uintptr_t)a[1], (uint64_t)a[2]);
     case 1:   return afw_fd_write(a[0], (const void *)(uintptr_t)a[1], (uint64_t)a[2]);

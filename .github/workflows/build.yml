@@ -442,6 +442,8 @@ jobs:
              -o out/dtv_bridge_test tools/dtv_bridge_test.c src/tls_static.c src/tls_layout.c src/tls_patch.c src/callback_bridge.c src/funcs.c src/platform.c
           cc -g -O1 -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined -Wall -Wextra \
              -o out/win_host_test tools/win_host_test.c src/win_host.c
+          cc -g -O1 -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined -Wall -Wextra -pthread \
+             -o out/net_test tools/net_test.c src/net.c
       - name: "Attestation checks (PR #7 + cross-block must_hold_table): queue self-test, variants 1-15 & stale"
         run: |
           set -euo pipefail
@@ -490,6 +492,7 @@ jobs:
           out/loader_lock_test
           out/dtv_bridge_test
           out/win_host_test
+          out/net_test
           out/afw-asan out/libhello.so
           out/afw-asan out/libsyscall_test.so
           out/afw-asan out/libredzone_test.so
@@ -580,8 +583,8 @@ jobs:
           clang-cl /nologo /O2 /W3 /DAFW_TEST /D_CRT_SECURE_NO_WARNINGS -Wno-unused-function -Iout\zydis-amalg ^
               /Fe:out\afw-loader-test.exe /Foout\testobj\ ^
               src\main.c src\elf_loader.c src\bionic_shim.c src\platform.c src\tls_patch.c src\crash.c ^
-              src\patch.c src\attest.c src\sha256.c src\syscall.c src\thread.c src\fd.c src\filemap.c src\funcs.c src\vma.c src\tls_layout.c src\tls_static.c src\loader_api.c src\callback_bridge.c src\exec.c src\win_host.c out\Zydis.obj ^
-              /link dbghelp.lib user32.lib gdi32.lib winmm.lib /STACK:8388608,8388608
+              src\patch.c src\attest.c src\sha256.c src\syscall.c src\thread.c src\fd.c src\filemap.c src\funcs.c src\vma.c src\tls_layout.c src\tls_static.c src\loader_api.c src\callback_bridge.c src\exec.c src\win_host.c src\net.c out\Zydis.obj ^
+              /link dbghelp.lib user32.lib gdi32.lib winmm.lib ws2_32.lib ole32.lib windowscodecs.lib mfplat.lib mfreadwrite.lib mfuuid.lib /STACK:8388608,8388608
           if errorlevel 1 exit /b 1
           out\afw-loader-test.exe out\libhello.so --finish-fail-late=tls:out\libtls_test.so
           if errorlevel 1 exit /b 1
@@ -797,14 +800,19 @@ jobs:
           if not "%rc%"=="0" exit /b 1
           findstr /c:"G3 ART GATE PASSED" out\g3-art-gate.txt >nul || exit /b 1
           exit /b 0
-      - name: "G4 Host Unit Tests: Win32 host bridge (framebuffer, 32-bit BMP, click injection, audio stats)"
+      - name: "G4 Host Unit Tests: Win32 host bridge & Winsock2 networking (framebuffer, BMP, click, audio, TCP/UDP/poll/epoll/pipe/eventfd)"
         shell: cmd
         run: |
           if not exist out\whobj mkdir out\whobj
-          clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Fe:out\win_host_test.exe /Foout\whobj\ tools\win_host_test.c src\win_host.c /link user32.lib gdi32.lib winmm.lib
+          clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Fe:out\win_host_test.exe /Foout\whobj\ tools\win_host_test.c src\win_host.c /link user32.lib gdi32.lib winmm.lib ole32.lib windowscodecs.lib mfplat.lib mfreadwrite.lib mfuuid.lib
           if errorlevel 1 exit /b 1
           out\win_host_test.exe
-      - name: "G4/G5 Gate: turnkey --apk sample_music_app.apk (AXML, native JNI, AssetManager, SharedPreferences, Canvas, touch click, AudioTrack, BMP) (required)"
+          if errorlevel 1 exit /b 1
+          if not exist out\netobj mkdir out\netobj
+          clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Fe:out\net_test.exe /Foout\netobj\ tools\net_test.c src\net.c /link ws2_32.lib
+          if errorlevel 1 exit /b 1
+          out\net_test.exe
+      - name: "G4/G5 Gate: turnkey --apk sample_music_app.apk (AXML, AppCompat, JNI, Winsock2 HTTP, WIC PNG, MediaFoundation, Hebrew TTF, SQLite, AudioTrack, BMP) (required)"
         timeout-minutes: 3
         shell: cmd
         run: |
@@ -818,9 +826,9 @@ jobs:
           findstr /c:"[afw] APK package:  com.afw.sample" out\g4-apk-gate.txt >nul || (echo missing package & exit /b 1)
           findstr /c:"[afw] APK activity: com.afw.sample.PlayerActivity" out\g4-apk-gate.txt >nul || (echo missing activity & exit /b 1)
           findstr /c:"[afw] extracted native lib:" out\g4-apk-gate.txt >nul || (echo missing native lib extraction & exit /b 1)
-          findstr /c:"[SAMPLE_APK] BOOT dsp=AFW-Native-DSP-1.0 asset=\"AFW-Asset-Ready\"" out\g4-apk-gate.txt >nul || (echo missing native JNI or asset check & exit /b 1)
+          findstr /c:"[SAMPLE_APK] BOOT dsp=AFW-Native-DSP-1.0 asset=\"AFW-Asset-Ready\" png=32x32 http=AFW-HTTP-OK mf_ms=100 db_rows=1" out\g4-apk-gate.txt >nul || (echo missing JNI/PNG/HTTP/MF/SQLite boot check & exit /b 1)
           findstr /c:"[SAMPLE_APK] BUTTON_CLICKED taps=1 note=E4" out\g4-apk-gate.txt >nul || (echo injected click did not fire OnClickListener & exit /b 1)
-          findstr /c:"[SAMPLE_APK] SUMMARY dsp=AFW-Native-DSP-1.0 asset=AFW-Asset-Ready taps=1 saved_taps=1" out\g4-apk-gate.txt >nul || (echo summary or SharedPreferences mismatch & exit /b 1)
+          findstr /c:"[SAMPLE_APK] SUMMARY dsp=AFW-Native-DSP-1.0 asset=AFW-Asset-Ready taps=1 saved_taps=1 http=AFW-HTTP-OK mf_ms=100 db_rows=1" out\g4-apk-gate.txt >nul || (echo summary or SharedPreferences mismatch & exit /b 1)
           findstr /c:"[afw] clean shutdown" out\g4-apk-gate.txt >nul || (echo missing clean shutdown & exit /b 1)
           python -I tools\build_sample_apk.py verify-bmp out\sample_screen.bmp
           if errorlevel 1 exit /b 1

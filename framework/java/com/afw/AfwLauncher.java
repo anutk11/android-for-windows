@@ -107,12 +107,15 @@ public final class AfwLauncher {
 
     private static int extractNativeLibs(ZipFile zip, File libDir) {
         int count = 0;
+        int arm64Count = 0;
         if (!libDir.exists()) libDir.mkdirs();
         Enumeration<? extends ZipEntry> en = zip.entries();
         while (en.hasMoreElements()) {
             ZipEntry e = en.nextElement();
             String name = e.getName();
-            if (e.isDirectory() || !name.startsWith("lib/x86_64/") || !name.endsWith(".so")) continue;
+            if (e.isDirectory() || !name.endsWith(".so")) continue;
+            if (name.startsWith("lib/arm64-v8a/")) { arm64Count++; continue; }
+            if (!name.startsWith("lib/x86_64/")) continue;
             String base = name.substring("lib/x86_64/".length());
             if (base.indexOf('/') >= 0) continue;
             File out = new File(libDir, base);
@@ -126,6 +129,11 @@ public final class AfwLauncher {
             } catch (Throwable t) {
                 System.err.println("[afw] warning: failed extracting " + name + ": " + t);
             }
+        }
+        if (count == 0 && arm64Count > 0) {
+            System.err.println("[afw] WARNING: APK contains " + arm64Count +
+                               " ARM64 (arm64-v8a) native libraries and 0 x86_64 libraries. " +
+                               "Use a universal/x86_64 APK for native code.");
         }
         return count;
     }

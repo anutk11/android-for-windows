@@ -305,6 +305,12 @@ static const shim_entry g_shims[] = {
     S("__afw_host_audio_close", afw_host_audio_close),
     S("__afw_host_sleep_ms", afw_host_sleep_ms),
     S("__afw_host_get_stats", afw_host_get_stats),
+    S("__afw_host_decode_image_alloc", afw_host_decode_image_alloc),
+    S("__afw_host_media_decode_alloc", afw_host_media_decode_alloc),
+    S("__afw_host_free_buf", afw_host_free_buf),
+    S("__afw_host_draw_text_ttf", afw_host_draw_text_ttf),
+    S("__afw_host_measure_text_ttf", afw_host_measure_text_ttf),
+    S("__afw_host_get_user_dir", afw_host_get_user_dir),
 };
 #undef S
 

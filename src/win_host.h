@@ -46,4 +46,18 @@ SYSV int32_t afw_host_audio_close(int32_t handle);
 SYSV void    afw_host_sleep_ms(int32_t ms);
 SYSV void    afw_host_get_stats(int32_t *frames_out, int64_t *audio_bytes_out);
 
+/* Pillars 2 & 3: Windows Imaging Component (PNG/JPEG/GIF/WebP), Media Foundation
+ * (MP3/AAC/FLAC/OGG/WAV/MP4), Win32 TrueType Unicode/Hebrew text, and user folders. */
+SYSV uint32_t *afw_host_decode_image_alloc(const uint8_t *data, int32_t len,
+                                           int32_t *out_w, int32_t *out_h);
+SYSV int16_t  *afw_host_media_decode_alloc(const char *path, int32_t *out_samples,
+                                           int32_t *out_rate, int32_t *out_channels);
+SYSV void      afw_host_free_buf(void *ptr);
+SYSV int32_t   afw_host_draw_text_ttf(uint32_t *fb, int32_t fb_w, int32_t fb_h,
+                                      const int32_t clip[4], const char *utf8_text,
+                                      float x, float baseline_y, float px_size,
+                                      uint32_t argb, int32_t bold);
+SYSV float     afw_host_measure_text_ttf(const char *utf8_text, float px_size, int32_t bold);
+SYSV int32_t   afw_host_get_user_dir(const char *kind, char *buf, int32_t bufsz);
+
 #endif

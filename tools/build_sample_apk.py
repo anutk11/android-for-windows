@@ -130,6 +130,43 @@ def build_manifest_axml(package: str, label: str, activity: str) -> bytes:
     return struct.pack("<HHI", 0x0003, 8, total) + bytes(body)
 
 
+import math
+import zlib
+
+
+def make_test_png(w: int = 32, h: int = 32) -> bytes:
+    def chunk(tag: bytes, payload: bytes) -> bytes:
+        return struct.pack(">I", len(payload)) + tag + payload + struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF)
+    raw = bytearray()
+    for y in range(h):
+        raw.append(0)  # filter type 0
+        for x in range(w):
+            r = (x * 8) & 0xFF
+            g = (y * 8) & 0xFF
+            b = 0xD0
+            raw.extend((r, g, b, 255))
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)  # 8-bit RGBA
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(bytes(raw)))
+            + chunk(b"IEND", b""))
+
+
+def make_test_wav(rate: int = 44100, frames: int = 4410) -> bytes:
+    pcm = bytearray()
+    for i in range(frames):
+        s = int(14000.0 * math.sin(2.0 * math.pi * 523.25 * i / rate))
+        pcm += struct.pack("<h", s)
+    data_sz = len(pcm)
+    hdr = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF", 36 + data_sz, b"WAVE",
+        b"fmt ", 16, 1, 1, rate, rate * 2, 2, 16,
+        b"data", data_sz,
+    )
+    return hdr + bytes(pcm)
+
+
 def cmd_build(args):
     axml = build_manifest_axml("com.afw.sample", "AFW Music Synth", ".PlayerActivity")
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
@@ -137,6 +174,8 @@ def cmd_build(args):
         zf.writestr("AndroidManifest.xml", axml)
         zf.write(args.dex, "classes.dex")
         zf.writestr("assets/info.txt", "AFW-Asset-Ready\n")
+        zf.writestr("assets/cover.png", make_test_png(32, 32))
+        zf.writestr("assets/chime.wav", make_test_wav(44100, 4410))
         if args.lib and os.path.exists(args.lib):
             zf.write(args.lib, "lib/x86_64/libsample_jni.so")
     print(f"Built {args.out} ({os.path.getsize(args.out)} bytes)")

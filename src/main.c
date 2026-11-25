@@ -24,6 +24,7 @@
 #include "tls_static.h"
 #include "vma.h"
 #include "win_host.h"
+#include "net.h"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -983,6 +984,7 @@ int main(int argc, char **argv) {
     if (afw_check_security() != 0) return 1;
     if (afw_tls_init() != 0) return 1;
     afw_syscall_set_gs_ops(afw_tls_set_art_gs, afw_tls_get_art_gs);
+    if (afw_net_init() == 0) afw_syscall_set_net_cb(afw_net_syscall);
     if (apk_path) {
         afw_load_enable_art_gs = 1;
         afw_load_allow_unproven = 1;

@@ -47,6 +47,11 @@ public class Paint {
     }
 
     public float measureText(String text) {
+        if (text == null || text.isEmpty()) return 0f;
+        try {
+            float w = com.afw.AfwHost.measureTextTtf(text, mTextSize, mTypeface != null && mTypeface.isBold());
+            if (w >= 0f) return w;
+        } catch (Throwable ignored) {}
         return AfwFont.measureText(text, mTextSize);
     }
 

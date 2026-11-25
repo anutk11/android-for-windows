@@ -90,6 +90,8 @@ static const char g_proc_meminfo[] =
     "MemFree:         4194304 kB\n"
     "MemAvailable:    4194304 kB\n";
 static const char g_sys_cpu_online[] = "0-3\n";
+static const char g_etc_hosts[] = "127.0.0.1 localhost\n::1 ip6-localhost\n";
+static const char g_etc_resolv[] = "nameserver 8.8.8.8\nnameserver 1.1.1.1\n";
 
 static int is_proc_maps_path(const char *path) {
     const char *p;
@@ -135,6 +137,16 @@ static int match_virtual_path(const char *path, const char **buf_out, size_t *le
         strcmp(path, "/sys/devices/system/cpu/present") == 0) {
         if (buf_out) *buf_out = g_sys_cpu_online;
         if (len_out) *len_out = sizeof(g_sys_cpu_online) - 1;
+        return FD_MEMBUF;
+    }
+    if (strcmp(path, "/etc/hosts") == 0 || strcmp(path, "/system/etc/hosts") == 0) {
+        if (buf_out) *buf_out = g_etc_hosts;
+        if (len_out) *len_out = sizeof(g_etc_hosts) - 1;
+        return FD_MEMBUF;
+    }
+    if (strcmp(path, "/etc/resolv.conf") == 0 || strcmp(path, "/system/etc/resolv.conf") == 0) {
+        if (buf_out) *buf_out = g_etc_resolv;
+        if (len_out) *len_out = sizeof(g_etc_resolv) - 1;
         return FD_MEMBUF;
     }
     return 0;
