@@ -218,8 +218,13 @@ static int apply_rela(afw_lib *lib, const Elf64_Rela *rel, size_t count,
         uint32_t type = ELF64_R_TYPE(rel[i].r_info);
         uint32_t sym = ELF64_R_SYM(rel[i].r_info);
         uint64_t *where = (uint64_t *)(lib->bias + rel[i].r_offset);
-        uint64_t S = sym ? symaddr[sym] : 0;
+        uint64_t S;
         int64_t A = rel[i].r_addend;
+        if (sym >= lib->nsyms && sym != 0) {
+            fprintf(stderr, "error: relocation symbol index %u out of range (nsyms %zu)\n", sym, lib->nsyms);
+            return -1;
+        }
+        S = sym ? symaddr[sym] : 0;
 
         /* an IFUNC of this library, or one imported from another loaded
          * library: S is the RESOLVER; the address comes from running it,
@@ -312,6 +317,135 @@ static void apply_relr(afw_lib *lib, const uint64_t *relr, size_t count) {
     }
 }
 
+/* Signed LEB128 reader for Android APS2 packed relocations (DT_ANDROID_RELA).
+ * Rejects truncated or overlong (>10-byte) encodings without UB. */
+static int sleb128_read(const unsigned char **cur, const unsigned char *end, int64_t *out) {
+    const unsigned char *p = *cur;
+    uint64_t val = 0;
+    unsigned shift = 0;
+    while (p < end) {
+        unsigned char byte = *p++;
+        if (shift == 63) {
+            if ((byte & 0x80u) != 0 || (byte != 0x00u && byte != 0x7fu))
+                return -1;
+            val |= ((uint64_t)(byte & 1u)) << 63;
+            *cur = p;
+            *out = (int64_t)val;
+            return 0;
+        }
+        val |= ((uint64_t)(byte & 0x7fu)) << shift;
+        shift += 7;
+        if ((byte & 0x80u) == 0) {
+            if (shift < 64 && (byte & 0x40u))
+                val |= (~0ULL) << shift;
+            *cur = p;
+            *out = (int64_t)val;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Android packed RELA relocations (APS2, used by real Android 14 libm.so and
+ * NDK libc++_shared.so). Decodes each group and feeds single Elf64_Rela
+ * entries into apply_rela() so all IFUNC/TLS/error checks stay identical. */
+static int apply_android_rela(afw_lib *lib, const unsigned char *buf, size_t sz,
+                              const uint64_t *symaddr, const unsigned char *imp_ifunc) {
+    const unsigned char *cur, *end;
+    int64_t reloc_count = 0, init_off = 0, emitted = 0;
+    uint64_t r_offset, r_info = 0;
+    int64_t r_addend = 0;
+    if (!buf || sz < 4 || memcmp(buf, "APS2", 4) != 0) {
+        fprintf(stderr, "error: invalid Android packed relocation header (expected APS2)\n");
+        return -1;
+    }
+    cur = buf + 4;
+    end = buf + sz;
+    if (sleb128_read(&cur, end, &reloc_count) != 0 || reloc_count < 0 ||
+        sleb128_read(&cur, end, &init_off) != 0) {
+        fprintf(stderr, "error: truncated APS2 relocation header\n");
+        return -1;
+    }
+    r_offset = (uint64_t)init_off;
+    while (emitted < reloc_count) {
+        int64_t group_size = 0, group_flags_s = 0, group_off_delta = 0, gi;
+        uint64_t flags;
+        if (sleb128_read(&cur, end, &group_size) != 0 ||
+            sleb128_read(&cur, end, &group_flags_s) != 0) {
+            fprintf(stderr, "error: truncated APS2 relocation group header\n");
+            return -1;
+        }
+        if (group_size <= 0 || group_size > reloc_count - emitted) {
+            fprintf(stderr, "error: invalid APS2 relocation group size %lld\n", (long long)group_size);
+            return -1;
+        }
+        flags = (uint64_t)group_flags_s;
+        if (flags & ~15ULL) {
+            fprintf(stderr, "error: unknown APS2 relocation group flags 0x%llx\n", (unsigned long long)flags);
+            return -1;
+        }
+        if (flags & 2u) { /* RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG */
+            if (sleb128_read(&cur, end, &group_off_delta) != 0) {
+                fprintf(stderr, "error: truncated APS2 group offset delta\n");
+                return -1;
+            }
+        }
+        if (flags & 1u) { /* RELOCATION_GROUPED_BY_INFO_FLAG */
+            int64_t v = 0;
+            if (sleb128_read(&cur, end, &v) != 0) {
+                fprintf(stderr, "error: truncated APS2 group info\n");
+                return -1;
+            }
+            r_info = (uint64_t)v;
+        }
+        if ((flags & 4u) && (flags & 8u)) { /* GROUPED_BY_ADDEND && HAS_ADDEND */
+            int64_t d = 0;
+            if (sleb128_read(&cur, end, &d) != 0) {
+                fprintf(stderr, "error: truncated APS2 group addend\n");
+                return -1;
+            }
+            r_addend = (int64_t)((uint64_t)r_addend + (uint64_t)d);
+        } else if (!(flags & 8u)) { /* !RELOCATION_GROUP_HAS_ADDEND_FLAG */
+            r_addend = 0;
+        }
+        for (gi = 0; gi < group_size; gi++) {
+            Elf64_Rela one;
+            if (flags & 2u) {
+                r_offset += (uint64_t)group_off_delta;
+            } else {
+                int64_t d = 0;
+                if (sleb128_read(&cur, end, &d) != 0) {
+                    fprintf(stderr, "error: truncated APS2 relocation offset delta\n");
+                    return -1;
+                }
+                r_offset += (uint64_t)d;
+            }
+            if (!(flags & 1u)) {
+                int64_t v = 0;
+                if (sleb128_read(&cur, end, &v) != 0) {
+                    fprintf(stderr, "error: truncated APS2 relocation info\n");
+                    return -1;
+                }
+                r_info = (uint64_t)v;
+            }
+            if ((flags & 8u) && !(flags & 4u)) {
+                int64_t d = 0;
+                if (sleb128_read(&cur, end, &d) != 0) {
+                    fprintf(stderr, "error: truncated APS2 relocation addend delta\n");
+                    return -1;
+                }
+                r_addend = (int64_t)((uint64_t)r_addend + (uint64_t)d);
+            }
+            one.r_offset = r_offset;
+            one.r_info = r_info;
+            one.r_addend = r_addend;
+            if (apply_rela(lib, &one, 1, symaddr, imp_ifunc) != 0) return -1;
+            emitted++;
+        }
+    }
+    return 0;
+}
+
 static int patch_bounds(const void *ctx, uint64_t addr, uint64_t *s, uint64_t *e) {
     return afw_func_bounds((const afw_lib *)ctx, addr, s, e);
 }
@@ -375,8 +509,9 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
     Elf64_Phdr *dyn_ph = NULL, *relro_ph = NULL, *tls_ph = NULL;
     const uint32_t *hash = NULL, *gnu_hash = NULL;
     const Elf64_Rela *rela = NULL, *jmprel = NULL;
-    size_t relasz = 0, pltrelsz = 0, relrsz = 0;
+    size_t relasz = 0, pltrelsz = 0, relrsz = 0, android_relasz = 0;
     const uint64_t *relr = NULL;
+    const unsigned char *android_rela = NULL;
     int64_t pltrel = DT_RELA;
     uint64_t soname_off = 0, needed_off[AFW_MAX_NEEDED];
     uint64_t *symaddr;
@@ -569,11 +704,15 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
                 fprintf(stderr, "error: REL relocations are not used on x86_64\n");
                 free(pageprot); return -1;
             case DT_ANDROID_REL:
-            case DT_ANDROID_RELA:
                 if (afw_load_patch_only) { skip_relocs = 1; break; }
-                fprintf(stderr, "error: Android packed relocations (APS2) not supported yet.\n"
-                                "       Rebuild with -Wl,--pack-dyn-relocs=none\n");
+                fprintf(stderr, "error: Android packed REL relocations are not used on x86_64\n");
                 free(pageprot); return -1;
+            case DT_ANDROID_RELA:
+                android_rela = (const unsigned char *)(uintptr_t)ptr;
+                break;
+            case DT_ANDROID_RELASZ:
+                android_relasz = d->d_val;
+                break;
             default: break;
             }
         }
@@ -680,9 +819,19 @@ static int load_inner(const char *path, afw_lib *lib, int verbose) {
     /* 5. Relocate ---------------------------------------------------- */
     if (skip_relocs) {
         fprintf(stderr, "note: packed relocations present: relocation skipped (measurement mode)\n");
-        relr = NULL; rela = NULL; jmprel = NULL;
+        relr = NULL; rela = NULL; android_rela = NULL; jmprel = NULL;
     }
     if (relr) apply_relr(lib, relr, relrsz / 8);
+    if (android_rela) {
+        uintptr_t ab = (uintptr_t)android_rela, lb = (uintptr_t)lib->base;
+        if (ab < lb || (size_t)(ab - lb) > lib->size || android_relasz > lib->size - (size_t)(ab - lb)) {
+            fprintf(stderr, "error: DT_ANDROID_RELA range outside mapped image\n");
+            free(symaddr); free(imp_ifunc); free(pageprot); return -1;
+        }
+        if (apply_android_rela(lib, android_rela, android_relasz, symaddr, imp_ifunc) != 0) {
+            free(symaddr); free(imp_ifunc); free(pageprot); return -1;
+        }
+    }
     if (rela && apply_rela(lib, rela, relasz / sizeof(Elf64_Rela), symaddr, imp_ifunc) != 0) {
         free(symaddr); free(imp_ifunc); free(pageprot); return -1;
     }
