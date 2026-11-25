@@ -937,6 +937,7 @@ static int64_t dispatch_ex(int64_t nr, int64_t *a, const afw_clone_regs *regs, u
     case 8:   return afw_fd_lseek(a[0], a[1], a[2]);
     case 13:  return sys_rt_sigaction(a[0], (const void *)(uintptr_t)a[1],
                                       (void *)(uintptr_t)a[2], (uint64_t)a[3]);
+    case 16:  return -25; /* ioctl: ENOTTY (isatty -> 0) */
     case 17:  return afw_fd_pread(a[0], (void *)(uintptr_t)a[1], (uint64_t)a[2], a[3]);
     case 18:  return afw_fd_pwrite(a[0], (const void *)(uintptr_t)a[1], (uint64_t)a[2], a[3]);
     case 19:  return afw_fd_readv(a[0], (const uint64_t *)(uintptr_t)a[1], a[2]);
