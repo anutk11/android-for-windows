@@ -196,7 +196,9 @@ void  afw_os_test_fail_dtv_fls_clear(int count);
 #endif
 
 /* ---- G3 ART /proc/self/maps synthesis & main-stack query (Rule 8) ---- */
-int afw_os_build_proc_maps(char **buf_out, size_t *len_out);
-int afw_os_is_current_stack(uint64_t addr, uint64_t len);
+int      afw_os_build_proc_maps(char **buf_out, size_t *len_out);
+int      afw_os_is_current_stack(uint64_t addr, uint64_t len);
+int      afw_os_current_stack_limits(uint64_t *lo_out, uint64_t *hi_out);
+uint32_t afw_os_current_pid(void);
 
 #endif

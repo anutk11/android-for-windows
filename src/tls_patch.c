@@ -298,22 +298,40 @@ int afw_tls_init(void) {   /* the key once; the thread's block until it succeeds
 /* Slots that point into the thread area: bionic dereferences them in memory
  * (__errno: [[tp] + 8] + 0x300, measured), so they hold pointers, never ids. */
 static void point_into_area(uintptr_t *blk, unsigned char *area) {
-    blk[TLS_SLOT_THREAD_ID] = (uintptr_t)(area + AFW_PTHREAD_INTERNAL_OFF);
-    blk[TLS_SLOT_BIONIC_TLS] = (uintptr_t)(area + AFW_BIONIC_TLS_OFF);
+    unsigned char *pti = area + AFW_PTHREAD_INTERNAL_OFF;
+    uintptr_t btls = (uintptr_t)(area + AFW_BIONIC_TLS_OFF);
+    blk[TLS_SLOT_THREAD_ID] = (uintptr_t)pti;
+    blk[TLS_SLOT_BIONIC_TLS] = btls;
+    memcpy(pti + AFW_PTI_BIONIC_TLS, &btls, sizeof btls);
+}
+
+static void init_pti_fields(unsigned char *area) {
+    unsigned char *pti = area + AFW_PTHREAD_INTERNAL_OFF;
+    int32_t tid = (int32_t)thread_id();
+    uint32_t cpid = afw_os_current_pid() & 0x7fffffffu;
+    uint64_t lo = 0, hi = 0;
+    memcpy(pti + AFW_PTI_TID, &tid, 4);
+    memcpy(pti + AFW_PTI_CACHED_PID, &cpid, 4);
+    if (afw_os_current_stack_limits(&lo, &hi) == 0 && hi > lo + 8192) {
+        uint64_t sbase = (lo + 4096u) & ~(uint64_t)4095u;
+        uint64_t ssize = hi - sbase;
+        uint64_t gsize = 4096u;
+        memcpy(pti + AFW_PTI_ATTR_STACK_BASE, &sbase, 8);
+        memcpy(pti + AFW_PTI_ATTR_STACK_SIZE, &ssize, 8);
+        memcpy(pti + AFW_PTI_ATTR_GUARD_SIZE, &gsize, 8);
+    }
 }
 
 int afw_tls_thread_init(void) {
     void *alloc;
     unsigned char *area;
     uintptr_t *blk;
-    int32_t tid;
     if (t_block) return 0;
     blk = afw_tls_static_alloc(&alloc, &area);
     if (!blk) { fprintf(stderr, "[tls] cannot allocate the thread's TLS block\n"); return -1; }
     blk[TLS_SLOT_SELF] = (uintptr_t)blk;
     point_into_area(blk, area);
-    tid = (int32_t)thread_id();
-    memcpy(area + AFW_PTHREAD_INTERNAL_OFF + AFW_PTI_TID, &tid, 4);
+    init_pti_fields(area);
     blk[TLS_SLOT_STACK_GUARD] = g_guard;
     if (publish(blk, alloc) != 0) {
         fprintf(stderr, "[tls] cannot publish the thread's TLS block\n");
@@ -335,8 +353,7 @@ int afw_tls_thread_rebuild(void) {
         memcpy(nb, t_block, BIONIC_TLS_SLOTS * sizeof *nb);
         memcpy(new_area, t_area, AFW_THREAD_AREA_SIZE);     /* errno, tid... carry over */
     } else {
-        int32_t tid = (int32_t)thread_id();
-        memcpy(new_area + AFW_PTHREAD_INTERNAL_OFF + AFW_PTI_TID, &tid, 4);
+        init_pti_fields(new_area);
         nb[TLS_SLOT_STACK_GUARD] = g_guard;
     }
     nb[TLS_SLOT_SELF] = (uintptr_t)nb;

@@ -69,10 +69,15 @@ uintptr_t *afw_tls_static_alloc(void **block, unsigned char **area);
  *   [0, 64KB)     pthread_internal_t  (tp[1]; tid at +0x10, errno at +0x300 measured)
  *   [64KB, 128KB) bionic_tls          (tp[9])
  * Both sizes are generous upper bounds until the real sizes are measured. */
-#define AFW_THREAD_AREA_SIZE   (128u * 1024u)
+#define AFW_THREAD_AREA_SIZE     (128u * 1024u)
 #define AFW_PTHREAD_INTERNAL_OFF 0u
-#define AFW_BIONIC_TLS_OFF     (64u * 1024u)
-#define AFW_PTI_TID            0x10   /* int: gettid() reads it (measured) */
+#define AFW_BIONIC_TLS_OFF       (64u * 1024u)
+#define AFW_PTI_TID              0x10   /* int32_t: gettid() reads it (measured) */
+#define AFW_PTI_CACHED_PID       0x14   /* uint32_t: low 31 bits = pid (measured) */
+#define AFW_PTI_ATTR_STACK_BASE  0x20   /* void*: attr.stack_base (measured: pthread_create ccc9c) */
+#define AFW_PTI_ATTR_STACK_SIZE  0x28   /* size_t: attr.stack_size (measured: pthread_create ccca9) */
+#define AFW_PTI_ATTR_GUARD_SIZE  0x30   /* size_t: attr.guard_size (measured: pthread_create cccb5) */
+#define AFW_PTI_BIONIC_TLS       0x2f8  /* bionic_tls*: (measured: pthread_create ccc5c) */
 void afw_tls_static_free(void *block);
 
 /* Address of byte `offset` of static module `module` (1-based) for the calling

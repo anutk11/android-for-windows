@@ -970,6 +970,19 @@ int afw_os_is_current_stack(uint64_t addr, uint64_t len) {
     return (addr >= (uint64_t)lo && addr + len <= (uint64_t)hi) ? 1 : 0;
 }
 
+int afw_os_current_stack_limits(uint64_t *lo_out, uint64_t *hi_out) {
+    ULONG_PTR lo = 0, hi = 0;
+    GetCurrentThreadStackLimits(&lo, &hi);
+    if (hi <= lo) return -1;
+    if (lo_out) *lo_out = (uint64_t)lo;
+    if (hi_out) *hi_out = (uint64_t)hi;
+    return 0;
+}
+
+uint32_t afw_os_current_pid(void) {
+    return (uint32_t)GetCurrentProcessId();
+}
+
 static int proc_maps_append(char **buf, size_t *len, size_t *cap, const char *line, size_t n) {
     if (*len + n + 1 > *cap) {
         size_t ncap = (*cap ? *cap * 2 : 16384);
@@ -1646,6 +1659,15 @@ void afw_os_clone_exit_on_host(afw_os_clone_trampoline *t, void *ctx,
 int afw_os_is_current_stack(uint64_t addr, uint64_t len) {
     (void)addr; (void)len;
     return 0;
+}
+
+int afw_os_current_stack_limits(uint64_t *lo_out, uint64_t *hi_out) {
+    (void)lo_out; (void)hi_out;
+    return -1;
+}
+
+uint32_t afw_os_current_pid(void) {
+    return (uint32_t)getpid();
 }
 
 int afw_os_build_proc_maps(char **buf_out, size_t *len_out) {
