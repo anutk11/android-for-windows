@@ -11,6 +11,7 @@
 #include "patch.h"
 
 #define AFW_MAX_NEEDED 32
+#define AFW_MAX_LIBS   64
 
 #define AFW_BUILD_ID_HEX 65
 /* the only libc.so whose libc_shared_globals layout is measured (tools/fetch_bionic.py pins it) */
@@ -67,6 +68,7 @@ typedef struct afw_lib_s {
     int code_ran;               /* IFUNC resolver or constructor started: past rollback point */
     int quarantined;            /* retained past point of no return (never freed/unmapped) */
     struct afw_lib_s *quarantine_next;   /* intrusive quarantine list (zero-alloc, unbounded) */
+    int32_t tls_dtor_refcount;  /* live __loader_add/remove_thread_local_dtor count (atomic) */
     int vma_adopted;            /* the image is registered with the VMA layer (6e) */
     unsigned char *pageprot;
     size_t npages, relro_first, relro_last;
@@ -119,6 +121,9 @@ int afw_is_loaded(const void *handle);
 int afw_is_retained(const void *handle);           /* loaded OR quarantined: do not free */
 void *afw_global_sym(const char *name);            /* RTLD_DEFAULT */
 int afw_find_lib(const char *name, char *out, size_t outsz);
+int afw_libs_snapshot_finished(afw_lib **out, int max, unsigned long long *adds_out);
+afw_lib *afw_lib_containing(const void *addr);
+int32_t afw_lib_tls_dtor_count(const afw_lib *lib);
 
 /* Find an exported symbol (like dlsym). */
 void *afw_sym(const afw_lib *lib, const char *name);

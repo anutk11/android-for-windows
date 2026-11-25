@@ -1,6 +1,9 @@
 /*
  * platform.c - Memory management for Windows (VirtualAlloc) and Linux (mmap).
  */
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 #include "platform.h"
 
 #if defined(_WIN32)
@@ -74,10 +77,31 @@ int afw_random_bytes(void *buf, size_t n) {
     return 0;
 }
 
-/* ---- Windows OS file primitives & FD lock (Rule 8: Win32 stays here) ---- */
+/* ---- Windows OS file primitives & locks (Rule 8: Win32 stays here) ---- */
 static SRWLOCK g_fd_srw = SRWLOCK_INIT;
 void afw_fd_lock(void)   { AcquireSRWLockExclusive(&g_fd_srw); }
 void afw_fd_unlock(void) { ReleaseSRWLockExclusive(&g_fd_srw); }
+
+static SRWLOCK g_libs_srw = SRWLOCK_INIT;
+void afw_libs_rdlock(void)   { AcquireSRWLockShared(&g_libs_srw); }
+void afw_libs_rdunlock(void) { ReleaseSRWLockShared(&g_libs_srw); }
+void afw_libs_wrlock(void)   { AcquireSRWLockExclusive(&g_libs_srw); }
+void afw_libs_wrunlock(void) { ReleaseSRWLockExclusive(&g_libs_srw); }
+
+static INIT_ONCE g_dlopen_once = INIT_ONCE_STATIC_INIT;
+static CRITICAL_SECTION g_dlopen_cs;
+static BOOL CALLBACK win_dlopen_cs_init(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&g_dlopen_cs);
+    return TRUE;
+}
+void afw_dlopen_lock(void) {
+    InitOnceExecuteOnce(&g_dlopen_once, win_dlopen_cs_init, NULL, NULL);
+    EnterCriticalSection(&g_dlopen_cs);
+}
+void afw_dlopen_unlock(void) {
+    LeaveCriticalSection(&g_dlopen_cs);
+}
 
 static int win_err_to_lnx(DWORD e) {
     switch (e) {
@@ -840,6 +864,18 @@ int32_t afw_os_atomic_xchg_i32(int32_t *addr, int32_t val) {
     return (int32_t)InterlockedExchange((volatile LONG *)addr, (LONG)val);
 }
 
+int32_t afw_os_atomic_add_i32(int32_t *addr, int32_t delta) {
+    return (int32_t)InterlockedExchangeAdd((volatile LONG *)addr, (LONG)delta) + delta;
+}
+
+int32_t afw_os_atomic_cmpxchg_i32(int32_t *addr, int32_t expected, int32_t desired) {
+    return (int32_t)InterlockedCompareExchange((volatile LONG *)addr, (LONG)desired, (LONG)expected);
+}
+
+int32_t afw_os_atomic_load_i32(const int32_t *addr) {
+    return __atomic_load_n(addr, __ATOMIC_SEQ_CST);
+}
+
 uintptr_t afw_os_atomic_xchg_uptr(uintptr_t *addr, uintptr_t val) {
     return (uintptr_t)InterlockedExchangePointer((PVOID volatile *)addr, (PVOID)val);
 }
@@ -964,10 +1000,33 @@ void afw_flush_icache(void *addr, size_t size) {
     __builtin___clear_cache((char *)addr, (char *)addr + size);
 }
 
-/* ---- Linux host OS file primitives & FD lock ---- */
+/* ---- Linux host OS file primitives & locks ---- */
 static pthread_mutex_t g_fd_mu = PTHREAD_MUTEX_INITIALIZER;
 void afw_fd_lock(void)   { pthread_mutex_lock(&g_fd_mu); }
 void afw_fd_unlock(void) { pthread_mutex_unlock(&g_fd_mu); }
+
+static pthread_rwlock_t g_libs_rw = PTHREAD_RWLOCK_INITIALIZER;
+void afw_libs_rdlock(void)   { pthread_rwlock_rdlock(&g_libs_rw); }
+void afw_libs_rdunlock(void) { pthread_rwlock_unlock(&g_libs_rw); }
+void afw_libs_wrlock(void)   { pthread_rwlock_wrlock(&g_libs_rw); }
+void afw_libs_wrunlock(void) { pthread_rwlock_unlock(&g_libs_rw); }
+
+static pthread_once_t g_dlopen_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t g_dlopen_mu;
+static void posix_dlopen_mu_init(void) {
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&g_dlopen_mu, &a);
+    pthread_mutexattr_destroy(&a);
+}
+void afw_dlopen_lock(void) {
+    pthread_once(&g_dlopen_once, posix_dlopen_mu_init);
+    pthread_mutex_lock(&g_dlopen_mu);
+}
+void afw_dlopen_unlock(void) {
+    pthread_mutex_unlock(&g_dlopen_mu);
+}
 
 static void fill_stat_from_posix(const struct stat *st, afw_os_stat_info *out) {
     memset(out, 0, sizeof *out);
@@ -1294,6 +1353,20 @@ void afw_os_atomic_store_i32(void *addr, int32_t val) {
 
 int32_t afw_os_atomic_xchg_i32(int32_t *addr, int32_t val) {
     return __atomic_exchange_n(addr, val, __ATOMIC_ACQ_REL);
+}
+
+int32_t afw_os_atomic_add_i32(int32_t *addr, int32_t delta) {
+    return __atomic_add_fetch(addr, delta, __ATOMIC_SEQ_CST);
+}
+
+int32_t afw_os_atomic_cmpxchg_i32(int32_t *addr, int32_t expected, int32_t desired) {
+    int32_t cur = expected;
+    (void)__atomic_compare_exchange_n(addr, &cur, desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return cur;
+}
+
+int32_t afw_os_atomic_load_i32(const int32_t *addr) {
+    return __atomic_load_n(addr, __ATOMIC_SEQ_CST);
 }
 
 uintptr_t afw_os_atomic_xchg_uptr(uintptr_t *addr, uintptr_t val) {

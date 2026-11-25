@@ -178,6 +178,26 @@ static SYSV int phdr_cb(void *vi, size_t size, void *data) {
         g_phdr_tls_ok = i->tls_modid == (size_t)user->tls_module && i->tls_data != NULL;
     return 0;
 }
+typedef struct {
+    SYSV int (*it)(SYSV int (*)(void *, size_t, void *), void *);
+    SYSV void *(*dlo)(const char *, int, const void *);
+    int depth;
+    int inner_seen;
+    int dlo_ok;
+} reent_ctx;
+static SYSV int phdr_reent_cb(void *vp, size_t sz, void *ud) {
+    reent_ctx *rc = (reent_ctx *)ud;
+    (void)vp; (void)sz;
+    if (rc->depth == 0) {
+        rc->depth = 1;
+        if (rc->dlo("libdeps_base.so", 2, NULL) != NULL) rc->dlo_ok++;
+        (void)rc->it(phdr_reent_cb, rc);
+        rc->depth = 0;
+    } else {
+        rc->inner_seen++;
+    }
+    return 0;
+}
 static void run_loader_api_tests(const afw_lib *user) {
     typedef SYSV void *(*dlopen_fn)(const char *, int, const void *);
     typedef SYSV void *(*dlsym_fn)(void *, const char *, const void *);
@@ -237,6 +257,35 @@ static void run_loader_api_tests(const afw_lib *user) {
           info.fname && strstr(info.fname, "libdeps_user.so"));
     check("dladdr on a non-library address (stack) returns 0; NULL info returns 0",
           dla(&info, &info) == 0 && dla((const void *)afw_sym(user, "afw_deps_check"), NULL) == 0);
+    {   /* G2-5a: __loader_add/remove_thread_local_dtor refcounting + reentrant dl_iterate_phdr */
+        typedef SYSV void (*dtor_fn)(void *);
+        dtor_fn add_dtor = (dtor_fn)afw_shim_lookup("__loader_add_thread_local_dtor");
+        dtor_fn rem_dtor = (dtor_fn)afw_shim_lookup("__loader_remove_thread_local_dtor");
+        void *in_user = afw_sym(user, "afw_deps_check");
+        int stack_var = 0;
+        check("__loader_add/remove_thread_local_dtor exported", add_dtor && rem_dtor);
+        if (add_dtor && rem_dtor) {
+            check("tls_dtor_refcount starts at 0", afw_lib_tls_dtor_count(user) == 0);
+            add_dtor(in_user);
+            add_dtor(in_user);
+            check("add_thread_local_dtor increments refcount per DSO", afw_lib_tls_dtor_count(user) == 2);
+            rem_dtor(in_user);
+            check("remove_thread_local_dtor decrements refcount", afw_lib_tls_dtor_count(user) == 1);
+            rem_dtor(in_user);
+            rem_dtor(in_user); /* extra remove must clamp at 0, never underflow */
+            check("remove_thread_local_dtor clamps at 0 without underflow", afw_lib_tls_dtor_count(user) == 0);
+            add_dtor(NULL);
+            add_dtor(&stack_var);
+            rem_dtor(NULL);
+            rem_dtor(&stack_var);
+            check("unknown/NULL dso_handle is a safe no-op", afw_lib_tls_dtor_count(user) == 0);
+        }
+        {
+            reent_ctx rctx = { it, dlo, 0, 0, 0 };
+            check("reentrant dl_iterate_phdr + dlopen inside callback does not deadlock",
+                  it(phdr_reent_cb, &rctx) == 0 && rctx.inner_seen == 4 && rctx.dlo_ok == 2);
+        }
+    }
 }
 
 static int run_syscall_tests(const afw_lib *lib) {

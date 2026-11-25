@@ -64,8 +64,13 @@ SYSV void *afw_l_dlopen(const char *name, int flags, const void *caller) {
     int ndeps = 0;
     (void)flags; (void)caller;   /* RTLD_LAZY/NOW/LOCAL/GLOBAL: binding is always now, scope global */
     if (!name) return &g_main_handle;
-    if ((lib = afw_find_loaded(name)) != NULL) return lib;
+    afw_dlopen_lock();
+    if ((lib = afw_find_loaded(name)) != NULL) {
+        afw_dlopen_unlock();
+        return lib;
+    }
     if (!afw_find_lib(name, path, sizeof path)) {
+        afw_dlopen_unlock();
         set_err("dlopen failed: library \"%s\" not found", name);
         return NULL;
     }
@@ -76,6 +81,7 @@ SYSV void *afw_l_dlopen(const char *name, int flags, const void *caller) {
         char *p = (char *)malloc(strlen(path) + 1);
         if (!lib || !dblk || !p) {
             free(lib); free(dblk); free(p);
+            afw_dlopen_unlock();
             set_err("dlopen failed: out of memory loading \"%s\"", name);
             return NULL;
         }
@@ -90,11 +96,13 @@ SYSV void *afw_l_dlopen(const char *name, int flags, const void *caller) {
                 if (afw_is_retained(&dblk->deps[i])) { keep_deps = 1; break; }
             if (keep_deps) keep_deps_block(dblk);
             else free(dblk);
+            afw_dlopen_unlock();
             return NULL;
         }
     }
     if (ndeps == 0) free(dblk);
     else keep_deps_block(dblk);
+    afw_dlopen_unlock();
     return lib;
 }
 
@@ -103,27 +111,24 @@ SYSV void *afw_l_android_dlopen_ext(const char *name, int flags, const void *ext
     return afw_l_dlopen(name, flags, caller);
 }
 
-/* The library an address lies in, as its load-order index; -1 if none. */
-static int lib_index_of(const void *addr) {
-    uintptr_t a = (uintptr_t)addr;
-    int k;
-    afw_lib *l;
-    for (k = 0; (l = afw_lib_at(k)) != NULL; k++) {
-        uintptr_t b = (uintptr_t)l->base;
-        if (l->base && a >= b && a - b < l->size)
-            return k;
-    }
-    return -1;
-}
-
 /* RTLD_NEXT, as bionic: only libraries loaded AFTER the caller's. A caller
  * outside every library (the loader itself, a test) is the main program:
- * every library comes after it. */
+ * every library comes after it. Snapshots finished libs under afw_libs_rdlock
+ * so afw_sym (which may invoke an IFUNC resolver) runs outside the lock. */
 static void *next_sym(const char *sym, const void *caller) {
-    int k = lib_index_of(caller) + 1;
-    afw_lib *l;
-    for (; (l = afw_lib_at(k)) != NULL; k++) {
-        void *p = l->pending ? NULL : afw_sym(l, sym);
+    afw_lib *snap[AFW_MAX_LIBS];
+    int n = afw_libs_snapshot_finished(snap, AFW_MAX_LIBS, NULL);
+    uintptr_t a = (uintptr_t)caller;
+    int k, start = 0;
+    for (k = 0; k < n; k++) {
+        uintptr_t b = (uintptr_t)snap[k]->base;
+        if (snap[k]->base && a >= b && a - b < snap[k]->size) {
+            start = k + 1;
+            break;
+        }
+    }
+    for (k = start; k < n; k++) {
+        void *p = afw_sym(snap[k], sym);
         if (p) return p;
     }
     return NULL;
@@ -174,21 +179,15 @@ typedef struct {            /* bionic's Dl_info (LP64) */
 
 SYSV int afw_l_dladdr(const void *addr, void *vinfo) {
     afw_dl_info *info = (afw_dl_info *)vinfo;
-    uintptr_t a = (uintptr_t)addr;
-    int k;
     afw_lib *l;
     if (!info) return 0;
-    for (k = 0; (l = afw_lib_at(k)) != NULL; k++) {
-        uintptr_t b = (uintptr_t)l->base;
-        if (l->base && a >= b && a - b < l->size) {
-            info->dli_fname = l->path;
-            info->dli_fbase = l->base;
-            info->dli_sname = NULL;   /* nearest symbol: not yet */
-            info->dli_saddr = NULL;
-            return 1;
-        }
-    }
-    return 0;
+    l = afw_lib_containing(addr);
+    if (!l) return 0;
+    info->dli_fname = l->path;
+    info->dli_fbase = l->base;
+    info->dli_sname = NULL;   /* nearest symbol: not yet */
+    info->dli_saddr = NULL;
+    return 1;
 }
 
 typedef struct {            /* bionic's dl_phdr_info (LP64) */
@@ -202,25 +201,49 @@ typedef struct {            /* bionic's dl_phdr_info (LP64) */
     void *dlpi_tls_data;
 } afw_dl_phdr_info;
 
-
+/* Snapshot finished libraries under afw_libs_rdlock(), then invoke cb()
+ * OUTSIDE the lock: finished libraries are never unloaded/freed, so cb() may
+ * safely call dl_iterate_phdr/dlopen/mmap without lock-ordering inversions. */
 SYSV int afw_l_dl_iterate_phdr(SYSV int (*cb)(void *info, size_t size, void *data), void *data) {
-    int k, n = afw_loaded_count(), rc = 0;
+    afw_lib *snap[AFW_MAX_LIBS];
+    unsigned long long adds = 0;
+    int k, n, rc = 0;
+    if (!cb) return 0;
+    n = afw_libs_snapshot_finished(snap, AFW_MAX_LIBS, &adds);
     for (k = 0; k < n && rc == 0; k++) {
-        afw_lib *l = afw_lib_at(k);
+        afw_lib *l = snap[k];
         afw_dl_phdr_info info;
-        if (!l || l->pending || !l->phdr) continue;   /* unfinished: not visible yet */
+        if (!l || !l->phdr) continue;
         memset(&info, 0, sizeof info);
         info.dlpi_addr = (uint64_t)l->bias;
         info.dlpi_name = l->path;
         info.dlpi_phdr = l->phdr;
         info.dlpi_phnum = (uint16_t)l->phnum;
-        info.dlpi_adds = (unsigned long long)n;
+        info.dlpi_adds = adds;
         info.dlpi_subs = 0;
         info.dlpi_tls_modid = (size_t)l->tls_module;
         info.dlpi_tls_data = l->tls_module ? afw_tls_static_resolve((uint64_t)l->tls_module, 0) : NULL;
         rc = cb(&info, sizeof info, data);
     }
     return rc;
+}
+
+/* Called by Bionic's __cxa_thread_atexit_impl / __cxa_thread_finalize to track
+ * live per-thread thread_local destructors belonging to each loaded DSO. */
+SYSV void afw_l_add_thread_local_dtor(void *dso_handle) {
+    afw_lib *l = afw_lib_containing(dso_handle);
+    if (l) (void)afw_os_atomic_add_i32(&l->tls_dtor_refcount, 1);
+}
+
+SYSV void afw_l_remove_thread_local_dtor(void *dso_handle) {
+    afw_lib *l = afw_lib_containing(dso_handle);
+    if (!l) return;
+    for (;;) {
+        int32_t cur = afw_os_atomic_load_i32(&l->tls_dtor_refcount);
+        if (cur <= 0) return;
+        if (afw_os_atomic_cmpxchg_i32(&l->tls_dtor_refcount, cur, cur - 1) == cur)
+            return;
+    }
 }
 
 SYSV void afw_l_android_get_LD_LIBRARY_PATH(char *buf, size_t sz) {

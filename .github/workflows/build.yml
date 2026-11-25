@@ -107,6 +107,22 @@ jobs:
           echo "--- afw_stack_test machine code ---"
           "$TC/llvm-objdump" -d --disassemble-symbols=afw_stack_test out/libhello.so
           cp "$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/x86_64-linux-android/libc++_shared.so" out/
+          # G2a Gate: two separate C++ DSOs + PIE dynamically linked against real libc++_shared.so
+          "$TC/clang++" --target=x86_64-linux-android34 -std=c++17 -shared -fPIC -O2 -nostdlib++ \
+            -Wl,--pack-dyn-relocs=none -Wl,-soname,libcxx_thrower.so \
+            -Lout -lc++_shared -o out/libcxx_thrower.so test/cxx_thrower.cpp
+          "$TC/clang++" --target=x86_64-linux-android34 -std=c++17 -shared -fPIC -O2 -nostdlib++ \
+            -Wl,--pack-dyn-relocs=none -Wl,-soname,libcxx_catcher.so \
+            -Lout -lcxx_thrower -lc++_shared -o out/libcxx_catcher.so test/cxx_catcher.cpp
+          "$TC/clang++" --target=x86_64-linux-android34 -std=c++17 -fPIE -pie -O2 -nostdlib++ \
+            -Wl,--pack-dyn-relocs=none \
+            -Lout -lcxx_catcher -lcxx_thrower -lc++_shared -ldl -o out/cxx_gate_exe test/cxx_gate_exe.cpp
+          echo "--- G2a Gate DT_NEEDED (must dynamically link libc++_shared.so across both DSOs and PIE)"
+          for f in out/libcxx_thrower.so out/libcxx_catcher.so out/cxx_gate_exe; do
+            echo "$f:"
+            "$TC/llvm-readelf" -dW "$f" | grep NEEDED
+            "$TC/llvm-readelf" -dW "$f" | grep -q "libc++_shared.so" || { echo "$f missing DT_NEEDED libc++_shared.so"; exit 1; }
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: libhello
@@ -119,6 +135,7 @@ jobs:
             out/g1_gate_exe
             out/pthread_probe
             out/pthread_mt_test
+            out/cxx_gate_exe
 
   # Gate G1 experiment: static scan of the real bionic libc.so.
   # The extracted Android files are NOT uploaded (licensing): only the report.
@@ -292,6 +309,10 @@ jobs:
                 --disassemble-symbols=__dl__ZNK15StaticTlsLayout21offset_thread_pointerEv,__dl__ZN15StaticTlsLayout27reserve_exe_segment_and_tcbEPK10TlsSegmentPKc,__dl__ZN15StaticTlsLayout7reserveEmm,__dl__ZN15StaticTlsLayout18reserve_bionic_tlsEv,__dl__ZN15StaticTlsLayout13finish_layoutEv \
                 out/bionic/linker64 || true
             fi
+            echo "--- G2-5a: disassemble __cxa_thread_atexit_impl & __cxa_thread_finalize ---"
+            "$TC/llvm-objdump" -d --no-show-raw-insn \
+              --disassemble-symbols=__cxa_thread_atexit_impl,__cxa_thread_finalize \
+              out/bionic/libc.so || true
             echo "--- syscall 56 (clone) and 60 (exit) and 202 (futex) sites from libc-scan.txt ---"
             grep -E "nr=(56|60|202)\b|__bionic_clone|_exit_with_stack|futex" out/libc-scan.txt | head -60 || true
           } | tee out/g2-pthread-scan.txt
@@ -326,6 +347,8 @@ jobs:
              -o out/fd_test tools/fd_test.c src/fd.c src/platform.c
           cc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wall -Wextra \
              -o out/tls_layout_test tools/tls_layout_test.c src/tls_layout.c
+          cc -g -O1 -fsanitize=address,undefined,pointer-compare -fno-sanitize-recover=undefined -Wall -Wextra -pthread \
+             -o out/loader_lock_test tools/loader_lock_test.c src/platform.c
       - name: "Attestation checks (PR #7 + cross-block must_hold_table): queue self-test, variants 1-15 & stale"
         run: |
           set -euo pipefail
@@ -371,6 +394,7 @@ jobs:
           out/thread_test
           out/fd_test
           out/tls_layout_test
+          out/loader_lock_test
           out/afw-asan out/libhello.so
           out/afw-asan out/libsyscall_test.so
           out/afw-asan out/libredzone_test.so
@@ -572,6 +596,13 @@ jobs:
           clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Fe:out\thread_test.exe /Foout\thobj\ tools\thread_test.c src\vma.c src\filemap.c src\syscall.c src\thread.c src\fd.c src\platform.c
           if errorlevel 1 exit /b 1
           out\thread_test.exe
+      - name: "G2-5a Host Unit Tests: loader RW lock, recursive dlopen lock, atomic refcount"
+        shell: cmd
+        run: |
+          if not exist out\llobj mkdir out\llobj
+          clang-cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /Fe:out\loader_lock_test.exe /Foout\llobj\ tools\loader_lock_test.c src\platform.c
+          if errorlevel 1 exit /b 1
+          out\loader_lock_test.exe
       - name: "C++ exceptions: every landing pad found, nothing unproven (static)"
         shell: cmd
         run: out\afw-loader.exe out\libcxx_exception_test.so --patch-report --strict --min-landing-pads=1
@@ -622,6 +653,19 @@ jobs:
           echo pthread_mt_test exit code %rc%
           if not "%rc%"=="0" (echo pthread_mt_test exited %rc%, not 0 & exit /b 1)
           findstr /c:"PTHREAD MT TEST PASSED" out\g2-pthread-mt.txt >nul || (echo G2-4b pthread_mt_test did not pass & exit /b 1)
+          exit /b 0
+      - name: "G2a Gate: cross-DSO C++ exceptions + thread_local dtors (real libc++_shared.so + libc.so) (required)"
+        timeout-minutes: 3
+        shell: cmd
+        run: |
+          set AFW_LIB_PATH=out\bionic;out
+          out\afw-loader.exe out\cxx_gate_exe --with-deps --watchdog=60 --exec > out\g2a-cxx-gate.txt 2>&1
+          set rc=%errorlevel%
+          type out\g2a-cxx-gate.txt
+          echo cxx_gate_exe exit code %rc%
+          if not "%rc%"=="0" (echo cxx_gate_exe exited %rc%, not 0 & exit /b 1)
+          findstr /c:"G2A CXX GATE PASSED" out\g2a-cxx-gate.txt >nul || (echo G2a cxx_gate_exe did not pass & exit /b 1)
+          findstr /c:"G2A MAIN THREAD_LOCAL DTOR OK" out\g2a-cxx-gate.txt >nul || (echo G2a main thread_local dtor did not run in LIFO order & exit /b 1)
           exit /b 0
       - name: "G2-1 Probe (Items 2-5): Windows stack / NT_TIB / VEH / ExitThread probe (informational)"
         continue-on-error: true
